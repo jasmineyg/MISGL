@@ -24,37 +24,33 @@ class GcnHpoolEncoder(Module):
   def reset_parameters(self):
     for m in self.modules():
       if isinstance(m, gcn_layer.GraphConvolution):
-        m.weight.data = torch.nn.init.xavier_uniform_(m.weight.data, gain=torch.nn.init.calculate_gain('relu'))
+        torch.nn.init.xavier_uniform_(m.weight, gain=torch.nn.init.calculate_gain('relu'))
         if m.bias is not None:
-          m.bias.data = torch.nn.init.constant_(m.bias.data, 0.0)
+          torch.nn.init.constant_(m.bias, 0.0)
 
   def build_graph(self):
 
-    # entry GCN
-    self.entry_conv_first = gcn_layer.GraphConvolution(
+    # entry GCN 改为单层（输出维度对齐 channel_list[2]）
+    self.entry_conv = gcn_layer.GraphConvolution(
       in_features=self._hparams.channel_list[0],
-      out_features=self._hparams.channel_list[1],
-      hparams=self._hparams,
-    )
-    self.entry_conv_block = gcn_layer.GraphConvolution(
-      in_features=self._hparams.channel_list[1],
-      out_features=self._hparams.channel_list[1],
-      hparams=self._hparams,
-    )
-    self.entry_conv_last = gcn_layer.GraphConvolution(
-      in_features=self._hparams.channel_list[1],
       out_features=self._hparams.channel_list[2],
       hparams=self._hparams,
     )
 
+    # 子模块保持不变，但入参特征维度改为单层输出（不再 3x 拼接）
     self.gcn_hpool_layer = GcnHpoolSubmodel(
-      self._hparams.channel_list[2] * 3, self._hparams.channel_list[3], self._hparams.channel_list[4],
+      self._hparams.channel_list[2], self._hparams.channel_list[3], self._hparams.channel_list[4],
       self._hparams.node_list[0], self._hparams.node_list[1], self._hparams.node_list[2],
       self._hparams
     )
 
+    # 预测层输入维度：入口一路 + 子模块一路（不再乘 3）
+    input_dim = (
+      self._hparams.channel_list[2] +
+      2 * self._hparams.channel_list[3] + self._hparams.channel_list[4]
+    )
     self.pred_model = torch.nn.Sequential(
-      torch.nn.Linear(2 * 3 * self._hparams.channel_list[-3], self._hparams.channel_list[-2]),
+      torch.nn.Linear(input_dim, self._hparams.channel_list[-2]),
       torch.nn.ReLU(),
       torch.nn.Linear(self._hparams.channel_list[-2], self._hparams.channel_list[-1])
     )
@@ -69,22 +65,21 @@ class GcnHpoolEncoder(Module):
     max_num_nodes = adjacency_mat.size()[1]
     embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
 
-    # entry embedding gcn
-    embedding_tensor_1 = self.gcn_forward(
-      node_feature, adjacency_mat,
-      self.entry_conv_first, self.entry_conv_block, self.entry_conv_last,
-      embedding_mask
-    )
+    # entry embedding gcn（单层输出，不再三份拼接）
+    embedding_single = F.relu(self.entry_conv(node_feature, adjacency_mat))
+    embedding_single = self.apply_bn(embedding_single)
+    embedding_tensor_1 = embedding_single
+    if embedding_mask is not None:
+        embedding_tensor_1 = embedding_tensor_1 * embedding_mask
     output_1, _ = torch.max(embedding_tensor_1, dim=1)
 
-    # hpool layer
+    # 子模块调用保持原逻辑（多层GCN在子模块中执行）
     output_2, _, _, _ = self.gcn_hpool_layer(
-      embedding_tensor_1, node_feature, adjacency_mat, embedding_mask
+        embedding_tensor_1, node_feature, adjacency_mat, embedding_mask
     )
 
     output = torch.cat([output_1, output_2], dim=1)
     ypred = self.pred_model(output)
-
     return ypred
 
   def gcn_forward(self, x, adj, conv_first, conv_block, conv_last, embedding_mask=None):
@@ -113,14 +108,14 @@ class GcnHpoolEncoder(Module):
       return bn_module(x)
 
   def construct_mask(self, max_nodes, batch_num_nodes):
-      ''' For each num_nodes in batch_num_nodes, the first num_nodes entries of the
-      corresponding column are 1's, and the rest are 0's (to be masked out).
-      Dimension of mask: [batch_size x max_nodes x 1]
-      '''
-      # masks
-      packed_masks = [torch.ones(int(num)) for num in batch_num_nodes]
-      batch_size = len(batch_num_nodes)
-      out_tensor = torch.zeros(batch_size, max_nodes)
+      # For each num_nodes in batch_num_nodes, the first num_nodes entries are 1's.
+      if isinstance(batch_num_nodes, torch.Tensor):
+          num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+      else:
+          num_list = [int(n) for n in batch_num_nodes]
+      packed_masks = [torch.ones(n, device=self._device) for n in num_list]
+      batch_size = len(num_list)
+      out_tensor = torch.zeros(batch_size, max_nodes, device=self._device)
       for i, mask in enumerate(packed_masks):
-          out_tensor[i, :batch_num_nodes[i]] = mask
-      return out_tensor.unsqueeze(2).to(self._device)
+          out_tensor[i, :num_list[i]] = mask
+      return out_tensor.unsqueeze(2)

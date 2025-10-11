@@ -26,8 +26,8 @@ def evaluate(dataset, model, hparams, max_num_examples=None):
   labels = np.hstack(labels)
   preds = np.hstack(preds)
 
-  result = {'prec': metrics.precision_score(labels, preds, average='macro'),
-            'recall': metrics.recall_score(labels, preds, average='macro'),
+  result = {'prec': metrics.precision_score(labels, preds, average='macro', zero_division=0),
+            'recall': metrics.recall_score(labels, preds, average='macro', zero_division=0),
             'acc': metrics.accuracy_score(labels, preds),
-            'F1': metrics.f1_score(labels, preds, average="micro")}
+            'F1': metrics.f1_score(labels, preds, average="micro", zero_division=0)}
   return result

@@ -7,7 +7,7 @@ from __future__ import print_function
 
 import six
 import numbers
-from ruamel import yaml
+from ruamel.yaml import YAML
 
 
 def _cast_to_type_if_compatible(name, param_type, value):
@@ -119,23 +119,24 @@ class HParams(object):
       del self._hparam_types[name]
 
   def to_yaml(self, save_dir):
-    def remove_callables(x):
-      """Omit callable elements from input with arbitrary nesting."""
-      if isinstance(x, dict):
-        return {k: remove_callables(v) for k, v in six.iteritems(x)
-                if not callable(v)}
-      elif isinstance(x, list):
-        return [remove_callables(i) for i in x if not callable(i)]
-      return x
-    with open(save_dir, 'w') as yml_writer:
-      yaml.dump(remove_callables(self.values()), yml_writer)
+      def remove_callables(x):
+          """Omit callable elements from input with arbitrary nesting."""
+          if isinstance(x, dict):
+            return {k: remove_callables(v) for k, v in six.iteritems(x)
+                    if not callable(v)}
+          elif isinstance(x, list):
+            return [remove_callables(i) for i in x if not callable(i)]
+          return x
+      with open(save_dir, 'w') as yml_writer:
+        yaml = YAML()
+        yaml.dump(remove_callables(self.values()), yml_writer)
 
   def from_yaml(self, read_dir):
-    with open(read_dir, 'r') as yml_reader:
-      hparams_dict = yaml.load(yml_reader, Loader=yaml.SafeLoader)
-
-    for name, value in hparams_dict.items():
-      self.add_hparam(name, value)
+      with open(read_dir, 'r') as yml_reader:
+        yaml = YAML(typ='safe')
+        hparams_dict = yaml.load(yml_reader)
+      for name, value in hparams_dict.items():
+        self.add_hparam(name, value)
 
   def values(self):
     """Return the hyperparameter values as a Python dictionary.

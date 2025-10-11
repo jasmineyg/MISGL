@@ -23,9 +23,9 @@ class GcnHpoolSubmodel(Module):
   def reset_parameters(self):
     for m in self.modules():
       if isinstance(m, gcn_layer.GraphConvolution):
-        m.weight.data = torch.nn.init.xavier_uniform_(m.weight.data, gain=torch.nn.init.calculate_gain('relu'))
+        torch.nn.init.xavier_uniform_(m.weight, gain=torch.nn.init.calculate_gain('relu'))
         if m.bias is not None:
-          m.bias.data = torch.nn.init.constant_(m.bias.data, 0.0)
+          torch.nn.init.constant_(m.bias, 0.0)
 
   def build_graph(self, in_feature, hidden_feature, out_feature, in_node, hidden_node, out_node):
 

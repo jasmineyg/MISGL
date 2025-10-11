@@ -28,7 +28,7 @@ def train_eval(hparams):
   data_loader = load_data.GraphDataLoaderWrapper(hparams)
 
   all_vals = []
-  for val_idx in range(hparams.fold_num):
+  for val_idx in range(5):
     logging.warning('* validation index: {}'.format(val_idx))
     training_loader, validation_loader = data_loader.get_loader(val_idx)
     summary_writer = tensorboardX.SummaryWriter(
@@ -43,6 +43,16 @@ def train_eval(hparams):
   all_vals = np.mean(all_vals, axis=0)
   logging.warning('* all of the validation results: '.format(all_vals))
   logging.warning('* the best validation results & its id: {} @ {}'.format(np.max(all_vals), np.argmax(all_vals)))
+
+  final_train_loader = data_loader.get_full_train_loader()
+  final_test_loader = data_loader.get_test_loader()
+  summary_writer = tensorboardX.SummaryWriter(
+    logdir=os.path.join(hparams.model_save_path, str(hparams.timestamp) + '/final_test')
+  )
+  final_model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
+  train_eval_iter(final_model, final_train_loader, final_train_loader, summary_writer, hparams)
+  test_result = evaluate(final_test_loader, final_model, hparams)
+  logging.warning('Final test result (acc): {:.4f}'.format(test_result['acc']))
 
 
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
@@ -60,7 +70,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
 
   for epoch in range(hparams.epoch):
 
-    if not epoch % 100:
+    if not epoch % 10:
       logging.info('* Start the {}_th epoch'.format(epoch))
 
     total_time = 0
@@ -133,10 +143,10 @@ def log_assignment(assign_tensor, writer, epoch, batch_idx):
 
   # has to be smaller than args.batch_size
   for i in range(len(batch_idx)):
-    plt.subplot(2, 2, i + 1)
-    plt.imshow(assign_tensor.cpu().data.numpy()[batch_idx[i]], cmap=plt.get_cmap('BuPu'))
-    cbar = plt.colorbar()
-    cbar.solids.set_edgecolor("face")
+      plt.subplot(2, 2, i + 1)
+      plt.imshow(assign_tensor.cpu().detach().numpy()[batch_idx[i]], cmap=plt.get_cmap('BuPu'))
+      cbar = plt.colorbar()
+      cbar.solids.set_edgecolor("face")
   plt.tight_layout()
   fig.canvas.draw()
 
@@ -151,14 +161,14 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
   fig = plt.figure(figsize=(8, 6), dpi=300)
 
   for i in range(len(batch_idx)):
-    ax = plt.subplot(2, 2, i + 1)
-    num_nodes = batch_num_nodes[batch_idx[i]]
-    adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().data.numpy()
-    G = nx.from_numpy_matrix(adj_matrix)
-    nx.draw(G, pos=nx.spring_layout(G), with_labels=True, node_color='#336699',
-            edge_color='grey', width=0.5, node_size=300,
-            alpha=0.7)
-    ax.xaxis.set_visible(False)
+      ax = plt.subplot(2, 2, i + 1)
+      num_nodes = int(batch_num_nodes[batch_idx[i]].item()) if isinstance(batch_num_nodes, torch.Tensor) else int(batch_num_nodes[batch_idx[i]])
+      adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().detach().numpy()
+      G = nx.from_numpy_array(adj_matrix)
+      nx.draw(G, pos=nx.spring_layout(G), with_labels=True, node_color='#336699',
+              edge_color='grey', width=0.5, node_size=300,
+              alpha=0.7)
+      ax.xaxis.set_visible(False)
 
   plt.tight_layout()
   fig.canvas.draw()
@@ -166,26 +176,26 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
   data = tensorboardX.utils.figure_to_image(fig)
   writer.add_image('graphs', data, epoch)
 
-  assignment = assign_tensor.cpu().data.numpy()
+  assignment = assign_tensor.cpu().detach().numpy()
   fig = plt.figure(figsize=(8, 6), dpi=300)
 
   num_clusters = assignment.shape[2]
   all_colors = np.array(range(num_clusters))
 
   for i in range(len(batch_idx)):
-    ax = plt.subplot(2, 2, i + 1)
-    num_nodes = batch_num_nodes[batch_idx[i]]
-    adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().data.numpy()
+      ax = plt.subplot(2, 2, i + 1)
+      num_nodes = int(batch_num_nodes[batch_idx[i]].item()) if isinstance(batch_num_nodes, torch.Tensor) else int(batch_num_nodes[batch_idx[i]])
+      adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().detach().numpy()
 
-    label = np.argmax(assignment[batch_idx[i]], axis=1).astype(int)
-    label = label[: batch_num_nodes[batch_idx[i]]]
-    node_colors = all_colors[label]
+      label = np.argmax(assignment[batch_idx[i]], axis=1).astype(int)
+      label = label[: batch_num_nodes[batch_idx[i]]]
+      node_colors = all_colors[label]
 
-    G = nx.from_numpy_matrix(adj_matrix)
-    nx.draw(G, pos=nx.spring_layout(G), with_labels=False, node_color=node_colors,
-            edge_color='grey', width=0.4, node_size=50, cmap=plt.get_cmap('Set1'),
-            vmin=0, vmax=num_clusters - 1,
-            alpha=0.8)
+      G = nx.from_numpy_array(adj_matrix)
+      nx.draw(G, pos=nx.spring_layout(G), with_labels=False, node_color=node_colors,
+              edge_color='grey', width=0.4, node_size=50, cmap=plt.get_cmap('Set1'),
+              vmin=0, vmax=num_clusters - 1,
+              alpha=0.8)
 
   plt.tight_layout()
   fig.canvas.draw()

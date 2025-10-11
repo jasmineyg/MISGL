@@ -1,14 +1,16 @@
 device: 'cuda'
 cuda_visible_devices: '2'
-datadir: 'data/gnn_enzymes_source_20190905'
+
 model_save_path: 'results'
-dataname: 'ENZYMES'
-fold_num: 10
-max_num_nodes: 1000
-channel_list: [3, 30, 30, 30, 30]
-node_list: [3, 10, 10]
+processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
+data_name: 'cs'
+timestamp: cs_dp
+max_num_nodes: 35  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35
+channel_list: [6805, 30, 30, 30, 30] # 第一个值为特征维度: cora 1433, citeseer 3703, pubmed 500, cs 6805
+node_list: [6805, 10, 10]  # 第一个值为特征维度
+
+fold_num: 5
 batch_size: 20
-epoch: 1000
-timestamp: 1567969359
+epoch: 200
 learning_rate: 0.001
 grad_clip: 2
