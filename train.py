@@ -1,10 +1,12 @@
 # coding=utf-8
 
+# function main(args) and top-level imports
 import os
 import torch
 import numpy as np
 import logging
 import argparse
+import random
 
 from gnn_hpool.utils import hparam
 
@@ -20,6 +22,7 @@ def main(args):
     torch.backends.cudnn.benchmark = False
   torch.manual_seed(1024)
   np.random.seed(1024)
+  random.seed(1024)
 
   # set default GPU
   os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices

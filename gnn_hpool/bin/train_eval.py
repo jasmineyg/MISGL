@@ -24,11 +24,12 @@ from gnn_hpool.utils import load_data
 from gnn_hpool.models import gcn_hpool_encoder
 
 
+# function train_eval(hparams)
 def train_eval(hparams):
   data_loader = load_data.GraphDataLoaderWrapper(hparams)
 
   all_vals = []
-  for val_idx in range(5):
+  for val_idx in range(hparams.fold_num):
     logging.warning('* validation index: {}'.format(val_idx))
     training_loader, validation_loader = data_loader.get_loader(val_idx)
     summary_writer = tensorboardX.SummaryWriter(
@@ -41,7 +42,7 @@ def train_eval(hparams):
 
   all_vals = np.vstack(all_vals)
   all_vals = np.mean(all_vals, axis=0)
-  logging.warning('* all of the validation results: '.format(all_vals))
+  logging.warning('* all of the validation results: {}'.format(all_vals))
   logging.warning('* the best validation results & its id: {} @ {}'.format(np.max(all_vals), np.argmax(all_vals)))
 
   final_train_loader = data_loader.get_full_train_loader()
@@ -54,87 +55,109 @@ def train_eval(hparams):
   test_result = evaluate(final_test_loader, final_model, hparams)
   logging.warning('Final test result (acc): {:.4f}'.format(test_result['acc']))
 
-
+  # function train_eval_iter(model, train_dataset, eval_dataset, writer, hparams)
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
-  optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=hparams.learning_rate)
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=hparams.learning_rate)
 
-  best_val_result = {
-    'epoch': 0,
-    'loss': 0,
-    'acc': 0}
-  train_accs = []
-  train_epochs = []
-  best_val_accs = []
-  best_val_epochs = []
-  val_accs = []
+    best_val_result = {
+      'epoch': 0,
+      'loss': 0,
+      'acc': 0}
+    train_accs = []
+    train_epochs = []
+    best_val_accs = []
+    best_val_epochs = []
+    val_accs = []
 
-  for epoch in range(hparams.epoch):
+    for epoch in range(hparams.epoch):
 
-    if not epoch % 10:
-      logging.info('* Start the {}_th epoch'.format(epoch))
+      if not epoch % 10:
+        logging.info('* Start the {}_th epoch'.format(epoch))
 
-    total_time = 0
-    avg_loss = 0.0
-    model.train()
+      total_time = 0
+      avg_loss = 0.0
+      model.train()
 
-    for batch_idx, graph_data in enumerate(train_dataset):
+      for batch_idx, graph_data in enumerate(train_dataset):
 
-      begin_time = time.time()
-      optimizer.zero_grad()
+        begin_time = time.time()
+        optimizer.zero_grad()
 
-      # run model
-      ypred = model(graph_data)
-      loss = get_loss.cross_entropy(ypred, graph_data[g_key.y])
-      loss.backward()
-      torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
-      optimizer.step()
+        # run model
+        ypred_out = model(graph_data)
+        
+        # 使用融合损失函数
+        loss = get_loss.fused_loss(ypred_out, graph_data[g_key.y], epoch, hparams)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
+        optimizer.step()
 
-      # record
-      avg_loss += loss
-      elapsed = time.time() - begin_time
-      total_time += elapsed
+        # record
+        avg_loss += loss
+        elapsed = time.time() - begin_time
+        total_time += elapsed
 
-      # log once per XX epochs
-      if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
-        log_assignment(model.gcn_hpool_layer.pool_tensor, writer, epoch, writer_batch_idx)
-        log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, writer_batch_idx, model.gcn_hpool_layer.pool_tensor)
+        # log once per XX epochs
+        if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
+          assign_tensor = model.gcn_hpool_layer.pool_tensor
+          bs = assign_tensor.size(0)
+          safe_idx = [i for i in writer_batch_idx if i < bs]
+          if len(safe_idx) > 0:
+            log_assignment(assign_tensor, writer, epoch, safe_idx)
+            log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
 
-    avg_loss /= batch_idx + 1
-    if writer is not None:
-      writer.add_scalar('loss/avg_loss', avg_loss, epoch)
+      avg_loss /= batch_idx + 1
+      if writer is not None:
+        writer.add_scalar('loss/avg_loss', avg_loss, epoch)
+        
+        # 记录当前gamma值
+        if hasattr(hparams, 'branch_b') and hparams.branch_b.get('use', False):
+            current_gamma = get_loss.get_gamma(epoch, 
+                                             hparams.branch_b.get('gamma_start', 0.3),
+                                             hparams.branch_b.get('gamma_end', 0.6),
+                                             hparams.branch_b.get('warmup_epochs', 20))
+            writer.add_scalar('fusion/gamma', current_gamma, epoch)
 
-    result = evaluate(train_dataset, model, hparams, max_num_examples=100)
-    train_accs.append(result['acc'])
-    train_epochs.append(epoch)
+      result = evaluate(train_dataset, model, hparams, max_num_examples=100)
+      train_accs.append(result['acc'])
+      train_epochs.append(epoch)
 
-    val_result = evaluate(eval_dataset, model, hparams)
-    val_accs.append(val_result['acc'])
-    if val_result['acc'] > best_val_result['acc'] - 1e-7:
-      best_val_result['acc'] = val_result['acc']
-      best_val_result['epoch'] = epoch
-      best_val_result['loss'] = avg_loss
+      val_result = evaluate(eval_dataset, model, hparams)
+      val_accs.append(val_result['acc'])
+      if val_result['acc'] > best_val_result['acc'] - 1e-7:
+        best_val_result['acc'] = val_result['acc']
+        best_val_result['epoch'] = epoch
+        best_val_result['loss'] = avg_loss
 
-      logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
-    if writer is not None:
-      writer.add_scalar('acc/train_acc', result['acc'], epoch)
-      writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
-      writer.add_scalar('loss/best_val_loss', best_val_result['loss'], epoch)
+        logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
+      if writer is not None:
+        writer.add_scalar('acc/train_acc', result['acc'], epoch)
+        writer.add_scalar('acc/eval_acc', val_result['acc'], epoch)
+        writer.add_scalar('loss/best_eval_loss', best_val_result['loss'], epoch)
 
-    best_val_epochs.append(best_val_result['epoch'])
-    best_val_accs.append(best_val_result['acc'])
+      best_val_epochs.append(best_val_result['epoch'])
+      best_val_accs.append(best_val_result['acc'])
 
-  matplotlib.style.use('seaborn')
-  plt.switch_backend('agg')
-  plt.figure()
-  plt.plot(train_epochs, common_utils.exp_moving_avg(train_accs, 0.85), '-', lw=1)
+    try:
+      matplotlib.style.use('seaborn-v0_8')  # 新版本matplotlib中的seaborn样式
+    except OSError:
+      try:
+        matplotlib.style.use('seaborn')  # 旧版本兼容
+      except OSError:
+        matplotlib.style.use('default')  # 如果都不可用，使用默认样式
+    
+    plt.switch_backend('agg')
+    plt.figure()
+    plt.plot(train_epochs, common_utils.exp_moving_avg(train_accs, 0.85), '-', lw=1)
+    
+    plt.plot(best_val_epochs, best_val_accs, 'bo')
+    plt.legend(['train', 'val'])
+    plt.savefig(os.path.join(hparams.model_save_path, str(hparams.timestamp) + '.png'), dpi=600)
+    plt.close()
+    matplotlib.style.use('default')
 
-  plt.plot(best_val_epochs, best_val_accs, 'bo')
-  plt.legend(['train', 'val'])
-  plt.savefig(os.path.join(hparams.model_save_path, str(hparams.timestamp) + '.png'), dpi=600)
-  plt.close()
-  matplotlib.style.use('default')
-
-  return model, val_accs
+    return model, val_accs
 
 
 def log_assignment(assign_tensor, writer, epoch, batch_idx):
@@ -150,8 +173,6 @@ def log_assignment(assign_tensor, writer, epoch, batch_idx):
   plt.tight_layout()
   fig.canvas.draw()
 
-  # data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  # data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
   data = tensorboardX.utils.figure_to_image(fig)
   writer.add_image('assignment', data, epoch)
 
@@ -200,7 +221,10 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
   plt.tight_layout()
   fig.canvas.draw()
 
-  # data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  # data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
   data = tensorboardX.utils.figure_to_image(fig)
   writer.add_image('graphs_colored', data, epoch)
+
+try:
+    import seaborn as sns
+except Exception:
+    sns = None

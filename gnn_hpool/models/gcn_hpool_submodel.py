@@ -28,8 +28,9 @@ class GcnHpoolSubmodel(Module):
           torch.nn.init.constant_(m.bias, 0.0)
 
   def build_graph(self, in_feature, hidden_feature, out_feature, in_node, hidden_node, out_node):
-
     # embedding blocks
+    dp = getattr(self._hparams, "dropout", 0.5)
+    self.dropout_embed = torch.nn.Dropout(p=dp)
 
     self.embed_conv_first = gcn_layer.GraphConvolution(
       in_features=in_feature,
@@ -84,6 +85,8 @@ class GcnHpoolSubmodel(Module):
       x_pool, adj_pool,
       self.embed_conv_first, self.embed_conv_block, self.embed_conv_last,
     )
+
+    embedding_tensor = self.dropout_embed(embedding_tensor)
 
     output, _ = torch.max(embedding_tensor, dim=1)
 
