@@ -13,7 +13,6 @@ def get_gamma(epoch, gamma_start=0.3, gamma_end=0.6, warmup_epochs=20):
 
 
 def bce_from_probs(probs, targets):
-    # 使用torch.clamp而不是就地操作
     probs = torch.clamp(probs.view(-1), min=1e-8, max=1-1e-8)
     targets = targets.view(-1).float()
     return -(targets*torch.log(probs) + (1-targets)*torch.log(1-probs)).mean()

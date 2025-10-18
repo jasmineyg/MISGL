@@ -3,23 +3,27 @@ cuda_visible_devices: '2'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name: 'med'
-timestamp: med_A
-max_num_nodes: 35  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
-channel_list: [5538, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
-node_list: [5538, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
+data_name: 'eng'
+timestamp: eng_testB
+max_num_nodes: 33  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
+channel_list: [4839, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
+node_list: [4839, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
 
-fold_num: 5
-batch_size: 20
+
+batch_size: 32
 epoch: 200
 learning_rate: 0.001
 grad_clip: 2
 dropout: 0.5
+
+holdout_runs: 5              # 重复留出次数（若提供holdout_seeds则忽略此项）
+holdout_seeds: [11,22,33,44,55]  # 可选：逐次运行的随机种子列表
+
 branch_b:
-  use: false
+  use: true
   attn_hidden: 128
   gate_hidden: 64
   lambda_lap: 0.0           # 初始设为0，收敛后可改为1e-3
-  gamma_start: 0.3          # 初始gamma权重
-  gamma_end: 0.6            # 最终gamma权重
+  gamma_start: 1          # 初始gamma权重
+  gamma_end: 1            # 最终gamma权重
   warmup_epochs: 20         # gamma从start到end的过渡轮数

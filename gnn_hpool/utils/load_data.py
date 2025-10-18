@@ -8,6 +8,7 @@ import re
 import random
 import logging
 import pickle
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -17,8 +18,6 @@ from gnn_hpool.utils.global_variables import *
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
-# no train-test split here
-
 
 class GraphDataset(Dataset):
 
@@ -35,7 +34,6 @@ class GraphDataset(Dataset):
       # 使用固定节点顺序以保证邻接矩阵与特征对齐
       nodelist = list(graph.nodes())
       adj = nx.to_numpy_array(graph, nodelist=nodelist, dtype=np.float32)
-      # node features：来自节点属性 'features'
       feature_dim = self._hparams.channel_list[0]
       node_tmp_feature = np.zeros((self._hparams.max_num_nodes, feature_dim), dtype=np.float32)
       for idx, node_id in enumerate(nodelist):
@@ -63,14 +61,13 @@ class GraphDataLoaderWrapper(object):
 
   def __init__(self, hparams):
     self._hparams = hparams_lib.copy_hparams(hparams)
-    # 新数据参数与路径
+
     processed_data_dir = getattr(self._hparams, 'processed_data_dir', '/data/yg/Subgraph-MIL/Data/processed_data')
     data_name = getattr(self._hparams, 'data_name', None)
     if not data_name:
       raise ValueError('缺少 data_name 参数，请在配置中设置 data_name')
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
 
-    # 读取 pickle 数据
     with open(dataset_path, 'rb') as f:
       dataset = pickle.load(f)
 
@@ -85,36 +82,88 @@ class GraphDataLoaderWrapper(object):
     max_num_nodes = int(dataset['dataset_metadata'].get('max_num_nodes', max(len(g.nodes()) for g in subgraphs)))
     self._hparams.max_num_nodes = max_num_nodes
 
-    # 切分训练/测试子图
+    # 原有：切分训练/测试子图（保留）
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
 
-    # 固定为五折
-    self.fold_num = 5
+    # 新增：构造“全集”用于Repeated Holdout（合并train+test）
+    self._subgraphs = subgraphs
+    self._dataset_raw = dataset
+    self.all_indices = list(train_indices) + list(test_indices)
+    self.all_graphs = [subgraphs[i] for i in self.all_indices]
+    self.all_labels = np.array([int(g.graph.get('label', 0)) for g in self.all_graphs])
+    self.all_groups = self._resolve_group_ids(dataset, subgraphs, self.all_indices)
+
+    # 使用配置文件中的fold_num（原K折，不再用于Holdout，但保留）
+    self.fold_num = getattr(self._hparams, 'fold_num', 5)
     self.train_count = len(self.train_graphs)
     self.val_size = max(1, self.train_count // self.fold_num)
 
-  def get_loader(self, val_idx):
-    # 五折交叉：仅基于训练集划分
-    graph_tmp = list(self.train_graphs)
-    random.shuffle(graph_tmp)
+    # 预生成分层K折索引（不重叠、类别均衡）
+    self._train_labels = np.array([int(g.graph.get('label', 0)) for g in self.train_graphs])
+    skf = StratifiedKFold(
+        n_splits=self.fold_num,
+        shuffle=True,
+        random_state=getattr(self._hparams, 'cv_seed', 1024)
+    )
+    self.folds = [(tr_idx, val_idx) for tr_idx, val_idx in skf.split(np.arange(self.train_count), self._train_labels)]
 
-    start = val_idx * self.val_size
-    end = (val_idx + 1) * self.val_size if val_idx < (self.fold_num - 1) else self.train_count
-    val_graphs = graph_tmp[start:end]
-    train_graphs = graph_tmp[:start] + graph_tmp[end:]
-
+  def get_loader(self, val_idx, inner_val_frac=None):
+    # 分层K折：严格不重叠
+    train_idx, val_idx_arr = self.folds[val_idx]
+    train_graphs = [self.train_graphs[i] for i in train_idx]
+    val_graphs = [self.train_graphs[i] for i in val_idx_arr]
+  
     logging.info('\n * the length of training sets is {}; \n * the length of validation sets is {}'
                  .format(len(train_graphs), len(val_graphs)))
-
+  
+    # 可选：在训练集内再切 inner-val（分层）
+    inner_loader = None
+    if inner_val_frac is None:
+        inner_val_frac = getattr(self._hparams, 'inner_val_frac', 0.1)
+    if inner_val_frac and inner_val_frac > 0.0:
+        labels_tr = np.array([int(g.graph.get('label', 0)) for g in train_graphs])
+        sss = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=inner_val_frac,
+            random_state=getattr(self._hparams, 'cv_seed', 1024)
+        )
+        main_idx, inner_idx = next(sss.split(np.arange(len(train_graphs)), labels_tr))
+        inner_graphs = [train_graphs[i] for i in inner_idx]
+        train_graphs = [train_graphs[i] for i in main_idx]
+        inner_set = GraphDataset(self._hparams, inner_graphs)
+        inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False)
+  
     training_set = GraphDataset(self._hparams, train_graphs)
     validation_set = GraphDataset(self._hparams, val_graphs)
-
+  
     training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
     validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False)
+  
+    return training_loader, inner_loader, validation_loader
 
-    return training_loader, validation_loader
-
+  def get_full_train_with_inner_loader(self, inner_val_frac=None):
+      if inner_val_frac is None:
+          inner_val_frac = getattr(self._hparams, 'inner_val_frac', 0.1)
+      train_graphs = list(self.train_graphs)
+      labels_tr = np.array([int(g.graph.get('label', 0)) for g in train_graphs])
+  
+      sss = StratifiedShuffleSplit(
+          n_splits=1,
+          test_size=inner_val_frac,
+          random_state=getattr(self._hparams, 'cv_seed', 1024)
+      )
+      main_idx, inner_idx = next(sss.split(np.arange(len(train_graphs)), labels_tr))
+      main_graphs = [train_graphs[i] for i in main_idx]
+      inner_graphs = [train_graphs[i] for i in inner_idx]
+  
+      training_set = GraphDataset(self._hparams, main_graphs)
+      inner_set = GraphDataset(self._hparams, inner_graphs)
+  
+      training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
+      inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False)
+      return training_loader, inner_loader
+  
   def get_full_train_loader(self):
     training_set = GraphDataset(self._hparams, self.train_graphs)
     return DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
@@ -122,6 +171,100 @@ class GraphDataLoaderWrapper(object):
   def get_test_loader(self):
     test_set = GraphDataset(self._hparams, self.test_graphs)
     return DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False)
+
+  def _resolve_group_ids(self, dataset, subgraphs, indices):
+    # 优先从dataset字典尝试取组ID数组（必须与subgraphs一一对齐）
+    possible_keys = [
+        'group_ids', 'groups', 'subject_ids', 'patient_ids',
+        'case_ids', 'slice_groups', 'slide_ids', 'group_idx'
+    ]
+    for key in possible_keys:
+      if key in dataset:
+        arr = dataset[key]
+        if isinstance(arr, (list, np.ndarray)) and len(arr) == len(subgraphs):
+          return [arr[i] for i in indices]
+
+    # 次选：从每个Graph的graph属性尝试取组ID；若无则退化为每图独立组
+    group_keys_in_graph = [
+        'group_id', 'group', 'subject_id', 'patient_id',
+        'case_id', 'slice_group', 'slide_id'
+    ]
+    resolved = []
+    for i in indices:
+      G = subgraphs[i]
+      gid = None
+      for k in group_keys_in_graph:
+        if k in G.graph:
+          gid = G.graph.get(k)
+          break
+      if gid is None:
+        gid = i
+      resolved.append(gid)
+    return resolved
+
+  def get_holdout_loaders(self, seed=None, train_frac=0.6, val_frac=0.2, test_frac=0.2):
+    """
+    重复随机留出：分组分层的6:2:2划分
+    - 组：若能解析到，则按组划分；否则每图视作独立组
+    - 分层：在“组”层面按多数标签进行分层抽样
+    返回：training_loader, validation_loader, test_loader
+    """
+    # 校验比例
+    total = train_frac + val_frac + test_frac
+    if abs(total - 1.0) > 1e-6:
+      raise ValueError(f'划分比例之和应为1.0，当前={total}')
+    if seed is None:
+      seed = getattr(self._hparams, 'cv_seed', 1024)
+
+    labels = self.all_labels
+    groups = np.array(self.all_groups)
+    unique_groups, group_inverse = np.unique(groups, return_inverse=True)
+    num_groups = len(unique_groups)
+
+    # 计算每组标签（多数表决；若组内标签一致则直接使用）
+    group_labels_list = [[] for _ in range(num_groups)]
+    for sample_idx, g_idx in enumerate(group_inverse):
+      group_labels_list[g_idx].append(labels[sample_idx])
+    group_labels = np.array([
+      int(np.round(np.mean(lst))) if len(set(lst)) > 1 else lst[0]
+      for lst in group_labels_list
+    ])
+
+    # Step1: 组层面划分 test vs 其余（分层随机）
+    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=seed)
+    group_indices = np.arange(num_groups)
+    train_val_group_idx, test_group_idx = next(sss_test.split(group_indices, group_labels))
+
+    # Step2: 在train_val内部再划分 train vs val（相对比例）
+    relative_val_frac = val_frac / (train_frac + val_frac)  # 0.2/0.8 = 0.25
+    sss_val = StratifiedShuffleSplit(n_splits=1, test_size=relative_val_frac, random_state=seed + 1)
+    tr_group_idx, val_group_idx = next(sss_val.split(train_val_group_idx, group_labels[train_val_group_idx]))
+
+    # 映射到样本索引
+    train_groups = set(unique_groups[train_val_group_idx[tr_group_idx]])
+    val_groups   = set(unique_groups[train_val_group_idx[val_group_idx]])
+    test_groups  = set(unique_groups[test_group_idx])
+
+    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
+    val_idx   = [i for i, g in enumerate(groups) if g in val_groups]
+    test_idx  = [i for i, g in enumerate(groups) if g in test_groups]
+
+    train_graphs = [self.all_graphs[i] for i in train_idx]
+    val_graphs   = [self.all_graphs[i] for i in val_idx]
+    test_graphs  = [self.all_graphs[i] for i in test_idx]
+
+    logging.info(f'Holdout split sizes: train={len(train_graphs)}, val={len(val_graphs)}, test={len(test_graphs)}')
+
+    # 构建 DataLoader
+    training_set   = GraphDataset(self._hparams, train_graphs)
+    validation_set = GraphDataset(self._hparams, val_graphs)
+    test_set       = GraphDataset(self._hparams, test_graphs)
+
+    training_loader   = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
+    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False)
+    test_loader       = DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False)
+
+    return training_loader, validation_loader, test_loader
 
 
 def read_graphfile(datadir, dataname, max_nodes=None):
