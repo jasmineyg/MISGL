@@ -82,38 +82,7 @@ def train_eval(hparams):
 
   return {'seeds': seeds, 'results': all_results, 'summary': summary}
 
-  # all_vals = []
-  # for val_idx in range(hparams.fold_num):
-  #   logging.warning('* validation index: {}'.format(val_idx))
-  #   training_loader, inner_val_loader, validation_loader = data_loader.get_loader(
-  #     val_idx, inner_val_frac=getattr(hparams, 'inner_val_frac', 0.1)
-  #   )
-  #   summary_writer = tensorboardX.SummaryWriter(
-  #     logdir=os.path.join(hparams.model_save_path, str(hparams.timestamp) + '/val_{}'.format(val_idx))
-  #   )
-  #
-  #   model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
-  #   _, val_accs = train_eval_iter(model, training_loader, inner_val_loader, validation_loader, summary_writer, hparams)
-  #   all_vals.append(np.array(val_accs))
-  #
-  # all_vals = np.vstack(all_vals)
-  # all_vals = np.mean(all_vals, axis=0)
-  # logging.warning('* all of the validation results: {}'.format(all_vals))
-  # logging.warning('* the best validation results & its id: {} @ {}'.format(np.max(all_vals), np.argmax(all_vals)))
-  #
-  # final_train_loader, final_inner_loader = data_loader.get_full_train_with_inner_loader(
-  #   inner_val_frac=getattr(hparams, 'inner_val_frac', 0.1)
-  # )
-  # final_test_loader = data_loader.get_test_loader()
-  # summary_writer = tensorboardX.SummaryWriter(
-  #   logdir=os.path.join(hparams.model_save_path, str(hparams.timestamp) + '/final_test')
-  # )
-  # final_model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
-  # train_eval_iter(final_model, final_train_loader, final_inner_loader, final_inner_loader, summary_writer, hparams)
-  # test_result = evaluate(final_test_loader, final_model, hparams, analyze_attention=True, dataset_name="test")
-  # logging.warning('Final test result (acc): {:.4f}'.format(test_result['acc']))
 
-  # function train_eval_iter(model, train_dataset, eval_dataset, writer, hparams)
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
     import copy
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=hparams.learning_rate)

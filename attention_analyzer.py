@@ -171,74 +171,72 @@ def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attenti
                 global_graph_idx += len(data[g_key.y])
                 continue
 
-            a = out['branch_b']['a'].view(-1).clamp(1e-6, 1-1e-6)  # [B*M]
+            a = out['branch_b']['a'].view(-1).clamp(1e-6, 1-1e-6)  # 注意力一维拼接：[sum_i n_i]
             graph_labels = data[g_key.y].view(-1)                  # [B]
             x = data[g_key.x]                                      # [B, M, D]
 
             B = graph_labels.size(0)
-            if a.numel() % B != 0:
-                print(f"错误：注意力长度 {a.numel()} 不能被 batch_size {B} 整除")
-            M = a.numel() // B
-
-            # 构造“batch”分组（等价 PyG 的 data.batch）
-            batch_vec = torch.arange(B, device=a.device).repeat_interleave(M)  # [B*M]
-
-            # 用特征非零判断真实节点（避免依赖 node_num）
+            # 用特征非零判断每图真实节点数（避免依赖 node_num）
             real_mask = (x.abs().sum(dim=-1) > 0)       # [B, M]
-            real_mask_flat = real_mask.view(-1)         # [B*M]
+            counts = real_mask.sum(dim=1).long()        # [B], 每图真实节点数 n_i
 
-            print(f"批次 {batch_idx}: {B} 个图, 总节点块长度: {a.numel()}, 每图块大小 M: {M}")
+            print(f"批次 {batch_idx}: {B} 个图, 注意力总长度: {a.numel()}")
 
+            # 动态按每图真实节点数切片
+            offset = 0
             for i in range(B):
                 current_graph_idx = global_graph_idx + i
                 graph_label = int(graph_labels[i].item())
 
-                # 取出第 i 图所有节点的注意力（固定块），再过滤真实节点
-                a_i = a[i*M:(i+1)*M]                         # [M]
-                real_i = real_mask[i]                        # [M]
-                a_i_real = a_i[real_i]                       # [n_i]
-                n_i = int(a_i_real.numel())
+                n_i = int(counts[i].item())
+                if n_i == 0:
+                    print(f"  处理图 {current_graph_idx}: 真实节点数为 0，跳过")
+                    continue
+
+                a_i_real = a[offset: offset + n_i]       # [n_i]
+                offset += n_i
 
                 print(f"  处理图 {current_graph_idx}: 真实节点数 n_i={n_i}, 标签(真实): {graph_label}")
 
-                # 加载该图的真实节点标签 node_y（来自数据集）
+                # 加载该图的真实节点标签（若不可用则继续写注意力）
                 node_labels = load_real_node_labels(hparams, current_graph_idx)
-                if node_labels is None:
-                    print(f"  图 {current_graph_idx}: 无法加载真实节点标签，跳过真实Hit统计")
-                    continue
-                if len(node_labels) != n_i:
-                    print(f"  图 {current_graph_idx}: node_y长度不匹配 ({len(node_labels)} vs {n_i})，按较小值对齐")
-                    n_i = min(n_i, len(node_labels))
-                    a_i_real = a_i_real[:n_i]
-                    node_labels = np.array(node_labels, dtype=int)[:n_i]
-                else:
-                    node_labels = np.array(node_labels, dtype=int)
+                node_labels_arr = None
+                if node_labels is not None:
+                    if len(node_labels) != n_i:
+                        print(f"  图 {current_graph_idx}: node_y长度不匹配 ({len(node_labels)} vs {n_i})，按较小值对齐")
+                        n_i = min(n_i, len(node_labels))
+                        a_i_real = a_i_real[:n_i]
+                        node_labels_arr = np.array(node_labels, dtype=int)[:n_i]
+                    else:
+                        node_labels_arr = np.array(node_labels, dtype=int)
 
-                positive_nodes = int(np.sum(node_labels))
-                if graph_label == 1 and positive_nodes > 0:
-                    # 只在正图且至少1个正节点时统计
-                    # Hit@k
-                    top_k = min(k, n_i)
-                    top_k_idx = torch.topk(a_i_real, top_k, largest=True).indices.cpu().numpy()
-                    hit_k = int(np.any(node_labels[top_k_idx] == 1))
+                # 仅在存在节点标签时计算命中指标
+                if node_labels_arr is not None:
+                    positive_nodes = int(np.sum(node_labels_arr))
+                    if graph_label == 1 and positive_nodes > 0:
+                        # Hit@k
+                        top_k = min(k, n_i)
+                        top_k_idx = torch.topk(a_i_real, top_k, largest=True).indices.cpu().numpy()
+                        hit_k = int(np.any(node_labels_arr[top_k_idx] == 1))
 
-                    # Hit@r%
-                    r_count = max(1, int(np.ceil(r_percent / 100.0 * n_i)))
-                    top_r_idx = torch.topk(a_i_real, r_count, largest=True).indices.cpu().numpy()
-                    hit_r = int(np.any(node_labels[top_r_idx] == 1))
+                        # Hit@r%
+                        r_count = max(1, int(np.ceil(r_percent / 100.0 * n_i)))
+                        top_r_idx = torch.topk(a_i_real, r_count, largest=True).indices.cpu().numpy()
+                        hit_r = int(np.any(node_labels_arr[top_r_idx] == 1))
 
                     # 记录到列表（供最终汇总）
                     # ... existing code ...
                 else:
-                    print(f"  图 {current_graph_idx}: 跳过Hit统计（非正图或无正节点，正节点数={positive_nodes}）")
+                    print(f"  图 {current_graph_idx}: 跳过Hit统计（非正图或无正节点）")
 
-                # 组装Excel节点数据（仅真实节点）
+                # 组装Excel节点数据（标签缺失时 node_class = -1）
                 node_data = []
                 for node_id in range(n_i):
+                    cls = int(node_labels_arr[node_id]) if node_labels_arr is not None else -1
                     node_data.append({
                         'node_id': node_id,
                         'attention_weight': float(a_i_real[node_id].item()),
-                        'node_class': int(node_labels[node_id])
+                        'node_class': cls
                     })
                 node_data.sort(key=lambda x: x['attention_weight'], reverse=True)
 

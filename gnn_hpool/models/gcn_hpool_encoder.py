@@ -61,7 +61,8 @@ class GcnHpoolEncoder(Module):
     bb_cfg = getattr(self._hparams, 'branch_b', None)
     self._use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
     if self._use_branch_b:
-        node_dim_B = 2 * self._hparams.channel_list[3] + self._hparams.channel_list[4]
+        # 使用原图一层GCN后的节点特征维度
+        node_dim_B = self._hparams.channel_list[2]
         attn_hidden = bb_cfg.get('attn_hidden', 128)
         gate_hidden = bb_cfg.get('gate_hidden', 64)
         self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden, gate_hidden)
@@ -92,11 +93,21 @@ class GcnHpoolEncoder(Module):
     output = torch.cat([output_1, output_2], dim=1)
     ypred = self.pred_model(output)
 
-    # 分支B
+    # 分支B：改为使用 embedding_tensor_1（原图一层GCN后的节点特征）
     if getattr(self, '_use_branch_b', False):
-        B, M, D = node_embed.size()
-        h_flat = node_embed.reshape(B * M, D)
-        batch_vec = torch.arange(B, device=self._device).repeat_interleave(M)
+        B = embedding_tensor_1.size(0)
+        D = embedding_tensor_1.size(2)
+        # 按每个图的真实节点数截取，避免包含填充节点
+        if isinstance(batch_num_nodes, torch.Tensor):
+            num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+        else:
+            num_list = [int(n) for n in batch_num_nodes]
+        chunks = [embedding_tensor_1[i, :num_list[i], :] for i in range(B)]
+        h_flat = torch.cat(chunks, dim=0)
+        batch_vec = torch.cat([
+            torch.full((num_list[i],), i, device=self._device, dtype=torch.long)
+            for i in range(B)
+        ], dim=0)
         b_out = self.mil_branch_b(h_flat, None, batch_vec)
         return {'ypred_A': ypred, 'branch_b': b_out}
     return ypred
