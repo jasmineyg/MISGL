@@ -109,6 +109,29 @@ class GcnHpoolEncoder(Module):
             for i in range(B)
         ], dim=0)
         b_out = self.mil_branch_b(h_flat, None, batch_vec)
+
+        # 增加：返回按 [B,M] 对齐的有效掩码与填充注意力
+        M = embedding_tensor_1.size(1)
+        if embedding_mask is not None:
+            mask_valid = embedding_mask.squeeze(2).bool()  # [B,M]
+        else:
+            mask_valid = torch.zeros(B, M, dtype=torch.bool, device=self._device)
+            for i in range(B):
+                mask_valid[i, :num_list[i]] = True
+
+        a = b_out['a']  # [sum_i n_i]
+        a_pad = torch.zeros(B, M, device=self._device)
+        for i in range(B):
+            idx_i = (batch_vec == i).nonzero(as_tuple=True)[0]  # 该图在拼接向量中的位置
+            n_i = num_list[i]
+            if idx_i.numel() > 0 and n_i > 0:
+                a_pad[i, :n_i] = a[idx_i][:n_i]
+        a_pad = torch.clamp(a_pad, min=1e-6, max=1.0 - 1e-6)
+
+        # 将对齐信息并入返回
+        b_out['a_pad'] = a_pad
+        b_out['mask_valid'] = mask_valid
+
         return {'ypred_A': ypred, 'branch_b': b_out}
     return ypred
 

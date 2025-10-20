@@ -98,36 +98,6 @@ def load_real_node_labels(hparams, graph_idx):
         return None
 
 
-def generate_node_labels(graph_label, num_nodes, seed=42):
-    """
-    临时生成节点标签的函数（备用方案）
-    
-    Args:
-        graph_label: 图级标签 (0或1)
-        num_nodes: 节点数量
-        seed: 随机种子
-    
-    Returns:
-        node_labels: numpy数组，形状为[num_nodes]，值为0或1
-    """
-    np.random.seed(seed)
-    
-    if graph_label == 0:
-        # 负图：所有节点都是负类
-        return np.zeros(num_nodes, dtype=int)
-    else:
-        # 正图：随机生成一些正类节点
-        # 确保至少有一个正类节点
-        node_labels = np.zeros(num_nodes, dtype=int)
-        num_positive = max(1, min(num_nodes, int(num_nodes * 0.3)))  # 30%的节点为正类，但不超过总节点数
-        # 防止num_positive超过num_nodes导致np.random.choice出错
-        if num_positive > num_nodes:
-            num_positive = num_nodes
-        positive_indices = np.random.choice(num_nodes, num_positive, replace=False)
-        node_labels[positive_indices] = 1
-        return node_labels
-
-
 def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attention_analysis.xlsx', k=3, r_percent=10):
     """
     分析分支B的注意力权重并计算Hit@k指标
@@ -171,65 +141,60 @@ def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attenti
                 global_graph_idx += len(data[g_key.y])
                 continue
 
-            a = out['branch_b']['a'].view(-1).clamp(1e-6, 1-1e-6)  # 注意力一维拼接：[sum_i n_i]
-            graph_labels = data[g_key.y].view(-1)                  # [B]
-            x = data[g_key.x]                                      # [B, M, D]
+            branch_b = out['branch_b']
+            a_pad = branch_b.get('a_pad', None)           # [B,M]
+            mask_valid = branch_b.get('mask_valid', None) # [B,M] bool
+            graph_labels = data[g_key.y].view(-1)         # [B]
+            node_num = data[g_key.node_num].view(-1)      # [B]
 
-            B = graph_labels.size(0)
-            # 用特征非零判断每图真实节点数（避免依赖 node_num）
-            real_mask = (x.abs().sum(dim=-1) > 0)       # [B, M]
-            counts = real_mask.sum(dim=1).long()        # [B], 每图真实节点数 n_i
+            if a_pad is None or mask_valid is None:
+                print("模型未返回 a_pad/mask_valid，无法稳定对齐；请应用模型端补丁")
+                continue
 
-            print(f"批次 {batch_idx}: {B} 个图, 注意力总长度: {a.numel()}")
+            B, M = a_pad.size()
+            print(f"处理批次 {batch_idx}: {B} 个图, 每图填充长度 M={M}")
 
-            # 动态按每图真实节点数切片
-            offset = 0
             for i in range(B):
                 current_graph_idx = global_graph_idx + i
-                graph_label = int(graph_labels[i].item())
-
-                n_i = int(counts[i].item())
-                if n_i == 0:
-                    print(f"  处理图 {current_graph_idx}: 真实节点数为 0，跳过")
+                graph_label_i = int(graph_labels[i].item())  # 显式定义该图的标签
+                n_i = int(node_num[i].item())
+                if n_i <= 0:
+                    print(f"  图 {current_graph_idx}: 真实节点数为 0，跳过")
                     continue
 
-                a_i_real = a[offset: offset + n_i]       # [n_i]
-                offset += n_i
+                valid_mask_i = mask_valid[i]          # [M] bool
+                a_i_real = a_pad[i][valid_mask_i]     # [n_i]
+                print(f"  处理图 {current_graph_idx}: 真实节点数 n_i={n_i}, 标签(真实): {graph_label_i}")
 
-                print(f"  处理图 {current_graph_idx}: 真实节点数 n_i={n_i}, 标签(真实): {graph_label}")
-
-                # 加载该图的真实节点标签（若不可用则继续写注意力）
+                # 载入该图的真实节点标签（若不可用仍导出注意力）
                 node_labels = load_real_node_labels(hparams, current_graph_idx)
                 node_labels_arr = None
                 if node_labels is not None:
-                    if len(node_labels) != n_i:
-                        print(f"  图 {current_graph_idx}: node_y长度不匹配 ({len(node_labels)} vs {n_i})，按较小值对齐")
-                        n_i = min(n_i, len(node_labels))
-                        a_i_real = a_i_real[:n_i]
-                        node_labels_arr = np.array(node_labels, dtype=int)[:n_i]
+                    node_labels = np.asarray(node_labels)
+                    if len(node_labels) == M:
+                        node_labels_arr = node_labels[valid_mask_i.cpu().numpy()]  # 对齐到 n_i
+                    elif len(node_labels) == n_i:
+                        node_labels_arr = node_labels
                     else:
-                        node_labels_arr = np.array(node_labels, dtype=int)
+                        print(f"  图 {current_graph_idx}: node_y长度不匹配 ({len(node_labels)} vs {n_i})，按 n_i 裁剪")
+                        node_labels_arr = node_labels[:n_i]
 
-                # 仅在存在节点标签时计算命中指标
+                # 计算 Hit 指标（仅当存在标签且为正图）
                 if node_labels_arr is not None:
                     positive_nodes = int(np.sum(node_labels_arr))
-                    if graph_label == 1 and positive_nodes > 0:
-                        # Hit@k
+                    if graph_label_i == 1 and positive_nodes > 0:
                         top_k = min(k, n_i)
                         top_k_idx = torch.topk(a_i_real, top_k, largest=True).indices.cpu().numpy()
                         hit_k = int(np.any(node_labels_arr[top_k_idx] == 1))
 
-                        # Hit@r%
                         r_count = max(1, int(np.ceil(r_percent / 100.0 * n_i)))
                         top_r_idx = torch.topk(a_i_real, r_count, largest=True).indices.cpu().numpy()
                         hit_r = int(np.any(node_labels_arr[top_r_idx] == 1))
 
-                    # 记录到列表（供最终汇总）
-                    # ... existing code ...
                 else:
-                    print(f"  图 {current_graph_idx}: 跳过Hit统计（非正图或无正节点）")
+                    print(f"  图 {current_graph_idx}: 节点标签不可用，仅导出注意力")
 
-                # 组装Excel节点数据（标签缺失时 node_class = -1）
+                # 组装Excel节点数据（确保使用英文键 attention_weight）
                 node_data = []
                 for node_id in range(n_i):
                     cls = int(node_labels_arr[node_id]) if node_labels_arr is not None else -1
@@ -238,16 +203,17 @@ def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attenti
                         'attention_weight': float(a_i_real[node_id].item()),
                         'node_class': cls
                     })
-                node_data.sort(key=lambda x: x['attention_weight'], reverse=True)
 
+                # 排序并写入 graph_info（统一使用 graph_label_i）
+                node_data.sort(key=lambda x: x['attention_weight'], reverse=True)
                 graph_info = {
                     'graph_idx': current_graph_idx,
-                    'graph_label': graph_label,
+                    'graph_label': graph_label_i,   # ← 修正
                     'num_nodes': n_i,
-                    'node_data': node_data
+                    'node_data': node_data,
                 }
                 all_graph_data.append(graph_info)
-                if graph_label == 1:
+                if graph_label_i == 1:             # ← 修正
                     positive_graphs_data.append(graph_info)
 
             global_graph_idx += B
@@ -261,14 +227,17 @@ def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attenti
             for graph_info in all_graph_data:
                 # 创建DataFrame
                 df_data = []
-                for node in graph_info['node_data']:
+                for node in node_data:
                     df_data.append([
                         node['node_id'],
                         node['attention_weight'],
                         node['node_class']
                     ])
-                
                 df = pd.DataFrame(df_data, columns=['节点编号', '注意力权重', '节点类别'])
+                
+                # 下游DataFrame组装保持：
+                # df_data = [[node['node_id'], node['attention_weight'], node['node_class']] for node in node_data]
+                # df = pd.DataFrame(df_data, columns=['节点编号', '注意力权重', '节点类别'])
                 
                 # 写入sheet，sheet名称包含图索引和标签
                 sheet_name = f"Graph_{graph_info['graph_idx']}_Label_{graph_info['graph_label']}"
