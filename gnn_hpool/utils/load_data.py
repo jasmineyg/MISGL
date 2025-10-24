@@ -47,6 +47,12 @@ class GraphDataset(Dataset):
       graph_tmp_dict[g_key.node_num] = torch.tensor(num_nodes, dtype=torch.int16).to(self._device)
       graph_tmp_dict[g_key.adj_mat] = torch.zeros(self._hparams.max_num_nodes, self._hparams.max_num_nodes).to(self._device)
       graph_tmp_dict[g_key.adj_mat][:num_nodes, :num_nodes] = torch.tensor(adj, dtype=torch.float32).to(self._device)
+      orig_idx = graph.graph.get('orig_idx', -1)
+      try:
+        orig_idx = int(orig_idx)
+      except (TypeError, ValueError):
+        orig_idx = -1
+      graph_tmp_dict[g_key.orig_graph_idx] = torch.tensor(orig_idx, dtype=torch.long).to(self._device)
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
 
@@ -86,11 +92,14 @@ class GraphDataLoaderWrapper(object):
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
 
-    # 新增：构造“全集”用于Repeated Holdout（合并train+test）
     self._subgraphs = subgraphs
     self._dataset_raw = dataset
     self.all_indices = list(train_indices) + list(test_indices)
-    self.all_graphs = [subgraphs[i] for i in self.all_indices]
+    self.all_graphs = []
+    for orig_idx in self.all_indices:
+      graph = subgraphs[orig_idx]
+      graph.graph['orig_idx'] = int(orig_idx)
+      self.all_graphs.append(graph)
     self.all_labels = np.array([int(g.graph.get('label', 0)) for g in self.all_graphs])
     self.all_groups = self._resolve_group_ids(dataset, subgraphs, self.all_indices)
 

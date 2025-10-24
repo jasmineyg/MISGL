@@ -23,6 +23,7 @@ from gnn_hpool.utils.global_variables import *
 from gnn_hpool.utils.evaluate import evaluate
 from gnn_hpool.utils import load_data
 from gnn_hpool.models import gcn_hpool_encoder
+from attention_analyzer import export_branchB_attention_from_model
 
 
 def train_eval(hparams):
@@ -63,13 +64,17 @@ def train_eval(hparams):
     # 训练+早停都用val
     train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams)
 
-    # 测试：单次评估
-    result = evaluate(test_loader, model, hparams, analyze_attention=True, dataset_name="test")
+    result = evaluate(test_loader, model, hparams, dataset_name="test")
     all_results.append(result)
     for key in test_metrics.keys():
       test_metrics[key].append(result[key])
 
-  # 汇总 mean ± std（不偏估计ddof=1）
+    # 导出分支B注意力（与当前 holdout 轮次的最佳权重一致）
+    out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
+    export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path)
+    for key in test_metrics.keys():
+      test_metrics[key].append(result[key])
+
   summary = {
     key: {
       'mean': float(np.mean(vals)),

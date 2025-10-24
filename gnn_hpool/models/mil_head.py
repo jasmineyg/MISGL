@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from torch_scatter import scatter_mean, scatter_add
+from torch_scatter import scatter_mean, scatter_add, scatter_max
 
 
 class GatedAttentionScorer(nn.Module):
@@ -30,7 +30,17 @@ class MILBranchB(nn.Module):
         self.scorer = GatedAttentionScorer(in_dim=4 * node_dim, hidden=attn_hidden)
         self.gate = nn.Sequential(  # g = σ(MLP_g(c))
             nn.Linear(node_dim, gate_hidden), nn.ReLU(), nn.Linear(gate_hidden, 1)
+
         )
+
+    def graph_softmax(self, s, batch, tau=1.0, eps=1e-9):
+        s = s / tau
+        # log-sum-exp 的稳定实现
+        m = scatter_max(s, batch, dim=0)[0][batch]  # [N]
+        exp = torch.exp(s - m)
+        Z = scatter_add(exp, batch, dim=0)[batch] + eps  # [N]
+        return (exp / Z).clamp(1e-6, 1 - 1e-6)  # [N]
+
 
     def forward(self, h, edge_index, batch, c_override=None):
         # Step1: graph context c [B,d]
@@ -44,6 +54,7 @@ class MILBranchB(nn.Module):
         s = self.scorer(phi)                      # [N]
         s = s.clamp(min=-12.0, max=12.0)          # 防止极端值
         a = torch.sigmoid(s)                      # [N]
+        # a = self.graph_softmax(s, batch, 1.0, 1e-9)
         a = torch.clamp(a, min=1e-6, max=1.0 - 1e-6)  # 改为非就地操作
         
         # Step4: dual readout
@@ -52,7 +63,7 @@ class MILBranchB(nn.Module):
         sumlog = scatter_add(log1m, batch, dim=0)   # [B]
         y_sparse = 1.0 - torch.exp(sumlog)          # [B]
         y_sparse = torch.clamp(y_sparse, min=1e-6, max=1.0 - 1e-6)
-        
+
         # Mean per graph
         y_dense = scatter_mean(a, batch, dim=0)
         y_dense = torch.clamp(y_dense, min=1e-6, max=1.0 - 1e-6)

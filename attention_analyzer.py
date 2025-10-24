@@ -1,287 +1,244 @@
-import torch
-import numpy as np
-import pandas as pd
-from collections import defaultdict
+# coding=utf-8
 import os
-import pickle
+import argparse
+import logging
+import numpy as np
+import torch
+import pandas as pd
+
+from gnn_hpool.utils.hparam import HParams
+from gnn_hpool.utils.global_variables import g_key
+from gnn_hpool.utils.load_data import GraphDataLoaderWrapper
+from gnn_hpool.models.gcn_hpool_encoder import GcnHpoolEncoder
 
 
-def load_real_node_labels(hparams, graph_idx):
-    """
-    从原始数据加载真实的节点标签
-    
-    Args:
-        hparams: 超参数配置
-        graph_idx: 图索引
-    
-    Returns:
-        node_labels: numpy数组，形状为[num_nodes]，值为0或1
-    """
-    try:
-        # 构建数据集路径
-        processed_data_dir = getattr(hparams, 'processed_data_dir', '/data/yg/Subgraph-MIL/Data/processed_data')
-        data_name = getattr(hparams, 'data_name', None)
-        if not data_name:
-            print(f"缺少data_name参数，无法加载真实节点标签")
-            return None
-            
-        dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
-        
-        # 读取pickle数据
-        with open(dataset_path, 'rb') as f:
-            dataset = pickle.load(f)
-        
-        # 获取测试集索引
-        test_indices = dataset['train_test_split']['test_indices']
-        
-        # 检查图索引是否有效
-        if graph_idx >= len(test_indices):
-            print(f"图索引 {graph_idx} 超出测试集范围 (测试集大小: {len(test_indices)})")
-            return None
-            
-        # 获取实际的图索引
-        actual_graph_idx = test_indices[graph_idx]
-        
-        # 方法1：尝试使用subgraph_structures中的节点信息
-        if 'subgraph_structures' in dataset:
-            subgraphs = dataset['subgraph_structures']
-            if actual_graph_idx < len(subgraphs):
-                graph = subgraphs[actual_graph_idx]
-                nodelist = list(graph.nodes())
-                
-                # 检查是否有node_binary_labels
-                if 'node_binary_labels' in dataset:
-                    node_binary_labels = dataset['node_binary_labels']
-                    node_labels = []
-                    
-                    for node_id in nodelist:
-                        if node_id < len(node_binary_labels):
-                            node_labels.append(node_binary_labels[node_id])
-                        else:
-                            node_labels.append(0)  # 默认为0
-                    
-                    result = np.array(node_labels, dtype=int)
-                    print(f"图 {graph_idx}: 从subgraph_structures+node_binary_labels加载了 {len(result)} 个节点标签，正类节点数: {np.sum(result)}")
-                    return result
-        
-        # 方法2：如果方法1失败，尝试使用subgraph_assignment
-        if 'subgraph_assignment' in dataset and 'node_binary_labels' in dataset:
-            subgraph_assignment = dataset['subgraph_assignment']
-            node_binary_labels = dataset['node_binary_labels']
-            
-            if actual_graph_idx < len(subgraph_assignment):
-                subgraph_nodes = subgraph_assignment[actual_graph_idx]
-                
-                # 检查subgraph_nodes的类型
-                if isinstance(subgraph_nodes, int):
-                    print(f"警告：subgraph_assignment[{actual_graph_idx}] 是单个整数 {subgraph_nodes}，而不是节点列表")
-                    return None
-                
-                # 提取这些节点的二分类标签
-                node_labels = []
-                for node_id in subgraph_nodes:
-                    if node_id < len(node_binary_labels):
-                        node_labels.append(node_binary_labels[node_id])
-                    else:
-                        print(f"警告：节点ID {node_id} 超出node_binary_labels范围")
-                        node_labels.append(0)  # 默认为0
-                
-                result = np.array(node_labels, dtype=int)
-                print(f"图 {graph_idx}: 从subgraph_assignment+node_binary_labels加载了 {len(result)} 个节点标签，正类节点数: {np.sum(result)}")
-                return result
-        
-        print(f"无法加载图 {graph_idx} 的节点标签：缺少必要的数据字段")
-        return None
-        
-    except Exception as e:
-        print(f"加载节点标签失败 (图索引: {graph_idx}): {e}")
-        return None
+def export_branchB_attention_to_excel(hparams, output_path, seed=None):
+    # 构造数据加载器（使用 Holdout 划分）
+    data_loader = GraphDataLoaderWrapper(hparams)
 
+    if seed is None:
+        holdout_seeds = getattr(hparams, 'holdout_seeds', None)
+        if isinstance(holdout_seeds, list) and len(holdout_seeds) > 0:
+            seed = int(holdout_seeds[0])
+        else:
+            seed = int(getattr(hparams, 'cv_seed', 1024))
 
-def analyze_attention_and_hit_at_k(model, dataset, hparams, output_path='attention_analysis.xlsx', k=3, r_percent=10):
-    """
-    分析分支B的注意力权重并计算Hit@k指标
-    
-    Args:
-        model: 训练好的模型
-        dataset: 测试数据集
-        hparams: 超参数配置
-        output_path: Excel输出路径
-        k: Hit@k中的k值，默认为3
-    
-    Returns:
-        dict: 包含分析结果的字典
-    """
-    # 导入全局变量
-    from gnn_hpool.utils.global_variables import g_key
-    
+    _, _, test_loader = data_loader.get_holdout_loaders(
+        seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
+    )
+
+    model = GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
     model.eval()
-    
-    # 检查模型是否有分支B
-    if not (hasattr(hparams, 'branch_b') and hparams.branch_b.get('use', False)):
-        print("模型未启用分支B，无法进行注意力分析")
-        return None
-    
-    all_graph_data = []
-    positive_graphs_data = []
-    
-    print("开始提取注意力权重...")
-    
+
+    if not hasattr(hparams, 'branch_b') or not hparams.branch_b.get('use', False):
+        raise RuntimeError("branch_b.use 未开启，无法导出注意力 a。请在配置中启用分支B。")
+
+    # 从原始数据集读取节点二分类标签
+    dataset_raw = data_loader._dataset_raw
+    node_labels_collection = dataset_raw.get('node_binary_labels', None)
+    if node_labels_collection is None:
+        logging.warning("未在数据集 pkl 中找到 key='node_binary_labels'，将以全0占位。")
+
+    # 写 Excel（每个sheet一个graph）
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    writer = pd.ExcelWriter(output_path, engine='openpyxl')
+
     with torch.no_grad():
-        global_graph_idx = 0
-
-        for batch_idx, data in enumerate(dataset):
-            print(f"处理批次 {batch_idx}")
-            for key, value in data.items():
-                data[key] = value.to(hparams.device)
-
-            out = model(data)
-            if not (isinstance(out, dict) and 'branch_b' in out and out['branch_b'] is not None):
-                print(f"批次 {batch_idx} 没有分支B输出")
-                global_graph_idx += len(data[g_key.y])
+        sheet_name_used = set()
+        for _, graph_data in enumerate(test_loader):
+            # 前向调用，获得分支B的对齐注意力（按 [B, M] 填充）
+            out = model(graph_data)
+            if not isinstance(out, dict) or 'branch_b' not in out or out['branch_b'] is None:
+                logging.warning("当前批次没有分支B输出，已跳过。")
                 continue
 
-            branch_b = out['branch_b']
-            a_pad = branch_b.get('a_pad', None)           # [B,M]
-            mask_valid = branch_b.get('mask_valid', None) # [B,M] bool
-            graph_labels = data[g_key.y].view(-1)         # [B]
-            node_num = data[g_key.node_num].view(-1)      # [B]
-
-            if a_pad is None or mask_valid is None:
-                print("模型未返回 a_pad/mask_valid，无法稳定对齐；请应用模型端补丁")
+            b_out = out['branch_b']
+            a_pad = b_out.get('a_pad', None)        # [B, M]
+            mask_valid = b_out.get('mask_valid', None)  # [B, M]，未使用，仅说明有效位置
+            if a_pad is None:
+                logging.warning("未找到 a_pad（分支B注意力对齐向量），已跳过。")
                 continue
 
-            B, M = a_pad.size()
-            print(f"处理批次 {batch_idx}: {B} 个图, 每图填充长度 M={M}")
+            # 取每个样本的真实节点数与原始图索引
+            batch_num_nodes = graph_data[g_key.node_num]
+            orig_idx_tensor = graph_data[g_key.orig_graph_idx]
 
-            for i in range(B):
-                current_graph_idx = global_graph_idx + i
-                graph_label_i = int(graph_labels[i].item())  # 显式定义该图的标签
-                n_i = int(node_num[i].item())
+            # 转到 CPU 处理
+            a_pad_np = a_pad.detach().cpu().numpy()
+            if isinstance(batch_num_nodes, torch.Tensor):
+                num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+            else:
+                num_list = [int(n) for n in batch_num_nodes]
+
+            if isinstance(orig_idx_tensor, torch.Tensor):
+                orig_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
+            else:
+                orig_indices = [int(i) for i in orig_idx_tensor]
+
+            # 逐图写入
+            for i, n_i in enumerate(num_list):
                 if n_i <= 0:
-                    print(f"  图 {current_graph_idx}: 真实节点数为 0，跳过")
                     continue
+                weights = a_pad_np[i, :n_i]
+                orig_idx = orig_indices[i]
 
-                valid_mask_i = mask_valid[i]          # [M] bool
-                a_i_real = a_pad[i][valid_mask_i]     # [n_i]
-                print(f"  处理图 {current_graph_idx}: 真实节点数 n_i={n_i}, 标签(真实): {graph_label_i}")
-
-                # 载入该图的真实节点标签（若不可用仍导出注意力）
-                node_labels = load_real_node_labels(hparams, current_graph_idx)
-                node_labels_arr = None
-                if node_labels is not None:
-                    node_labels = np.asarray(node_labels)
-                    if len(node_labels) == M:
-                        node_labels_arr = node_labels[valid_mask_i.cpu().numpy()]  # 对齐到 n_i
-                    elif len(node_labels) == n_i:
-                        node_labels_arr = node_labels
-                    else:
-                        print(f"  图 {current_graph_idx}: node_y长度不匹配 ({len(node_labels)} vs {n_i})，按 n_i 裁剪")
-                        node_labels_arr = node_labels[:n_i]
-
-                # 计算 Hit 指标（仅当存在标签且为正图）
-                if node_labels_arr is not None:
-                    positive_nodes = int(np.sum(node_labels_arr))
-                    if graph_label_i == 1 and positive_nodes > 0:
-                        top_k = min(k, n_i)
-                        top_k_idx = torch.topk(a_i_real, top_k, largest=True).indices.cpu().numpy()
-                        hit_k = int(np.any(node_labels_arr[top_k_idx] == 1))
-
-                        r_count = max(1, int(np.ceil(r_percent / 100.0 * n_i)))
-                        top_r_idx = torch.topk(a_i_real, r_count, largest=True).indices.cpu().numpy()
-                        hit_r = int(np.any(node_labels_arr[top_r_idx] == 1))
-
+                if node_labels_collection is not None and 0 <= orig_idx < len(node_labels_collection):
+                    node_bin_labels = np.asarray(node_labels_collection[orig_idx])
+                    node_bin_labels = node_bin_labels[:n_i]
                 else:
-                    print(f"  图 {current_graph_idx}: 节点标签不可用，仅导出注意力")
+                    node_bin_labels = np.zeros(n_i, dtype=np.int64)
 
-                # 组装Excel节点数据（确保使用英文键 attention_weight）
-                node_data = []
-                for node_id in range(n_i):
-                    cls = int(node_labels_arr[node_id]) if node_labels_arr is not None else -1
-                    node_data.append({
-                        'node_id': node_id,
-                        'attention_weight': float(a_i_real[node_id].item()),
-                        'node_class': cls
-                    })
+                df = pd.DataFrame({
+                    'weight': weights,
+                    'node_binary_label': node_bin_labels
+                })
+                # 按权重降序排列并重置索引
+                df = df.sort_values(by='weight', ascending=False).reset_index(drop=True)
 
-                # 排序并写入 graph_info（统一使用 graph_label_i）
-                node_data.sort(key=lambda x: x['attention_weight'], reverse=True)
-                graph_info = {
-                    'graph_idx': current_graph_idx,
-                    'graph_label': graph_label_i,   # ← 修正
-                    'num_nodes': n_i,
-                    'node_data': node_data,
-                }
-                all_graph_data.append(graph_info)
-                if graph_label_i == 1:             # ← 修正
-                    positive_graphs_data.append(graph_info)
+                # 每个sheet一个graph；避免重名
+                base_name = f'graph_{orig_idx}'
+                sheet_name = base_name
+                suffix = 1
+                while sheet_name in sheet_name_used:
+                    sheet_name = f'{base_name}_{suffix}'
+                    suffix += 1
+                sheet_name_used.add(sheet_name)
 
-            global_graph_idx += B
-    
-    print(f"共处理 {len(all_graph_data)} 个图，其中 {len(positive_graphs_data)} 个正图")
-    
-    # 生成Excel文件
-    print("生成Excel文件...")
-    try:
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            for graph_info in all_graph_data:
-                # 创建DataFrame
-                df_data = []
-                for node in node_data:
-                    df_data.append([
-                        node['node_id'],
-                        node['attention_weight'],
-                        node['node_class']
-                    ])
-                df = pd.DataFrame(df_data, columns=['节点编号', '注意力权重', '节点类别'])
-                
-                # 下游DataFrame组装保持：
-                # df_data = [[node['node_id'], node['attention_weight'], node['node_class']] for node in node_data]
-                # df = pd.DataFrame(df_data, columns=['节点编号', '注意力权重', '节点类别'])
-                
-                # 写入sheet，sheet名称包含图索引和标签
-                sheet_name = f"Graph_{graph_info['graph_idx']}_Label_{graph_info['graph_label']}"
-                # 限制sheet名称长度
-                if len(sheet_name) > 31:
-                    sheet_name = f"G{graph_info['graph_idx']}_L{graph_info['graph_label']}"
-                
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
-        
-        print(f"Excel文件已保存: {output_path}")
-    except Exception as e:
-        print(f"保存Excel文件失败: {e}")
-        return None
-    
-    # 计算Hit@k指标
-    print(f"计算Hit@{k}指标...")
-    hit_count = 0
-    total_positive_graphs = len(positive_graphs_data)
-    
-    if total_positive_graphs == 0:
-        hit_at_k = 0.0
+
+    writer.close()
+    print(f'Exported branch B attention for test graphs to {output_path}')
+
+
+def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw, output_path):
+    model.eval()
+    if not hasattr(hparams, 'branch_b') or not hparams.branch_b.get('use', False):
+        raise RuntimeError("branch_b.use 未开启，无法导出注意力 a。")
+
+    node_labels_collection = dataset_raw.get('node_binary_labels', None)
+    subgraphs = dataset_raw.get('subgraph_structures', None)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    writer = pd.ExcelWriter(output_path, engine='openpyxl')
+
+    with torch.no_grad():
+        sheet_name_used = set()
+        for _, graph_data in enumerate(test_loader):
+            out = model(graph_data)
+            if not isinstance(out, dict) or 'branch_b' not in out or out['branch_b'] is None:
+                continue
+
+            b_out = out['branch_b']
+            a_pad = b_out.get('a_pad', None)
+            if a_pad is None:
+                continue
+            # 新增：批次级 y_B 与 gate
+            yB_batch = b_out.get('y_B', None)
+            gate_batch = b_out.get('gate', None)
+
+            batch_num_nodes = graph_data['node_num']
+            orig_idx_tensor = graph_data['orig_graph_idx']
+
+            a_pad_np = a_pad.detach().cpu().numpy()
+            if isinstance(batch_num_nodes, torch.Tensor):
+                num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+            else:
+                num_list = [int(n) for n in batch_num_nodes]
+            if isinstance(orig_idx_tensor, torch.Tensor):
+                orig_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
+            else:
+                orig_indices = [int(i) for i in orig_idx_tensor]
+
+            for i, n_i in enumerate(num_list):
+                if n_i <= 0:
+                    continue
+                weights = a_pad_np[i, :n_i]
+                orig_idx = orig_indices[i]
+
+                # 修复：按子图节点映射到原图索引再取标签
+                if node_labels_collection is not None and subgraphs is not None and 0 <= orig_idx < len(subgraphs):
+                    subgraph = subgraphs[orig_idx]
+                    node_bin_labels = _map_subgraph_nodes_to_labels(subgraph, node_labels_collection, n_i)
+                else:
+                    node_bin_labels = np.zeros(n_i, dtype=np.int64)
+
+                # 新增：该图的 y_B 与 gate（重复为常量列）
+                yB_i = float(yB_batch[i].item()) if yB_batch is not None else np.nan
+                g_i  = float(gate_batch[i].item()) if gate_batch is not None else np.nan
+
+                df = pd.DataFrame({
+                    'weight': weights,
+                    'node_binary_label': node_bin_labels,
+                    'y_B': np.full(n_i, yB_i, dtype=float),
+                    'gate': np.full(n_i, g_i, dtype=float),
+                })
+                df = df.sort_values(by='weight', ascending=False).reset_index(drop=True)
+
+                base_name = f'graph_{orig_idx}'
+                sheet_name = base_name
+                suffix = 1
+                while sheet_name in sheet_name_used:
+                    sheet_name = f'{base_name}_{suffix}'
+                    suffix += 1
+                sheet_name_used.add(sheet_name)
+
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    writer.close()
+
+def _map_subgraph_nodes_to_labels(subgraph, node_binary_labels, n_i):
+    nodes = list(subgraph.nodes())
+    labels = np.zeros(len(nodes), dtype=np.int64)
+    total = len(node_binary_labels)
+    for j, node_id in enumerate(nodes):
+        idx = None
+        # 优先：节点ID就是原图索引（常见情况）
+        if isinstance(node_id, (int, np.integer)):
+            idx = int(node_id)
+        else:
+            # 回退：从节点属性取原图索引
+            attr = subgraph.nodes[node_id]
+            for key in ('original_index', 'orig_id', 'node_index'):
+                if key in attr and attr[key] is not None:
+                    try:
+                        idx = int(attr[key])
+                        break
+                    except Exception:
+                        pass
+        if idx is not None and 0 <= idx < total:
+            labels[j] = int(node_binary_labels[idx])
+        else:
+            labels[j] = 0  # 无法映射时置0
+    return labels[:n_i]
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Export Branch B attention (a) to Excel.')
+    parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
+                        help='配置文件路径（.yml）。')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')
+    parser.add_argument('--output', type=str, default=None,
+                        help='导出 Excel 文件路径（默认写到 model_save_path/timestamp_branchB_attention.xlsx）。')
+    args = parser.parse_args()
+
+    # 读取配置
+    hparams = HParams()
+    hparams.from_yaml(args.hparam_path)
+
+    # 设备与可见 GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
+
+    # 输出文件默认路径
+    if args.output is None:
+        out_dir = getattr(hparams, 'model_save_path', '.')
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, f'{hparams.timestamp}_attention.xlsx')
     else:
-        for graph_info in positive_graphs_data:
-            # 获取top-k节点
-            top_k_nodes = graph_info['node_data'][:min(k, len(graph_info['node_data']))]
-            
-            # 检查是否有正类节点
-            has_positive = any(node['node_class'] == 1 for node in top_k_nodes)
-            
-            if has_positive:
-                hit_count += 1
-        
-        hit_at_k = hit_count / total_positive_graphs
-    
-    # 打印结果
-    print(f"\n=== Hit@{k} 结果 ===")
-    print(f"Hit@{k}: {hit_at_k:.4f} ({hit_count}/{total_positive_graphs})")
-    
-    results = {
-        'excel_path': output_path,
-        'hit_at_k': hit_at_k,
-        'hit_count': hit_count,
-        'total_graphs': len(all_graph_data),
-        'positive_graphs': len(positive_graphs_data)
-    }
-    
-    return results
+        output_path = args.output
+
+    export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
+
+
+if __name__ == '__main__':
+    logging.getLogger().setLevel(logging.INFO)
+    main()
