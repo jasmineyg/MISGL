@@ -27,7 +27,7 @@ class MILBranchB(nn.Module):
     """
     def __init__(self, node_dim, attn_hidden=128, gate_hidden=64):
         super().__init__()
-        self.scorer = GatedAttentionScorer(in_dim=4 * node_dim, hidden=attn_hidden)
+        self.scorer = GatedAttentionScorer(in_dim=3 * node_dim, hidden=attn_hidden)
         self.gate = nn.Sequential(  # g = σ(MLP_g(c))
             nn.Linear(node_dim, gate_hidden), nn.ReLU(), nn.Linear(gate_hidden, 1)
 
@@ -46,9 +46,9 @@ class MILBranchB(nn.Module):
         # Step1: graph context c [B,d]
         c = scatter_mean(h, batch, dim=0) if c_override is None else c_override
         
-        # Step2: phi [N,4d]
+        # Step2: phi [N,3d]
         c_i = c[batch]
-        phi = torch.cat([h, c_i, h*c_i, (h-c_i).abs()], dim=-1)
+        phi = torch.cat([h, h*c_i, (h-c_i).abs()], dim=-1)
         
         # Step3: scores -> probs
         s = self.scorer(phi)                      # [N]

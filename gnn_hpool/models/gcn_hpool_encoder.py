@@ -32,14 +32,20 @@ class GcnHpoolEncoder(Module):
   def build_graph(self):
 
 
-    self.entry_conv = gcn_layer.GraphConvolution(
+    self.entry_conv_A = gcn_layer.GraphConvolution(
       in_features=self._hparams.channel_list[0],
       out_features=self._hparams.channel_list[2],
       hparams=self._hparams,
     )
-
     dp = getattr(self._hparams, "dropout", 0.5)
-    self.dropout_entry = torch.nn.Dropout(p=dp)
+    self.dropout_entry_A = torch.nn.Dropout(p=dp)
+
+    self.entry_conv_B = gcn_layer.GraphConvolution(
+      in_features=self._hparams.channel_list[0],
+      out_features=self._hparams.channel_list[2],
+      hparams=self._hparams,
+    )
+    self.dropout_entry_B = torch.nn.Dropout(p=dp)
 
     self.gcn_hpool_layer = GcnHpoolSubmodel(
       self._hparams.channel_list[2], self._hparams.channel_list[3], self._hparams.channel_list[4],
@@ -77,32 +83,36 @@ class GcnHpoolEncoder(Module):
     max_num_nodes = adjacency_mat.size()[1]
     embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
 
-    # entry embedding gcn
-    embedding_single = F.relu(self.entry_conv(node_feature, adjacency_mat))
-    embedding_single = self.apply_bn(embedding_single)
-
-    embedding_single = self.dropout_entry(embedding_single)
-    embedding_tensor_1 = embedding_single
+    # entry embedding gcn (A)
+    embedding_single_A = F.relu(self.entry_conv_A(node_feature, adjacency_mat))
+    embedding_single_A = self.apply_bn(embedding_single_A)
+    embedding_single_A = self.dropout_entry_A(embedding_single_A)
+    embedding_tensor_A = embedding_single_A
     if embedding_mask is not None:
-        embedding_tensor_1 = embedding_tensor_1 * embedding_mask
-    output_1, _ = torch.max(embedding_tensor_1, dim=1)
+        embedding_tensor_A = embedding_tensor_A * embedding_mask
+    output_1, _ = torch.max(embedding_tensor_A, dim=1)
 
     output_2, _, _, node_embed = self.gcn_hpool_layer(
-        embedding_tensor_1, node_feature, adjacency_mat, embedding_mask
+        embedding_tensor_A, node_feature, adjacency_mat, embedding_mask
     )
     output = torch.cat([output_1, output_2], dim=1)
     ypred = self.pred_model(output)
 
-    # 分支B：改为使用 embedding_tensor_1（原图一层GCN后的节点特征）
+    # 分支B：使用独立的GCN(B)
     if getattr(self, '_use_branch_b', False):
-        B = embedding_tensor_1.size(0)
-        D = embedding_tensor_1.size(2)
-        # 按每个图的真实节点数截取，避免包含填充节点
+        embedding_single_B = F.relu(self.entry_conv_B(node_feature, adjacency_mat))
+        embedding_single_B = self.apply_bn(embedding_single_B)
+        embedding_single_B = self.dropout_entry_B(embedding_single_B)
+        embedding_tensor_B = embedding_single_B
+        if embedding_mask is not None:
+            embedding_tensor_B = embedding_tensor_B * embedding_mask
+
+        B = embedding_tensor_B.size(0)
         if isinstance(batch_num_nodes, torch.Tensor):
             num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
         else:
             num_list = [int(n) for n in batch_num_nodes]
-        chunks = [embedding_tensor_1[i, :num_list[i], :] for i in range(B)]
+        chunks = [embedding_tensor_B[i, :num_list[i], :] for i in range(B)]
         h_flat = torch.cat(chunks, dim=0)
         batch_vec = torch.cat([
             torch.full((num_list[i],), i, device=self._device, dtype=torch.long)
@@ -110,8 +120,7 @@ class GcnHpoolEncoder(Module):
         ], dim=0)
         b_out = self.mil_branch_b(h_flat, None, batch_vec)
 
-        # 增加：返回按 [B,M] 对齐的有效掩码与填充注意力
-        M = embedding_tensor_1.size(1)
+        M = embedding_tensor_B.size(1)
         if embedding_mask is not None:
             mask_valid = embedding_mask.squeeze(2).bool()  # [B,M]
         else:
@@ -122,13 +131,12 @@ class GcnHpoolEncoder(Module):
         a = b_out['a']  # [sum_i n_i]
         a_pad = torch.zeros(B, M, device=self._device)
         for i in range(B):
-            idx_i = (batch_vec == i).nonzero(as_tuple=True)[0]  # 该图在拼接向量中的位置
+            idx_i = (batch_vec == i).nonzero(as_tuple=True)[0]
             n_i = num_list[i]
             if idx_i.numel() > 0 and n_i > 0:
                 a_pad[i, :n_i] = a[idx_i][:n_i]
         a_pad = torch.clamp(a_pad, min=1e-6, max=1.0 - 1e-6)
 
-        # 将对齐信息并入返回
         b_out['a_pad'] = a_pad
         b_out['mask_valid'] = mask_valid
 
