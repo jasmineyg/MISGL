@@ -131,9 +131,9 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
             a_pad = b_out.get('a_pad', None)
             if a_pad is None:
                 continue
-            # 新增：批次级 y_B 与 gate
-            yB_batch = b_out.get('y_B', None)
-            gate_batch = b_out.get('gate', None)
+            # 删除：不再读取 y_B 与 gate
+            # yB_batch = b_out.get('y_B', None)
+            # gate_batch = b_out.get('gate', None)
 
             batch_num_nodes = graph_data['node_num']
             orig_idx_tensor = graph_data['orig_graph_idx']
@@ -161,15 +161,10 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 else:
                     node_bin_labels = np.zeros(n_i, dtype=np.int64)
 
-                # 新增：该图的 y_B 与 gate（重复为常量列）
-                yB_i = float(yB_batch[i].item()) if yB_batch is not None else np.nan
-                g_i  = float(gate_batch[i].item()) if gate_batch is not None else np.nan
-
+                # 导出仅包含权重与节点二分类标签
                 df = pd.DataFrame({
                     'weight': weights,
-                    'node_binary_label': node_bin_labels,
-                    'y_B': np.full(n_i, yB_i, dtype=float),
-                    'gate': np.full(n_i, g_i, dtype=float),
+                    'node_binary_label': node_bin_labels
                 })
                 df = df.sort_values(by='weight', ascending=False).reset_index(drop=True)
 

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from gnn_hpool.layers.hierarchical_diff_pooling import dense_diff_pool
 from gnn_hpool.utils import hparams_lib
 from gnn_hpool.layers import gcn_layer
+from gnn_hpool.layers.gat_layer import ResidualGATLayer
 
 
 class GcnHpoolSubmodel(Module):
@@ -96,15 +97,24 @@ class GcnHpoolSubmodel(Module):
   def gcn_forward(self, x, adj, conv_first, conv_block, conv_last, embedding_mask=None):
     out_all = []
 
-    layer_out_1 = F.relu(conv_first(x, adj))
+    try:
+      layer_out_1 = F.relu(conv_first(x, adj, embedding_mask))
+    except TypeError:
+      layer_out_1 = F.relu(conv_first(x, adj))
     layer_out_1 = self.apply_bn(layer_out_1)
     out_all.append(layer_out_1)
 
-    layer_out_2 = F.relu(conv_block(layer_out_1, adj))
+    try:
+      layer_out_2 = F.relu(conv_block(layer_out_1, adj, embedding_mask))
+    except TypeError:
+      layer_out_2 = F.relu(conv_block(layer_out_1, adj))
     layer_out_2 = self.apply_bn(layer_out_2)
     out_all.append(layer_out_2)
 
-    layer_out_3 = conv_last(layer_out_2, adj)
+    try:
+      layer_out_3 = conv_last(layer_out_2, adj, embedding_mask)
+    except TypeError:
+      layer_out_3 = conv_last(layer_out_2, adj)
     out_all.append(layer_out_3)
     out_all = torch.cat(out_all, dim=2)
     if embedding_mask is not None:

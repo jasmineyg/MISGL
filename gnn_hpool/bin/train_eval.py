@@ -68,12 +68,13 @@ def train_eval(hparams):
     all_results.append(result)
     for key in test_metrics.keys():
       test_metrics[key].append(result[key])
+    logging.warning('Holdout {} test => acc: {:.4f}, prec: {:.4f}, rec: {:.4f}, F1: {:.4f}'.format(
+      run_idx, result['acc'], result['prec'], result['rec'], result['F1']
+    ))
 
     # 导出分支B注意力（与当前 holdout 轮次的最佳权重一致）
     out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
     export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path)
-    for key in test_metrics.keys():
-      test_metrics[key].append(result[key])
 
   summary = {
     key: {
@@ -98,70 +99,79 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
     train_accs, train_epochs = [], []
     best_val_accs, best_val_epochs, val_accs = [], [], []
 
+    patience = int(getattr(hparams, 'patience', 50))
+    no_improve = 0
+
     for epoch in range(hparams.epoch):
-        if not epoch % 10:
-            logging.info('* Start the {}_th epoch'.format(epoch))
+      if not epoch % 10:
+        logging.info('* Start the {}_th epoch'.format(epoch))
 
-        total_time = 0
-        avg_loss = 0.0
-        model.train()
+      total_time = 0
+      avg_loss = 0.0
+      model.train()
 
-        for batch_idx, graph_data in enumerate(train_dataset):
-            begin_time = time.time()
-            optimizer.zero_grad()
+      for batch_idx, graph_data in enumerate(train_dataset):
+        begin_time = time.time()
+        optimizer.zero_grad()
 
-            ypred_out = model(graph_data)
-            loss = get_loss.fused_loss(ypred_out, graph_data[g_key.y], epoch, hparams)
+        ypred_out = model(graph_data)
+        loss = get_loss.fused_loss(ypred_out, graph_data[g_key.y], epoch, hparams)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
-            optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
+        optimizer.step()
 
-            avg_loss += loss
-            elapsed = time.time() - begin_time
-            total_time += elapsed
+        avg_loss += loss
+        elapsed = time.time() - begin_time
+        total_time += elapsed
 
-            if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
-                assign_tensor = model.gcn_hpool_layer.pool_tensor
-                bs = assign_tensor.size(0)
-                safe_idx = [i for i in writer_batch_idx if i < bs]
-                if len(safe_idx) > 0:
-                    log_assignment(assign_tensor, writer, epoch, safe_idx)
-                    log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
+        if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
+          assign_tensor = model.gcn_hpool_layer.pool_tensor
+          bs = assign_tensor.size(0)
+          safe_idx = [i for i in writer_batch_idx if i < bs]
+          if len(safe_idx) > 0:
+            log_assignment(assign_tensor, writer, epoch, safe_idx)
+            log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
 
-        avg_loss /= batch_idx + 1
-        if writer is not None:
-            writer.add_scalar('loss/avg_loss', avg_loss, epoch)
-            if hasattr(hparams, 'branch_b') and hparams.branch_b.get('use', False):
-                current_gamma = get_loss.get_gamma(epoch, 
-                                                hparams.branch_b.get('gamma_start', 0.3),
-                                                hparams.branch_b.get('gamma_end', 0.6),
-                                                hparams.branch_b.get('warmup_epochs', 20))
-                writer.add_scalar('fusion/gamma', current_gamma, epoch)
+      avg_loss /= batch_idx + 1
+      if writer is not None:
+        writer.add_scalar('loss/avg_loss', avg_loss, epoch)
+        # if hasattr(hparams, 'branch_b') and hparams.branch_b.get('use', False):
+        #     current_gamma = get_loss.get_gamma(epoch,
+        #                                     hparams.branch_b.get('gamma_start', 0.3),
+        #                                     hparams.branch_b.get('gamma_end', 0.6),
+        #                                     hparams.branch_b.get('warmup_epochs', 20))
+        #     writer.add_scalar('fusion/gamma', current_gamma, epoch)
 
-        # 训练集评估
-        result = evaluate(train_dataset, model, hparams, max_num_examples=100)
-        train_accs.append(result['acc'])
-        train_epochs.append(epoch)
-        if writer is not None:
-            writer.add_scalar('acc/train_acc', result['acc'], epoch)
+      # 训练集评估
+      result = evaluate(train_dataset, model, hparams, max_num_examples=100)
+      train_accs.append(result['acc'])
+      train_epochs.append(epoch)
+      if writer is not None:
+        writer.add_scalar('acc/train_acc', result['acc'], epoch)
 
-        # 验证：用于早停与报告
-        val_result = evaluate(eval_dataset, model, hparams)
-        val_accs.append(val_result['acc'])
-        if writer is not None:
-            writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
-        if val_result['acc'] > best_val_result['acc'] - 1e-7:
-            best_val_result.update({'acc': val_result['acc'], 'epoch': epoch, 'loss': avg_loss})
-            best_model_state = copy.deepcopy(model.state_dict())
-            logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
+      # 验证：用于早停与报告
+      val_result = evaluate(eval_dataset, model, hparams)
+      val_accs.append(val_result['acc'])
+      if writer is not None:
+        writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
+      if val_result['acc'] > best_val_result['acc'] - 1e-7:
+        best_val_result.update({'acc': val_result['acc'], 'epoch': epoch, 'loss': avg_loss})
+        best_model_state = copy.deepcopy(model.state_dict())
+        logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
+        no_improve = 0
+      else:
+        no_improve += 1
+        if no_improve >= patience:
+          logging.warning('Early stop at epoch {} (patience={})'.format(epoch, patience))
+          break
 
-        best_val_epochs.append(best_val_result['epoch'])
-        best_val_accs.append(best_val_result['acc'])
+      best_val_epochs.append(best_val_result['epoch'])
+      best_val_accs.append(best_val_result['acc'])
 
     # 恢复 val 最优权重
     if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+      model.load_state_dict(best_model_state)
 
     try:
         matplotlib.style.use('seaborn-v0_8')

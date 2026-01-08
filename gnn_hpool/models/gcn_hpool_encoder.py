@@ -9,6 +9,7 @@ from gnn_hpool.utils import hparams_lib
 from gnn_hpool.models.gcn_hpool_submodel import GcnHpoolSubmodel
 from gnn_hpool.layers import gcn_layer
 from gnn_hpool.models.mil_head import MILBranchB
+from gnn_hpool.layers.gat_layer import ResidualGATLayer
 
 
 class GcnHpoolEncoder(Module):
@@ -31,21 +32,44 @@ class GcnHpoolEncoder(Module):
 
   def build_graph(self):
 
+    heads = getattr(self._hparams, "gat_heads", 4)
+    attn_dp = getattr(self._hparams, "gat_attn_dropout", getattr(self._hparams, "dropout", 0.5))
+    feat_dp = getattr(self._hparams, "gat_feat_dropout", getattr(self._hparams, "dropout", 0.5))
+    alpha = getattr(self._hparams, "gat_alpha", 0.2)
+    concat = getattr(self._hparams, "gat_concat", True)
+    residual = getattr(self._hparams, "gat_residual", True)
 
-    self.entry_conv_A = gcn_layer.GraphConvolution(
-      in_features=self._hparams.channel_list[0],
-      out_features=self._hparams.channel_list[2],
+    # 入口处GNN
+    self.entry_conv_A_1 = ResidualGATLayer(
+      in_dim=self._hparams.channel_list[0],
+      out_dim=self._hparams.channel_list[2],
       hparams=self._hparams,
+      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
+    )
+    self.entry_conv_A_2 = ResidualGATLayer(
+      in_dim=self._hparams.channel_list[2],
+      out_dim=self._hparams.channel_list[2],
+      hparams=self._hparams,
+      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
     )
     dp = getattr(self._hparams, "dropout", 0.5)
-    self.dropout_entry_A = torch.nn.Dropout(p=dp)
+    self.dropout_entry_A1 = torch.nn.Dropout(p=dp)
+    self.dropout_entry_A2 = torch.nn.Dropout(p=dp)
 
-    self.entry_conv_B = gcn_layer.GraphConvolution(
-      in_features=self._hparams.channel_list[0],
-      out_features=self._hparams.channel_list[2],
+    self.entry_conv_B_1 = ResidualGATLayer(
+      in_dim=self._hparams.channel_list[0],
+      out_dim=self._hparams.channel_list[2],
       hparams=self._hparams,
+      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
     )
-    self.dropout_entry_B = torch.nn.Dropout(p=dp)
+    self.entry_conv_B_2 = ResidualGATLayer(
+      in_dim=self._hparams.channel_list[2],
+      out_dim=self._hparams.channel_list[2],
+      hparams=self._hparams,
+      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
+    )
+    self.dropout_entry_B1 = torch.nn.Dropout(p=dp)
+    self.dropout_entry_B2 = torch.nn.Dropout(p=dp)
 
     self.gcn_hpool_layer = GcnHpoolSubmodel(
       self._hparams.channel_list[2], self._hparams.channel_list[3], self._hparams.channel_list[4],
@@ -53,12 +77,23 @@ class GcnHpoolEncoder(Module):
       self._hparams
     )
 
-    input_dim = (
+    input_dim_A = (
       self._hparams.channel_list[2] +
       2 * self._hparams.channel_list[3] + self._hparams.channel_list[4]
     )
+
+    bb_cfg = getattr(self._hparams, 'branch_b', None)
+    self._use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
+    extra_dim_B = 0
+    if self._use_branch_b:
+        node_dim_B = self._hparams.channel_list[2]
+        attn_hidden = bb_cfg.get('attn_hidden', 128)
+        self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden)
+        extra_dim_B = node_dim_B
+
+    pred_input_dim = input_dim_A + extra_dim_B
     self.pred_model = torch.nn.Sequential(
-      torch.nn.Linear(input_dim, self._hparams.channel_list[-2]),
+      torch.nn.Linear(pred_input_dim, self._hparams.channel_list[-2]),
       torch.nn.ReLU(),
       torch.nn.Dropout(p=dp),
       torch.nn.Linear(self._hparams.channel_list[-2], self._hparams.channel_list[-1])
@@ -67,11 +102,9 @@ class GcnHpoolEncoder(Module):
     bb_cfg = getattr(self._hparams, 'branch_b', None)
     self._use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
     if self._use_branch_b:
-        # 使用原图一层GCN后的节点特征维度
         node_dim_B = self._hparams.channel_list[2]
         attn_hidden = bb_cfg.get('attn_hidden', 128)
-        gate_hidden = bb_cfg.get('gate_hidden', 64)
-        self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden, gate_hidden)
+        self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden)
 
   def forward(self, graph_input):
 
@@ -83,10 +116,13 @@ class GcnHpoolEncoder(Module):
     max_num_nodes = adjacency_mat.size()[1]
     embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
 
-    # entry embedding gcn (A)
-    embedding_single_A = F.relu(self.entry_conv_A(node_feature, adjacency_mat))
+    # entry embedding gat (A x2)
+    embedding_single_A = F.relu(self.entry_conv_A_1(node_feature, adjacency_mat, embedding_mask))
     embedding_single_A = self.apply_bn(embedding_single_A)
-    embedding_single_A = self.dropout_entry_A(embedding_single_A)
+    embedding_single_A = self.dropout_entry_A1(embedding_single_A)
+    embedding_single_A = F.relu(self.entry_conv_A_2(embedding_single_A, adjacency_mat, embedding_mask))
+    embedding_single_A = self.apply_bn(embedding_single_A)
+    embedding_single_A = self.dropout_entry_A2(embedding_single_A)
     embedding_tensor_A = embedding_single_A
     if embedding_mask is not None:
         embedding_tensor_A = embedding_tensor_A * embedding_mask
@@ -95,14 +131,15 @@ class GcnHpoolEncoder(Module):
     output_2, _, _, node_embed = self.gcn_hpool_layer(
         embedding_tensor_A, node_feature, adjacency_mat, embedding_mask
     )
-    output = torch.cat([output_1, output_2], dim=1)
-    ypred = self.pred_model(output)
+    output = torch.cat([output_1, output_2], dim=1)     # Diffpool输出的图嵌入向量
 
-    # 分支B：使用独立的GCN(B)
     if getattr(self, '_use_branch_b', False):
-        embedding_single_B = F.relu(self.entry_conv_B(node_feature, adjacency_mat))
+        embedding_single_B = F.relu(self.entry_conv_B_1(node_feature, adjacency_mat, embedding_mask))
         embedding_single_B = self.apply_bn(embedding_single_B)
-        embedding_single_B = self.dropout_entry_B(embedding_single_B)
+        embedding_single_B = self.dropout_entry_B1(embedding_single_B)
+        embedding_single_B = F.relu(self.entry_conv_B_2(embedding_single_B, adjacency_mat, embedding_mask))
+        embedding_single_B = self.apply_bn(embedding_single_B)
+        embedding_single_B = self.dropout_entry_B2(embedding_single_B)
         embedding_tensor_B = embedding_single_B
         if embedding_mask is not None:
             embedding_tensor_B = embedding_tensor_B * embedding_mask
@@ -136,11 +173,14 @@ class GcnHpoolEncoder(Module):
             if idx_i.numel() > 0 and n_i > 0:
                 a_pad[i, :n_i] = a[idx_i][:n_i]
         a_pad = torch.clamp(a_pad, min=1e-6, max=1.0 - 1e-6)
-
         b_out['a_pad'] = a_pad
         b_out['mask_valid'] = mask_valid
 
+        # 拼接分支A与分支B的图级表示，走A的分类头
+        ypred = self.pred_model(torch.cat([output, b_out['z_B']], dim=1))
         return {'ypred_A': ypred, 'branch_b': b_out}
+
+    ypred = self.pred_model(output)
     return ypred
 
   def gcn_forward(self, x, adj, conv_first, conv_block, conv_last, embedding_mask=None):

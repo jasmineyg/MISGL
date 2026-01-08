@@ -18,25 +18,11 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
             
             out = model(data)
             
-            # 处理两种输出格式：字典格式（有分支B）和张量格式（无分支B）
+            # 只使用分支A的分类头输出，不做融合
             if isinstance(out, dict) and 'ypred_A' in out:
-                # 字典格式：有分支B的情况
                 logits_A = out['ypred_A']  # [B] 或 [B,1]
-                
-                use_b = ('branch_b' in out) and (out['branch_b'] is not None) \
-                        and ('y_B' in out['branch_b']) \
-                        and getattr(hparams, 'branch_b', None) and hparams.branch_b.get('use', False)
-
-                if use_b:
-                    # 评估：在概率域融合
-                    p_A = torch.sigmoid(logits_A).view(-1)      # [B]
-                    p_B = out['branch_b']['y_B'].view(-1)       # [B]
-                    gamma_end = hparams.branch_b.get('gamma_end', 0.6)
-                    p = gamma_end * p_B + (1 - gamma_end) * p_A  # [B]
-                else:
-                    p = torch.sigmoid(logits_A).view(-1)  # [B]
+                p = torch.sigmoid(logits_A).view(-1)  # [B]
             else:
-                # 张量格式：无分支B的情况（兼容旧版本）
                 logits_A = out  # [B] 或 [B,1]
                 p = torch.sigmoid(logits_A).view(-1)  # [B]
 
@@ -54,15 +40,19 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
     labels = np.concatenate(labels, axis=0)
     
     result = {
-        'prec': metrics.precision_score(labels, preds, average='binary'),
-        'rec': metrics.recall_score(labels, preds, average='binary'),
+        'prec': metrics.precision_score(labels, preds, average='binary', zero_division=0),
+        'rec': metrics.recall_score(labels, preds, average='binary', zero_division=0),
         'acc': metrics.accuracy_score(labels, preds),
-        'F1': metrics.f1_score(labels, preds, average='binary')
+        'F1': metrics.f1_score(labels, preds, average='binary', zero_division=0)
     }
     
     # 添加数据集名称标识
     prefix = f"[{dataset_name}]" if dataset_name else ""
     # print(f'{prefix}  acc: {result["acc"]:.4f}, prec: {result["prec"]:.4f}, rec: {result["rec"]:.4f}, F1: {result["F1"]:.4f}')
-
     
-    return result
+    nested = {
+        'A': dict(result),
+        'B': dict(result),
+        'AB': dict(result)
+    }
+    return {**nested, **result}
