@@ -131,9 +131,6 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
             a_pad = b_out.get('a_pad', None)
             if a_pad is None:
                 continue
-            # 删除：不再读取 y_B 与 gate
-            # yB_batch = b_out.get('y_B', None)
-            # gate_batch = b_out.get('gate', None)
 
             batch_num_nodes = graph_data['node_num']
             orig_idx_tensor = graph_data['orig_graph_idx']
@@ -208,30 +205,30 @@ def _map_subgraph_nodes_to_labels(subgraph, node_binary_labels, n_i):
 
 def main():
     parser = argparse.ArgumentParser(description='Export Branch B attention (a) to Excel.')
-    parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
-                        help='配置文件路径（.yml）。')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')
-    parser.add_argument('--output', type=str, default=None,
-                        help='导出 Excel 文件路径（默认写到 model_save_path/timestamp_branchB_attention.xlsx）。')
-    args = parser.parse_args()
-
-    # 读取配置
-    hparams = HParams()
-    hparams.from_yaml(args.hparam_path)
-
-    # 设备与可见 GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
-
-    # 输出文件默认路径
-    if args.output is None:
-        out_dir = getattr(hparams, 'model_save_path', '.')
-        os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, f'{hparams.timestamp}_attention.xlsx')
-    else:
-        output_path = args.output
-
-    export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
+    # parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
+    #                     help='配置文件路径（.yml）。')
+    # parser.add_argument('--seed', type=int, default=None,
+    #                     help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')
+    # parser.add_argument('--output', type=str, default=None,
+    #                     help='导出 Excel 文件路径（默认写到 model_save_path/timestamp_branchB_attention.xlsx）。')
+    # args = parser.parse_args()
+    #
+    # # 读取配置
+    # hparams = HParams()
+    # hparams.from_yaml(args.hparam_path)
+    #
+    # # 设备与可见 GPU
+    # os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
+    #
+    # # 输出文件默认路径
+    # if args.output is None:
+    #     out_dir = getattr(hparams, 'model_save_path', '.')
+    #     os.makedirs(out_dir, exist_ok=True)
+    #     output_path = os.path.join(out_dir, f'{hparams.timestamp}_attention.xlsx')
+    # else:
+    #     output_path = args.output
+    #
+    # export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
 
 
 if __name__ == '__main__':

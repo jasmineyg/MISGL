@@ -36,7 +36,6 @@ class MILBranchB(nn.Module):
         Z = scatter_add(exp, batch, dim=0)[batch] + eps  # [N]
         return (exp / Z).clamp(1e-6, 1 - 1e-6)  # [N]
 
-
     def forward(self, h, edge_index, batch, c_override=None):
         c = scatter_mean(h, batch, dim=0) if c_override is None else c_override
         c_i = c[batch]

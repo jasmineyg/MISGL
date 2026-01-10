@@ -39,37 +39,32 @@ class GcnHpoolEncoder(Module):
     concat = getattr(self._hparams, "gat_concat", True)
     residual = getattr(self._hparams, "gat_residual", True)
 
-    # 入口处GNN
-    self.entry_conv_A_1 = ResidualGATLayer(
+    self.entry_conv_A = ResidualGATLayer(
       in_dim=self._hparams.channel_list[0],
       out_dim=self._hparams.channel_list[2],
       hparams=self._hparams,
-      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
-    )
-    self.entry_conv_A_2 = ResidualGATLayer(
-      in_dim=self._hparams.channel_list[2],
-      out_dim=self._hparams.channel_list[2],
-      hparams=self._hparams,
-      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
+      heads=heads,
+      attn_dropout=attn_dp,
+      feat_dropout=feat_dp,
+      alpha=alpha,
+      concat=concat,
+      residual=residual
     )
     dp = getattr(self._hparams, "dropout", 0.5)
-    self.dropout_entry_A1 = torch.nn.Dropout(p=dp)
-    self.dropout_entry_A2 = torch.nn.Dropout(p=dp)
+    self.dropout_entry_A = torch.nn.Dropout(p=dp)
 
-    self.entry_conv_B_1 = ResidualGATLayer(
+    self.entry_conv_B = ResidualGATLayer(
       in_dim=self._hparams.channel_list[0],
       out_dim=self._hparams.channel_list[2],
       hparams=self._hparams,
-      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
+      heads=heads,
+      attn_dropout=attn_dp,
+      feat_dropout=feat_dp,
+      alpha=alpha,
+      concat=concat,
+      residual=residual
     )
-    self.entry_conv_B_2 = ResidualGATLayer(
-      in_dim=self._hparams.channel_list[2],
-      out_dim=self._hparams.channel_list[2],
-      hparams=self._hparams,
-      heads=heads, attn_dropout=attn_dp, feat_dropout=feat_dp, alpha=alpha, concat=concat, residual=residual
-    )
-    self.dropout_entry_B1 = torch.nn.Dropout(p=dp)
-    self.dropout_entry_B2 = torch.nn.Dropout(p=dp)
+    self.dropout_entry_B = torch.nn.Dropout(p=dp)
 
     self.gcn_hpool_layer = GcnHpoolSubmodel(
       self._hparams.channel_list[2], self._hparams.channel_list[3], self._hparams.channel_list[4],
@@ -84,6 +79,7 @@ class GcnHpoolEncoder(Module):
 
     bb_cfg = getattr(self._hparams, 'branch_b', None)
     self._use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
+    self._branch_b_only = bool(bb_cfg and bb_cfg.get('only', False))
     extra_dim_B = 0
     if self._use_branch_b:
         node_dim_B = self._hparams.channel_list[2]
@@ -91,20 +87,13 @@ class GcnHpoolEncoder(Module):
         self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden)
         extra_dim_B = node_dim_B
 
-    pred_input_dim = input_dim_A + extra_dim_B
+    pred_input_dim = extra_dim_B if (self._use_branch_b and self._branch_b_only) else (input_dim_A + extra_dim_B)
     self.pred_model = torch.nn.Sequential(
       torch.nn.Linear(pred_input_dim, self._hparams.channel_list[-2]),
       torch.nn.ReLU(),
       torch.nn.Dropout(p=dp),
       torch.nn.Linear(self._hparams.channel_list[-2], self._hparams.channel_list[-1])
     )
-    # 分支B
-    bb_cfg = getattr(self._hparams, 'branch_b', None)
-    self._use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
-    if self._use_branch_b:
-        node_dim_B = self._hparams.channel_list[2]
-        attn_hidden = bb_cfg.get('attn_hidden', 128)
-        self.mil_branch_b = MILBranchB(node_dim_B, attn_hidden)
 
   def forward(self, graph_input):
 
@@ -116,30 +105,26 @@ class GcnHpoolEncoder(Module):
     max_num_nodes = adjacency_mat.size()[1]
     embedding_mask = self.construct_mask(max_num_nodes, batch_num_nodes)
 
-    # entry embedding gat (A x2)
-    embedding_single_A = F.relu(self.entry_conv_A_1(node_feature, adjacency_mat, embedding_mask))
-    embedding_single_A = self.apply_bn(embedding_single_A)
-    embedding_single_A = self.dropout_entry_A1(embedding_single_A)
-    embedding_single_A = F.relu(self.entry_conv_A_2(embedding_single_A, adjacency_mat, embedding_mask))
-    embedding_single_A = self.apply_bn(embedding_single_A)
-    embedding_single_A = self.dropout_entry_A2(embedding_single_A)
-    embedding_tensor_A = embedding_single_A
-    if embedding_mask is not None:
-        embedding_tensor_A = embedding_tensor_A * embedding_mask
-    output_1, _ = torch.max(embedding_tensor_A, dim=1)
+    only_branch_b = getattr(self, '_use_branch_b', False) and getattr(self, '_branch_b_only', False)
 
-    output_2, _, _, node_embed = self.gcn_hpool_layer(
-        embedding_tensor_A, node_feature, adjacency_mat, embedding_mask
-    )
-    output = torch.cat([output_1, output_2], dim=1)     # Diffpool输出的图嵌入向量
+    if not only_branch_b:
+        embedding_single_A = F.relu(self.entry_conv_A(node_feature, adjacency_mat))
+        embedding_single_A = self.apply_bn(embedding_single_A)
+        embedding_single_A = self.dropout_entry_A(embedding_single_A)
+        embedding_tensor_A = embedding_single_A
+        if embedding_mask is not None:
+            embedding_tensor_A = embedding_tensor_A * embedding_mask
+        output_1, _ = torch.max(embedding_tensor_A, dim=1)
+
+        output_2, _, _, node_embed = self.gcn_hpool_layer(
+            embedding_tensor_A, node_feature, adjacency_mat, embedding_mask
+        )
+        output = torch.cat([output_1, output_2], dim=1)
 
     if getattr(self, '_use_branch_b', False):
-        embedding_single_B = F.relu(self.entry_conv_B_1(node_feature, adjacency_mat, embedding_mask))
+        embedding_single_B = F.relu(self.entry_conv_B(node_feature, adjacency_mat))
         embedding_single_B = self.apply_bn(embedding_single_B)
-        embedding_single_B = self.dropout_entry_B1(embedding_single_B)
-        embedding_single_B = F.relu(self.entry_conv_B_2(embedding_single_B, adjacency_mat, embedding_mask))
-        embedding_single_B = self.apply_bn(embedding_single_B)
-        embedding_single_B = self.dropout_entry_B2(embedding_single_B)
+        embedding_single_B = self.dropout_entry_B(embedding_single_B)
         embedding_tensor_B = embedding_single_B
         if embedding_mask is not None:
             embedding_tensor_B = embedding_tensor_B * embedding_mask
@@ -176,8 +161,10 @@ class GcnHpoolEncoder(Module):
         b_out['a_pad'] = a_pad
         b_out['mask_valid'] = mask_valid
 
-        # 拼接分支A与分支B的图级表示，走A的分类头
-        ypred = self.pred_model(torch.cat([output, b_out['z_B']], dim=1))
+        if getattr(self, '_branch_b_only', False):
+            ypred = self.pred_model(b_out['z_B'])
+        else:
+            ypred = self.pred_model(torch.cat([output, b_out['z_B']], dim=1))
         return {'ypred_A': ypred, 'branch_b': b_out}
 
     ypred = self.pred_model(output)

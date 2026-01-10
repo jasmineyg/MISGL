@@ -5,6 +5,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+
 class ResidualGATLayer(Module):
   def __init__(self, in_dim, out_dim, hparams=None, heads=4, attn_dropout=0.1, feat_dropout=0.1, alpha=0.2, concat=True, residual=True):
     super(ResidualGATLayer, self).__init__()

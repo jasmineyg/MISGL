@@ -50,9 +50,8 @@ class GcnHpoolSubmodel(Module):
     )
 
     # pooling blocks
-
     self.pool_conv_first = gcn_layer.GraphConvolution(
-      in_features=in_node,
+      in_features=self._hparams.channel_list[0],
       out_features=hidden_node,
       hparams=self._hparams,
     )

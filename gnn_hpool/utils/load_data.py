@@ -74,21 +74,54 @@ class GraphDataLoaderWrapper(object):
       raise ValueError('缺少 data_name 参数，请在配置中设置 data_name')
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
 
-    with open(dataset_path, 'rb') as f:
-      dataset = pickle.load(f)
+    use_synth = bool(getattr(self._hparams, 'synthetic', False))
+    if (not use_synth) and os.path.exists(dataset_path):
+      with open(dataset_path, 'rb') as f:
+        dataset = pickle.load(f)
+    else:
+      rng = np.random.RandomState(getattr(self._hparams, 'cv_seed', 1024))
+      num_graphs = int(getattr(self._hparams, 'synthetic_num_graphs', 200))
+      max_nodes = int(getattr(self._hparams, 'max_num_nodes', 20))
+      feat_dim = int(self._hparams.channel_list[0])
+      graphs = []
+      for i in range(num_graphs):
+        n = rng.randint(5, max_nodes)
+        G = nx.Graph()
+        G.add_nodes_from(range(n))
+        for u in range(n):
+          for v in range(u + 1, n):
+            if rng.rand() < 0.1:
+              G.add_edge(u, v)
+        for u in G.nodes():
+          vec = rng.randn(feat_dim).astype(np.float32)
+          G.nodes[u]['features'] = vec
+        label = int(rng.rand() < 0.5)
+        G.graph['label'] = label
+        G.graph['group_id'] = i // max(1, (num_graphs // 10))
+        graphs.append(G)
+      split = int(num_graphs * 0.8)
+      dataset = {
+        'subgraph_structures': graphs,
+        'train_test_split': {
+          'train_indices': list(range(split)),
+          'test_indices': list(range(split, num_graphs))
+        },
+        'feature_dimension': feat_dim,
+        'dataset_metadata': {
+          'feature_dim': feat_dim,
+          'max_num_nodes': max_nodes
+        }
+      }
 
-    # 子图列表与索引划分
-    subgraphs = dataset['subgraph_structures']  # list[networkx.Graph]
+    subgraphs = dataset['subgraph_structures']
     train_indices = dataset['train_test_split']['train_indices']
     test_indices = dataset['train_test_split']['test_indices']
 
-    # 对齐模型输入维度与最大节点数
     feature_dim = int(dataset.get('feature_dimension', dataset['dataset_metadata']['feature_dim']))
     self._hparams.channel_list[0] = feature_dim
     max_num_nodes = int(dataset['dataset_metadata'].get('max_num_nodes', max(len(g.nodes()) for g in subgraphs)))
     self._hparams.max_num_nodes = max_num_nodes
 
-    # 原有：切分训练/测试子图（保留）
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
 

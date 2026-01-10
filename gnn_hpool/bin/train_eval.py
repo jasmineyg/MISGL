@@ -60,7 +60,12 @@ def train_eval(hparams):
       logdir=os.path.join(hparams.model_save_path, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
     )
 
-    model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
+    model_type = getattr(hparams, 'model_type', 'gcn_hpool')
+    if model_type == 'gat_mean':
+      from gnn_hpool.models.gat_mean_encoder import GATMeanEncoder
+      model = GATMeanEncoder(hparams).to(torch.device(hparams.device))
+    else:
+      model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
     # 训练+早停都用val
     train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams)
 
@@ -72,9 +77,10 @@ def train_eval(hparams):
       run_idx, result['acc'], result['prec'], result['rec'], result['F1']
     ))
 
-    # 导出分支B注意力（与当前 holdout 轮次的最佳权重一致）
-    out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
-    export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path)
+    bb_cfg = getattr(hparams, 'branch_b', None)
+    if bool(bb_cfg and bb_cfg.get('use', False)):
+      out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
+      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path)
 
   summary = {
     key: {
@@ -173,22 +179,22 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
     if best_model_state is not None:
       model.load_state_dict(best_model_state)
 
-    try:
-        matplotlib.style.use('seaborn-v0_8')
-    except OSError:
-        try:
-            matplotlib.style.use('seaborn')
-        except OSError:
-            matplotlib.style.use('default')
-
-    plt.switch_backend('agg')
-    plt.figure()
-    plt.plot(train_epochs, common_utils.exp_moving_avg(train_accs, 0.85), '-', lw=1)
-    plt.plot(best_val_epochs, best_val_accs, 'bo')
-    plt.legend(['train', 'val'])
-    plt.savefig(os.path.join(hparams.model_save_path, str(hparams.timestamp) + '.png'), dpi=600)
-    plt.close()
-    matplotlib.style.use('default')
+    # try:
+    #     matplotlib.style.use('seaborn-v0_8')
+    # except OSError:
+    #     try:
+    #         matplotlib.style.use('seaborn')
+    #     except OSError:
+    #         matplotlib.style.use('default')
+    #
+    # plt.switch_backend('agg')
+    # plt.figure()
+    # plt.plot(train_epochs, common_utils.exp_moving_avg(train_accs, 0.85), '-', lw=1)
+    # plt.plot(best_val_epochs, best_val_accs, 'bo')
+    # plt.legend(['train', 'val'])
+    # plt.savefig(os.path.join(hparams.model_save_path, str(hparams.timestamp) + '.png'), dpi=600)
+    # plt.close()
+    # matplotlib.style.use('default')
 
     return model, val_accs
 
