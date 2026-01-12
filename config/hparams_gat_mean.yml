@@ -3,13 +3,13 @@ cuda_visible_devices: '0'
 model_type: 'gat_mean'
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name: 'med'
+data_name: 'chem'
 synthetic: true
 synthetic_num_graphs: 200
-timestamp: med_gat
-max_num_nodes: 35 # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
-channel_list: [5538, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
-node_list: [5538, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
+timestamp: chem_gat
+max_num_nodes: 39 # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
+channel_list: [4877, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
+node_list: [4877, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
 
 batch_size: 32
 epoch: 200
@@ -23,3 +23,4 @@ branch_b:
   use: false
   attn_hidden: 128
   gate_hidden: 64
+use_coarse_graph: false

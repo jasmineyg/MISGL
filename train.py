@@ -35,7 +35,7 @@ if __name__ == '__main__':
   logging.getLogger().setLevel(logging.INFO)
   parser = argparse.ArgumentParser(description='Parameters for the training of GNN')
   parser.add_argument('--hparam_path', nargs='?', type=str,
-                      default='./config/hparams_testdb.yml',
+                      default='./config/hparams_gat_mean.yml',
                       help='The path to .yml file which contains all the hyperparameters.'
                       )
 

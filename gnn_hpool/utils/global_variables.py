@@ -9,6 +9,7 @@ class GKey(object):
     self.y = 'y'
     self.node_num = 'node_num'
     self.orig_graph_idx = 'orig_graph_idx'
+    self.subgraph_id = 'subgraph_id'
 
 
 g_key = GKey()

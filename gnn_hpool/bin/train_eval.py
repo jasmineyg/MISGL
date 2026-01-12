@@ -132,22 +132,18 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
         total_time += elapsed
 
         if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
-          assign_tensor = model.gcn_hpool_layer.pool_tensor
-          bs = assign_tensor.size(0)
-          safe_idx = [i for i in writer_batch_idx if i < bs]
-          if len(safe_idx) > 0:
-            log_assignment(assign_tensor, writer, epoch, safe_idx)
-            log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
+          layer = getattr(model, 'gcn_hpool_layer', None)
+          assign_tensor = getattr(layer, 'pool_tensor', None)
+          if assign_tensor is not None:
+            bs = assign_tensor.size(0)
+            safe_idx = [i for i in writer_batch_idx if i < bs]
+            if len(safe_idx) > 0:
+              log_assignment(assign_tensor, writer, epoch, safe_idx)
+              log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
 
       avg_loss /= batch_idx + 1
       if writer is not None:
         writer.add_scalar('loss/avg_loss', avg_loss, epoch)
-        # if hasattr(hparams, 'branch_b') and hparams.branch_b.get('use', False):
-        #     current_gamma = get_loss.get_gamma(epoch,
-        #                                     hparams.branch_b.get('gamma_start', 0.3),
-        #                                     hparams.branch_b.get('gamma_end', 0.6),
-        #                                     hparams.branch_b.get('warmup_epochs', 20))
-        #     writer.add_scalar('fusion/gamma', current_gamma, epoch)
 
       # 训练集评估
       result = evaluate(train_dataset, model, hparams, max_num_examples=100)

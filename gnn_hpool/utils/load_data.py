@@ -53,6 +53,12 @@ class GraphDataset(Dataset):
       except (TypeError, ValueError):
         orig_idx = -1
       graph_tmp_dict[g_key.orig_graph_idx] = torch.tensor(orig_idx, dtype=torch.long).to(self._device)
+      subgraph_id = graph.graph.get('subgraph_id', -1)
+      try:
+        subgraph_id = int(subgraph_id)
+      except (TypeError, ValueError):
+        subgraph_id = -1
+      graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
 
@@ -70,48 +76,9 @@ class GraphDataLoaderWrapper(object):
 
     processed_data_dir = getattr(self._hparams, 'processed_data_dir', '/data/yg/Subgraph-MIL/Data/processed_data')
     data_name = getattr(self._hparams, 'data_name', None)
-    if not data_name:
-      raise ValueError('缺少 data_name 参数，请在配置中设置 data_name')
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
-
-    use_synth = bool(getattr(self._hparams, 'synthetic', False))
-    if (not use_synth) and os.path.exists(dataset_path):
-      with open(dataset_path, 'rb') as f:
-        dataset = pickle.load(f)
-    else:
-      rng = np.random.RandomState(getattr(self._hparams, 'cv_seed', 1024))
-      num_graphs = int(getattr(self._hparams, 'synthetic_num_graphs', 200))
-      max_nodes = int(getattr(self._hparams, 'max_num_nodes', 20))
-      feat_dim = int(self._hparams.channel_list[0])
-      graphs = []
-      for i in range(num_graphs):
-        n = rng.randint(5, max_nodes)
-        G = nx.Graph()
-        G.add_nodes_from(range(n))
-        for u in range(n):
-          for v in range(u + 1, n):
-            if rng.rand() < 0.1:
-              G.add_edge(u, v)
-        for u in G.nodes():
-          vec = rng.randn(feat_dim).astype(np.float32)
-          G.nodes[u]['features'] = vec
-        label = int(rng.rand() < 0.5)
-        G.graph['label'] = label
-        G.graph['group_id'] = i // max(1, (num_graphs // 10))
-        graphs.append(G)
-      split = int(num_graphs * 0.8)
-      dataset = {
-        'subgraph_structures': graphs,
-        'train_test_split': {
-          'train_indices': list(range(split)),
-          'test_indices': list(range(split, num_graphs))
-        },
-        'feature_dimension': feat_dim,
-        'dataset_metadata': {
-          'feature_dim': feat_dim,
-          'max_num_nodes': max_nodes
-        }
-      }
+    with open(dataset_path, 'rb') as f:
+      dataset = pickle.load(f)
 
     subgraphs = dataset['subgraph_structures']
     train_indices = dataset['train_test_split']['train_indices']
@@ -127,6 +94,8 @@ class GraphDataLoaderWrapper(object):
 
     self._subgraphs = subgraphs
     self._dataset_raw = dataset
+    self.original_graph = dataset.get('original_graph', None)
+    self.assignment_matrix = dataset.get('assignment_matrix', None)
     self.all_indices = list(train_indices) + list(test_indices)
     self.all_graphs = []
     for orig_idx in self.all_indices:
@@ -307,6 +276,12 @@ class GraphDataLoaderWrapper(object):
     test_loader       = DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False)
 
     return training_loader, validation_loader, test_loader
+
+  def get_original_graph(self):
+    return self.original_graph
+  
+  def get_assignment_matrix(self):
+    return self.assignment_matrix
 
 
 def read_graphfile(datadir, dataname, max_nodes=None):
