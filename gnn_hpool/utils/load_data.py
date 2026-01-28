@@ -71,11 +71,12 @@ class GraphDataset(Dataset):
 
 class GraphDataLoaderWrapper(object):
 
-  def __init__(self, hparams):
+  def __init__(self, hparams, data_name=None):
     self._hparams = hparams_lib.copy_hparams(hparams)
 
     processed_data_dir = getattr(self._hparams, 'processed_data_dir', '/data/yg/Subgraph-MIL/Data/processed_data')
-    data_name = getattr(self._hparams, 'data_name', None)
+    if data_name is None:
+      data_name = getattr(self._hparams, 'data_name', None)
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
     with open(dataset_path, 'rb') as f:
       dataset = pickle.load(f)
@@ -98,9 +99,15 @@ class GraphDataLoaderWrapper(object):
     self.assignment_matrix = dataset.get('assignment_matrix', None)
     self.all_indices = list(train_indices) + list(test_indices)
     self.all_graphs = []
+    subgraph_labels = dataset.get('subgraph_labels', None)
     for orig_idx in self.all_indices:
       graph = subgraphs[orig_idx]
       graph.graph['orig_idx'] = int(orig_idx)
+      if subgraph_labels is not None and 0 <= int(orig_idx) < len(subgraph_labels):
+        try:
+          graph.graph['label'] = int(subgraph_labels[int(orig_idx)])
+        except Exception:
+          pass
       self.all_graphs.append(graph)
     self.all_labels = np.array([int(g.graph.get('label', 0)) for g in self.all_graphs])
     self.all_groups = self._resolve_group_ids(dataset, subgraphs, self.all_indices)

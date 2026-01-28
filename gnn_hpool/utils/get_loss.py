@@ -27,6 +27,7 @@ def fused_loss(model_output, targets, epoch, hparams):
         lam = float(bb_cfg.get('lambda_attn', 0.2)) if use_b else 0.0
         eps = float(bb_cfg.get('attn_eps', 1e-6)) if use_b else 1e-6
 
+        # L_attn = torch.zeros((), device=logits_A.device)
         # 注意力正则
         if use_b and 'branch_b' in model_output and lam > 0.0:
             a_pad = model_output['branch_b'].get('a_pad', None)
@@ -39,6 +40,9 @@ def fused_loss(model_output, targets, epoch, hparams):
                 H = -(a_masked * torch.log(torch.clamp(a_pad, min=1e-12) + eps)).sum(dim=1)
                 H_hat = H / denom
                 y = targets.view(-1).float()
+                # pos = y > 0.5
+                # if pos.any():
+                #     L_attn = H_hat[pos].mean()
                 L_attn = (y * H_hat + (1.0 - y) * (1.0 - H_hat)).mean()
                 return bce + lam * L_attn
         return bce

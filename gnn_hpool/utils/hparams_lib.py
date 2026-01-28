@@ -12,6 +12,9 @@ from gnn_hpool.utils import hparam
 def copy_hparams(hparams):
   hp_vals = hparams.values()
   new_hparams = hparam.HParams(**hp_vals)
+  for name in ('data_name',):
+    if hasattr(hparams, name):
+      setattr(new_hparams, name, getattr(hparams, name))
   return new_hparams
 
 

@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import torch
 import pandas as pd
+import random
 
 from gnn_hpool.utils.hparam import HParams
 from gnn_hpool.utils.global_variables import g_key
@@ -110,7 +111,7 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
     print(f'Exported branch B attention for test graphs to {output_path}')
 
 
-def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw, output_path):
+def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw, output_path, sample_frac=0.2):
     model.eval()
     if not hasattr(hparams, 'branch_b') or not hparams.branch_b.get('use', False):
         raise RuntimeError("branch_b.use 未开启，无法导出注意力 a。")
@@ -118,18 +119,34 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
     node_labels_collection = dataset_raw.get('node_binary_labels', None)
     subgraphs = dataset_raw.get('subgraph_structures', None)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # 采样逻辑
+    total_graphs = len(test_loader.dataset)
+    num_sample = int(total_graphs * sample_frac)
+    if num_sample < 1 and total_graphs > 0: num_sample = 1
+    sampled_indices = set(random.sample(range(total_graphs), num_sample))
+    
     writer = pd.ExcelWriter(output_path, engine='openpyxl')
 
     with torch.no_grad():
         sheet_name_used = set()
+        current_idx = 0
         for _, graph_data in enumerate(test_loader):
             out = model(graph_data)
             if not isinstance(out, dict) or 'branch_b' not in out or out['branch_b'] is None:
+                # 即使没有输出，也要增加计数以保持对齐（假设 batch size 是确定的）
+                # 但这里更安全的是根据 node_num 的长度来增加
+                batch_num_nodes = graph_data['node_num']
+                bs = len(batch_num_nodes) if not isinstance(batch_num_nodes, torch.Tensor) else batch_num_nodes.size(0)
+                current_idx += bs
                 continue
 
             b_out = out['branch_b']
             a_pad = b_out.get('a_pad', None)
             if a_pad is None:
+                batch_num_nodes = graph_data['node_num']
+                bs = len(batch_num_nodes) if not isinstance(batch_num_nodes, torch.Tensor) else batch_num_nodes.size(0)
+                current_idx += bs
                 continue
 
             batch_num_nodes = graph_data['node_num']
@@ -146,7 +163,12 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 orig_indices = [int(i) for i in orig_idx_tensor]
 
             for i, n_i in enumerate(num_list):
+                if current_idx not in sampled_indices:
+                    current_idx += 1
+                    continue
+                
                 if n_i <= 0:
+                    current_idx += 1
                     continue
                 weights = a_pad_np[i, :n_i]
                 orig_idx = orig_indices[i]
@@ -174,6 +196,7 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 sheet_name_used.add(sheet_name)
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+                current_idx += 1
 
     writer.close()
 
@@ -205,31 +228,51 @@ def _map_subgraph_nodes_to_labels(subgraph, node_binary_labels, n_i):
 
 def main():
     parser = argparse.ArgumentParser(description='Export Branch B attention (a) to Excel.')
-    # parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
-    #                     help='配置文件路径（.yml）。')
-    # parser.add_argument('--seed', type=int, default=None,
-    #                     help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')
-    # parser.add_argument('--output', type=str, default=None,
-    #                     help='导出 Excel 文件路径（默认写到 model_save_path/timestamp_branchB_attention.xlsx）。')
-    # args = parser.parse_args()
-    #
-    # # 读取配置
-    # hparams = HParams()
-    # hparams.from_yaml(args.hparam_path)
-    #
-    # # 设备与可见 GPU
-    # os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
-    #
-    # # 输出文件默认路径
-    # if args.output is None:
-    #     out_dir = getattr(hparams, 'model_save_path', '.')
-    #     os.makedirs(out_dir, exist_ok=True)
-    #     output_path = os.path.join(out_dir, f'{hparams.timestamp}_attention.xlsx')
-    # else:
-    #     output_path = args.output
-    #
-    # export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
+    parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
+                        help='配置文件路径（.yml）。')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')
+    parser.add_argument('--output', type=str, default=None,
+                        help='导出 Excel 文件路径（默认写到 model_save_path/timestamp_branchB_attention.xlsx）。')
+    args = parser.parse_args()
 
+    # 读取配置
+    hparams = HParams()
+    hparams.from_yaml(args.hparam_path)
+
+    data_name = getattr(hparams, 'data_name', None)
+    if data_name is None or str(data_name).strip() == '':
+        data_name_set = getattr(hparams, 'data_name_set', None)
+        if isinstance(data_name_set, list) and len(data_name_set) > 0:
+            data_name = str(data_name_set[0]).strip()
+        else:
+            raise RuntimeError('未指定数据集：请在yml中提供 data_name_set。')
+    hparams.data_name = data_name
+
+    base_ts = getattr(hparams, 'timestamp', None)
+    base_ts = str(base_ts).strip() if base_ts is not None else ''
+    if base_ts == '':
+        base_ts = 'run'
+    hparams.timestamp = f'{data_name}_{base_ts}'
+
+    base_save_path = getattr(hparams, 'model_save_path', None)
+    if base_save_path:
+        hparams.model_save_path = os.path.join(base_save_path, data_name)
+    else:
+        hparams.model_save_path = os.path.join('results', data_name)
+
+    # 设备与可见 GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
+
+    # 输出文件默认路径
+    if args.output is None:
+        out_dir = getattr(hparams, 'model_save_path', '.')
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, f'{hparams.timestamp}_attention.xlsx')
+    else:
+        output_path = args.output
+
+    export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)

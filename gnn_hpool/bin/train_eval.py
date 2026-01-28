@@ -15,19 +15,37 @@ import numpy as np
 import networkx as nx
 
 import torch
-import tensorboardX
+try:
+  import tensorboardX
+  SummaryWriter = tensorboardX.SummaryWriter
+  _figure_to_image = tensorboardX.utils.figure_to_image
+except ModuleNotFoundError:
+  tensorboardX = None
+  from torch.utils.tensorboard import SummaryWriter
+  _figure_to_image = None
 import random
 from gnn_hpool.utils import get_loss
 from gnn_hpool.utils import common_utils
 from gnn_hpool.utils.global_variables import *
 from gnn_hpool.utils.evaluate import evaluate
 from gnn_hpool.utils import load_data
+from gnn_hpool.utils.result_analyze_export import export_test_result_analyze_excel
 from gnn_hpool.models import gcn_hpool_encoder
 from attention_analyzer import export_branchB_attention_from_model
 
 
-def train_eval(hparams):
-  data_loader = load_data.GraphDataLoaderWrapper(hparams)
+def train_eval(hparams, data_name=None):
+  """
+  训练与评估主入口（Repeated Holdout）。
+
+  - 根据 hparams.holdout_seeds 或 (holdout_runs, cv_seed) 生成多个随机种子
+  - 每个 seed 划分 train/val/test，训练模型（在 val 上早停），并在 test 上评估
+  - 可选：导出 test set 的 embedding 分析结果（Excel）与 branch-B 注意力（Excel）
+
+  返回：
+    dict: {'seeds': [...], 'results': [...], 'summary': {...}}，其中 summary 是多次 holdout 的均值±方差统计
+  """
+  data_loader = load_data.GraphDataLoaderWrapper(hparams, data_name=data_name)
 
   # 读取重复留出配置：优先使用 holdout_seeds，否则使用 holdout_runs/cv_seed 生成
   holdout_seeds = getattr(hparams, 'holdout_seeds', None)
@@ -56,16 +74,13 @@ def train_eval(hparams):
       seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
 
-    summary_writer = tensorboardX.SummaryWriter(
-      logdir=os.path.join(hparams.model_save_path, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
-    )
+    tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
+    logdir = os.path.join(tb_root, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
+    if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
+      logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
+    summary_writer = SummaryWriter(logdir)
 
-    model_type = getattr(hparams, 'model_type', 'gcn_hpool')
-    if model_type == 'gat_mean':
-      from gnn_hpool.models.gat_mean_encoder import GATMeanEncoder
-      model = GATMeanEncoder(hparams).to(torch.device(hparams.device))
-    else:
-      model = gcn_hpool_encoder.GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
+    model = gcn_hpool_encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     # 训练+早停都用val
     train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams)
 
@@ -77,10 +92,29 @@ def train_eval(hparams):
       run_idx, result['acc'], result['prec'], result['rec'], result['F1']
     ))
 
+    # ra_cfg = getattr(hparams, 'result_analyze', None)
+    # if bool(ra_cfg and ra_cfg.get('use', False)) and hasattr(model, 'forward_with_embeddings'):
+    #   export_dir = ra_cfg.get('output_dir', getattr(hparams, 'model_save_path', '.'))
+    #   sample_seed = int(ra_cfg.get('sample_seed', seed))
+    #   sample_frac = float(ra_cfg.get('sample_frac', 0.2))
+    #   prefix = f'{hparams.timestamp}_holdout_{run_idx}'
+    #   export_test_result_analyze_excel(
+    #     model=model,
+    #     test_loader=test_loader,
+    #     hparams=hparams,
+    #     dataset_raw=data_loader._dataset_raw,
+    #     output_dir=export_dir,
+    #     seed=sample_seed,
+    #     sample_frac=sample_frac,
+    #     filename_prefix=prefix,
+    #     heatmap_filename=f'{prefix}_heatmap.xlsx',
+    #   )
+
     bb_cfg = getattr(hparams, 'branch_b', None)
     if bool(bb_cfg and bb_cfg.get('use', False)):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
-      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path)
+      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path, sample_frac=0.2)
+    summary_writer.close()
 
   summary = {
     key: {
@@ -96,6 +130,16 @@ def train_eval(hparams):
 
 
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
+    """
+    单次 holdout 下的训练循环（按 epoch 训练 + val 早停）。
+
+    - train_dataset：用于反向传播更新参数
+    - eval_dataset：用于评估与 early stopping（val）
+    - writer：TensorBoard 记录器（可为 None）
+    
+    返回：
+      (model, val_accs) 其中 model 会在结束前恢复到 val 最优权重。
+    """
     import copy
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=hparams.learning_rate)
 
@@ -107,6 +151,9 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
 
     patience = int(getattr(hparams, 'patience', 50))
     no_improve = 0
+    
+    # 暂时移除projector相关参数和逻辑，因为dataset_raw传递比较复杂，且非核心功能
+    writer_batch_idx = list(range(10)) # 默认可视化前10个图
 
     for epoch in range(hparams.epoch):
       if not epoch % 10:
@@ -127,7 +174,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
         torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
         optimizer.step()
 
-        avg_loss += loss
+        avg_loss += loss.item()
         elapsed = time.time() - begin_time
         total_time += elapsed
 
@@ -175,27 +222,16 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
     if best_model_state is not None:
       model.load_state_dict(best_model_state)
 
-    # try:
-    #     matplotlib.style.use('seaborn-v0_8')
-    # except OSError:
-    #     try:
-    #         matplotlib.style.use('seaborn')
-    #     except OSError:
-    #         matplotlib.style.use('default')
-    #
-    # plt.switch_backend('agg')
-    # plt.figure()
-    # plt.plot(train_epochs, common_utils.exp_moving_avg(train_accs, 0.85), '-', lw=1)
-    # plt.plot(best_val_epochs, best_val_accs, 'bo')
-    # plt.legend(['train', 'val'])
-    # plt.savefig(os.path.join(hparams.model_save_path, str(hparams.timestamp) + '.png'), dpi=600)
-    # plt.close()
-    # matplotlib.style.use('default')
-
     return model, val_accs
 
 
 def log_assignment(assign_tensor, writer, epoch, batch_idx):
+  """
+  将 DiffPool 的 assignment 矩阵（每个子图：node->cluster 的软分配）可视化并写入 TensorBoard。
+
+  assign_tensor: shape 通常为 [batch_size, num_nodes, num_clusters]
+  batch_idx: 选取 batch 中要展示的子图索引列表
+  """
   plt.switch_backend('agg')
   fig = plt.figure(figsize=(8, 6), dpi=300)
 
@@ -207,12 +243,17 @@ def log_assignment(assign_tensor, writer, epoch, batch_idx):
       cbar.solids.set_edgecolor("face")
   plt.tight_layout()
   fig.canvas.draw()
-
-  data = tensorboardX.utils.figure_to_image(fig)
+  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
   writer.add_image('assignment', data, epoch)
 
 
 def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None):
+  """
+  可视化原始子图结构与按 cluster 着色后的子图，并写入 TensorBoard。
+
+  - 第 1 张图：直接画子图的邻接结构（带节点标签）
+  - 第 2 张图：根据 assignment 的 argmax 得到 cluster label，对节点着色
+  """
   plt.switch_backend('agg')
   fig = plt.figure(figsize=(8, 6), dpi=300)
 
@@ -228,8 +269,7 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
 
   plt.tight_layout()
   fig.canvas.draw()
-
-  data = tensorboardX.utils.figure_to_image(fig)
+  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
   writer.add_image('graphs', data, epoch)
 
   assignment = assign_tensor.cpu().detach().numpy()
@@ -255,10 +295,250 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
 
   plt.tight_layout()
   fig.canvas.draw()
-
-  data = tensorboardX.utils.figure_to_image(fig)
+  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
   writer.add_image('graphs_colored', data, epoch)
-try:
-    import seaborn as sns
-except Exception:
-    sns = None
+def _mpl_figure_to_image(fig):
+  """
+  将 matplotlib Figure 转成 CHW 格式的 uint8 图像（用于 TensorBoard add_image）。
+
+  当 tensorboardX 不可用时，使用该函数替代 figure_to_image。
+  """
+  import numpy as np
+  fig.canvas.draw()
+  w, h = fig.canvas.get_width_height()
+  buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+  img = buf.reshape(h, w, 3)
+  return img.transpose(2, 0, 1)
+
+
+def _label_str(v):
+  """将二分类标签转成人类可读字符串：1->pos，0->neg。"""
+  return 'pos' if int(v) == 1 else 'neg'
+
+
+def _build_fixed_projector_batch(val_loader, num_graphs):
+  """
+  从 val_loader 中抽取一个“固定”的小 batch，用于每隔若干 epoch 记录 embedding projector。
+
+  目标：
+    - 尽量平衡正负样本（pos/neg 各一半，至少 1 个 pos）
+    - 返回的是一个 dict（只包含 Tensor 字段），便于直接喂给 model.forward_with_embeddings
+  """
+  selected = []
+  selected_pos = 0
+  selected_neg = 0
+  want_pos = max(1, num_graphs // 2)
+  want_neg = num_graphs - want_pos
+
+  for batch in val_loader:
+    ys = batch[g_key.y].detach().cpu().view(-1).tolist()
+    bs = len(ys)
+    for i in range(bs):
+      y = int(ys[i])
+      if y == 1 and selected_pos < want_pos:
+        selected.append((batch, i))
+        selected_pos += 1
+      elif y == 0 and selected_neg < want_neg:
+        selected.append((batch, i))
+        selected_neg += 1
+      if len(selected) >= num_graphs:
+        break
+    if len(selected) >= num_graphs:
+      break
+
+  if len(selected) == 0:
+    return None
+
+  out = {}
+  keys = list(selected[0][0].keys())
+  for k in keys:
+    v0 = selected[0][0][k]
+    if not torch.is_tensor(v0):
+      continue
+    pieces = []
+    for b, idx in selected:
+      pieces.append(b[k][idx].unsqueeze(0))
+    out[k] = torch.cat(pieces, dim=0)
+  return out
+
+
+def _map_subgraph_nodes_to_labels(subgraph, node_binary_labels, n_i):
+  """
+  将 dataset_raw 的全局节点二分类标签映射到“当前子图节点顺序”上。
+
+  - subgraph：networkx 子图结构（节点属性里可能包含 original_id/original_index 等字段）
+  - node_binary_labels：全局节点标签数组
+  - n_i：当前子图有效节点数（用于截断）
+  """
+  nodes = list(subgraph.nodes())
+  labels = np.zeros(len(nodes), dtype=np.int64)
+  total = len(node_binary_labels)
+  for j, node_id in enumerate(nodes):
+    idx = None
+    attr = subgraph.nodes[node_id]
+    for key in ('original_id', 'original_index', 'orig_id', 'node_index'):
+      if key in attr and attr[key] is not None:
+        try:
+          idx = int(attr[key])
+          break
+        except Exception:
+          pass
+    if idx is None and isinstance(node_id, (int, np.integer)):
+      idx = int(node_id)
+    if idx is not None and 0 <= idx < total:
+      labels[j] = int(node_binary_labels[idx])
+    else:
+      labels[j] = 0
+  return labels[:n_i]
+
+
+def _get_node_labels_for_batch(dataset_raw, orig_graph_indices, num_list):
+  """
+  为一个 batch 的多个子图生成节点标签列表。
+
+  返回：
+    list[np.ndarray]，长度=子图数；每个元素是该子图的节点标签（长度=对应 n_i）。
+  """
+  if dataset_raw is None:
+    return [np.zeros(n, dtype=np.int64) for n in num_list]
+  node_labels_collection = dataset_raw.get('node_binary_labels', None)
+  subgraphs = dataset_raw.get('subgraph_structures', None)
+  if node_labels_collection is None or subgraphs is None:
+    return [np.zeros(n, dtype=np.int64) for n in num_list]
+
+  out = []
+  for orig_idx, n_i in zip(orig_graph_indices, num_list):
+    if 0 <= orig_idx < len(subgraphs):
+      subgraph = subgraphs[orig_idx]
+      out.append(_map_subgraph_nodes_to_labels(subgraph, node_labels_collection, n_i))
+    else:
+      out.append(np.zeros(n_i, dtype=np.int64))
+  return out
+
+
+def _map_subgraph_nodes_to_orig_ids(subgraph, n_i):
+  """
+  将子图节点映射回原始图节点 id（便于分析与可视化对齐）。
+
+  若无法找到 original_id/original_index 等属性，则回退为 node_id（若为 int）。
+  """
+  nodes = list(subgraph.nodes())
+  out = np.full(len(nodes), -1, dtype=np.int64)
+  for j, node_id in enumerate(nodes):
+    attr = subgraph.nodes[node_id]
+    idx = None
+    for key in ('original_id', 'original_index', 'orig_id', 'node_index'):
+      if key in attr and attr[key] is not None:
+        try:
+          idx = int(attr[key])
+          break
+        except Exception:
+          pass
+    if idx is None and isinstance(node_id, (int, np.integer)):
+      idx = int(node_id)
+    out[j] = -1 if idx is None else idx
+  return out[:n_i]
+
+
+def _get_node_orig_ids_for_batch(dataset_raw, orig_graph_indices, num_list):
+  """
+  为一个 batch 的多个子图生成“原始节点 id”列表。
+
+  返回：
+    list[np.ndarray]，长度=子图数；每个元素长度=对应 n_i。
+  """
+  if dataset_raw is None:
+    return [np.full(n, -1, dtype=np.int64) for n in num_list]
+  subgraphs = dataset_raw.get('subgraph_structures', None)
+  if subgraphs is None:
+    return [np.full(n, -1, dtype=np.int64) for n in num_list]
+
+  out = []
+  for orig_idx, n_i in zip(orig_graph_indices, num_list):
+    if 0 <= orig_idx < len(subgraphs):
+      subgraph = subgraphs[orig_idx]
+      out.append(_map_subgraph_nodes_to_orig_ids(subgraph, n_i))
+    else:
+      out.append(np.full(n_i, -1, dtype=np.int64))
+  return out
+
+
+def _log_embedding_projector(writer, model, graph_data, dataset_raw, global_step, max_nodes_per_graph=256):
+  """
+  将图级/节点级 embedding 写入 TensorBoard Embedding Projector 以便交互式查看。
+
+  - 图级：mean_vec、H1、H2（如果 forward_with_embeddings 返回了对应 key）
+  - 节点级：h（每个子图最多记录 max_nodes_per_graph 个节点）
+  - metadata：包含 y/pred/prob、orig_graph_idx、subgraph_id，以及节点的 orig_id 与 node_y
+  """
+  model.eval()
+  with torch.no_grad():
+    ypred_out, emb = model.forward_with_embeddings(graph_data)
+  if emb is None:
+    return
+
+  ys = graph_data[g_key.y].detach().cpu().view(-1).tolist()
+  logits = ypred_out['ypred_A'] if isinstance(ypred_out, dict) and 'ypred_A' in ypred_out else ypred_out
+  probs = torch.sigmoid(logits.view(-1).detach().cpu()).tolist() if logits is not None else [0.0 for _ in ys]
+  preds = [1 if float(p) >= 0.5 else 0 for p in probs]
+
+  orig_idx_tensor = graph_data.get(g_key.orig_graph_idx, None)
+  if orig_idx_tensor is not None and isinstance(orig_idx_tensor, torch.Tensor):
+    orig_graph_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
+  else:
+    orig_graph_indices = list(range(len(ys)))
+
+  subgraph_id_tensor = graph_data.get(g_key.subgraph_id, None)
+  if subgraph_id_tensor is not None and isinstance(subgraph_id_tensor, torch.Tensor):
+    subgraph_ids = [int(i) for i in subgraph_id_tensor.detach().cpu().tolist()]
+  else:
+    subgraph_ids = [-1 for _ in ys]
+
+  graph_metadata_header = ['class', 'orig_idx', 'subgraph_id', 'y', 'pred', 'prob']
+  graph_metadata = [
+    [
+      _label_str(ys[i]),
+      str(orig_graph_indices[i]),
+      str(subgraph_ids[i]),
+      str(int(ys[i])),
+      str(int(preds[i])),
+      f'{float(probs[i]):.4f}',
+    ]
+    for i in range(len(ys))
+  ]
+
+  mean_vec = emb.get('mean_vec', None)
+  if mean_vec is not None:
+    writer.add_embedding(mean_vec.detach().cpu(), metadata=graph_metadata, metadata_header=graph_metadata_header, global_step=global_step, tag=f'graph_emb/mean_vec/ep_{global_step}')
+
+  H1 = emb.get('graph_emb_H1', None)
+  if H1 is not None:
+    writer.add_embedding(H1.detach().cpu(), metadata=graph_metadata, metadata_header=graph_metadata_header, global_step=global_step, tag=f'graph_emb/H1/ep_{global_step}')
+
+  H2 = emb.get('graph_emb_H2', None)
+  if H2 is not None:
+    writer.add_embedding(H2.detach().cpu(), metadata=graph_metadata, metadata_header=graph_metadata_header, global_step=global_step, tag=f'graph_emb/H2/ep_{global_step}')
+
+  h = emb.get('h', None)
+  if h is None:
+    return
+
+  batch_num_nodes = graph_data[g_key.node_num]
+  if isinstance(batch_num_nodes, torch.Tensor):
+    num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+  else:
+    num_list = [int(n) for n in batch_num_nodes]
+
+  node_labels_per_graph = _get_node_labels_for_batch(dataset_raw, orig_graph_indices, num_list)
+  node_orig_ids_per_graph = _get_node_orig_ids_for_batch(dataset_raw, orig_graph_indices, num_list)
+  for i, n_i in enumerate(num_list):
+    if n_i <= 0:
+      continue
+    n_use = min(int(n_i), int(max_nodes_per_graph))
+    node_emb = h[i, :n_use, :].detach().cpu()
+    node_labels = node_labels_per_graph[i][:n_use].tolist()
+    node_orig_ids = node_orig_ids_per_graph[i][:n_use].tolist()
+    node_metadata_header = ['class', 'orig', 'node_y']
+    node_metadata = [[_label_str(node_labels[j]), str(int(node_orig_ids[j])), str(int(node_labels[j]))] for j in range(n_use)]
+    tag = f'node_emb/h/graph_{orig_graph_indices[i]}/ep_{global_step}'
+    writer.add_embedding(node_emb, metadata=node_metadata, metadata_header=node_metadata_header, global_step=global_step, tag=tag)

@@ -3,24 +3,29 @@ cuda_visible_devices: '2'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name: 'med'
-timestamp: med_AB_gat1
-max_num_nodes: 35  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
-channel_list: [5538, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
-node_list: [5538, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
+data_name_set: ['cs','eng','phy','chem','med'] #
+timestamp: gat1_b
+max_num_nodes: 39  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
+channel_list: [6805, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
+node_list: [6805, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
 
 batch_size: 32
 epoch: 200
 learning_rate: 0.001
-grad_clip: 2
 dropout: 0.5
 patience: 50
+grad_clip: 2
 
 holdout_runs: 5                                        # 重复留出次数
 holdout_seeds: [11,22,33,44,55]         # 可选：逐次运行的随机种子列表,66,77,88,99,110
 
+branch_a:
+  use: false
+
 branch_b:
   use: true
-  only: true
   attn_hidden: 128
   gate_hidden: 64
+
+use_coarse_graph: false
+coarse_graph_topk: 16

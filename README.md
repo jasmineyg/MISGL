@@ -24,6 +24,18 @@ ENZYMES dataset is used, which includes 600 molecule structures. The edge featur
 python train.py --hparam_path=./config/hparams_testdb.yml # or other config files you defined
 ```
 
+To run multiple datasets by default, set `data_name_set` in your yaml (e.g. `config/hparams_testdb.yml`).
+
+Run multiple datasets in one shot (will execute them sequentially and print a final summary):
+```shell
+python train.py --hparam_path=./config/hparams_testdb.yml --data_name_set cs eng phy med chem med_big
+```
+
+You can also pass a comma-separated string:
+```shell
+python train.py --hparam_path=./config/hparams_testdb.yml --data_name_set "cs,eng,phy,med,chem,med_big"
+```
+
 # Results
 ## Reported Results
 ![](./data/fig/ReportedResults.png)
