@@ -6,25 +6,25 @@ from torch_scatter import scatter_mean, scatter_add, scatter_max
 
 
 class GatedAttentionScorer(nn.Module):
-    """Step3: gated-attention 打分器 s_i"""
+    """gated-attention 打分器 s_i"""
     def __init__(self, in_dim, attn_hidden=128, gate_hidden=None):
         super().__init__()
         gate_hidden = attn_hidden if gate_hidden is None else gate_hidden
         self.V = nn.Linear(in_dim, attn_hidden)
-        self.U = nn.Linear(in_dim, gate_hidden)
+        self.U = nn.Linear(in_dim, attn_hidden)
         self.w = nn.Linear(attn_hidden, 1, bias=False)
-        self.u = nn.Linear(gate_hidden, 1, bias=False)
+        # self.u = nn.Linear(gate_hidden, 1, bias=False)
 
     def forward(self, phi):  # [N, 4d]
         t1 = torch.tanh(self.V(phi))
         t2 = torch.sigmoid(self.U(phi))
-        return (self.w(t1) * self.u(t2)).squeeze(-1)  # s: [N]
+        gated_features = t1 * t2
+        return self.w(gated_features).squeeze(-1)  # s: [N]
 
 
 class MILBranchB(nn.Module):
     """
-    分支B顶层：Step1 均值上下文 -> Step2 节点-图匹配特征 -> Step3 打分 -> Step4
-    forward 返回图级预测与可解释中间量（a/s/c/g 等）
+    分支B 特征 -> 打分 -> 返回图级预测与可解释中间量
     """
     def __init__(self, node_dim, attn_hidden=128, gate_hidden=None):
         super().__init__()

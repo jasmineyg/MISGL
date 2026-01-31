@@ -4,10 +4,11 @@ cuda_visible_devices: '2'
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['cs','eng','phy','chem','med'] #
-timestamp: gat1_b
+timestamp: line2_gat1
 max_num_nodes: 39  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
-channel_list: [6805, 30, 30, 30, 1] # 分支A改成二分类：最后一维改为1
+channel_list: [6805, 256, 128, 64, 1] # 分支A改成二分类：最后一维改为1
 node_list: [6805, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
+feat_proj_dim: 1024
 
 batch_size: 32
 epoch: 200

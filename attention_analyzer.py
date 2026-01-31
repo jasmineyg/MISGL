@@ -107,6 +107,10 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
 
+    if len(sheet_name_used) == 0:
+        logging.warning(f"No attention maps were exported to {output_path}. Saving an empty sheet.")
+        pd.DataFrame({'info': ['No attention data exported']}).to_excel(writer, sheet_name='No_Data', index=False)
+
     writer.close()
     print(f'Exported branch B attention for test graphs to {output_path}')
 
@@ -197,6 +201,10 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
                 current_idx += 1
+
+    if len(sheet_name_used) == 0:
+        logging.warning(f"No attention maps were exported to {output_path} (no graphs selected or available). Saving an empty sheet.")
+        pd.DataFrame({'info': ['No attention data exported']}).to_excel(writer, sheet_name='No_Data', index=False)
 
     writer.close()
 
