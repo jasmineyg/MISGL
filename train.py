@@ -10,7 +10,7 @@ import random
 import time
 
 from gnn_hpool.utils import hparam
-
+from gnn_hpool.utils import reproducibility
 
 def _parse_data_name_set(raw):
   if raw is None:
@@ -41,9 +41,7 @@ def _parse_data_name_set(raw):
 def main(args):
 
   # reproducibility
-  torch.manual_seed(1024)
-  np.random.seed(1024)
-  random.seed(1024)
+  reproducibility.set_seed(1024)
 
   from gnn_hpool.bin import train_eval
 

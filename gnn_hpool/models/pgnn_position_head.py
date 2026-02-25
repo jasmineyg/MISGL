@@ -1,54 +1,84 @@
-# pgnn_position_head.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Nonlinear(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        return self.linear2(F.relu(self.linear1(x)))
-
-class PGNNLayer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, dist_trainable=True):
-        super().__init__()
-        self.dist_trainable = dist_trainable
-        if dist_trainable:
-            self.dist_compute = Nonlinear(1, hidden_dim, 1)
-        self.linear_hidden = nn.Linear(input_dim * 2, hidden_dim)
-        self.linear_out_position = nn.Linear(hidden_dim, 1)
-
-    def forward(self, feature, dists_max, dists_argmax):
-        if self.dist_trainable:
-            dists_max = self.dist_compute(dists_max.unsqueeze(-1)).squeeze(-1)
-
-        subset_features = feature[dists_argmax.reshape(-1), :]
-        subset_features = subset_features.reshape(dists_argmax.size(0), dists_argmax.size(1), feature.size(1))
-        messages = subset_features * dists_max.unsqueeze(-1)
-
-        self_feature = feature.unsqueeze(1).expand(-1, dists_max.size(1), -1)
-        messages = torch.cat([messages, self_feature], dim=-1)
-
-        messages = F.relu(self.linear_hidden(messages))      # [N, M, hidden]
-        out_position = self.linear_out_position(messages).squeeze(-1)  # [N, M]
-        out_structure = messages.mean(dim=1)                 # [N, hidden]
-        return out_position, out_structure
-
-class PositionConcatClassifier(nn.Module):
-    def __init__(self, h_dim, num_classes, p_hidden_dim=32, p_out_dim=32, dist_trainable=True):
-        super().__init__()
-        self.pos_layer = PGNNLayer(h_dim, p_hidden_dim, dist_trainable=dist_trainable)
-        self.p_proj = nn.Linear(-1, -1)  # 占位，首次 forward 时重建
-        self.p_out_dim = p_out_dim
-        self.classifier = nn.Linear(h_dim + p_out_dim, num_classes)
-
-    def forward(self, h, dists_max, dists_argmax):
-        p, _ = self.pos_layer(h, dists_max, dists_argmax)    # p: [N, M]
-        if self.p_proj.in_features != p.size(1):
-            self.p_proj = nn.Linear(p.size(1), self.p_out_dim).to(p.device)
-        p = self.p_proj(p)                                   # [N, p_out_dim]
-        z = torch.cat([h, p], dim=-1)
-        return self.classifier(z)
+class SubgraphPositionEncoder(nn.Module):
+    """
+    Module 2: Subgraph Position Encoder.
+    Encodes position using anchor distances and fuses with subgraph features.
+    """
+    def __init__(self, input_dim, hidden_dim, num_classes, max_dist, k_anchors, d_pos=64, dropout=0.5):
+        super(SubgraphPositionEncoder, self).__init__()
+        self.d_pos = d_pos
+        self.k_anchors = k_anchors
+        
+        # 1. Embedding Layer
+        # Input indices are in [0, max_dist]. Size should be max_dist + 1.
+        self.pos_embedding = nn.Embedding(max_dist + 1, d_pos)
+        
+        # 2. Attention Pooling
+        # "Weighted average along anchor dimension"
+        # We learn a weight for each anchor position context
+        self.attn_fc = nn.Linear(d_pos, 1)
+        
+        # 3. Fusion & Classifier
+        # Concatenate h (input_dim) + p (d_pos)
+        fusion_dim = input_dim + d_pos
+        
+        # Two layers MLP (with BN, ReLU, Dropout=0.5)
+        # Layer 1
+        self.mlp_1 = nn.Linear(fusion_dim, hidden_dim)
+        self.bn_1 = nn.BatchNorm1d(hidden_dim)
+        self.dropout_1 = nn.Dropout(p=dropout)
+        
+        # Layer 2
+        self.mlp_2 = nn.Linear(hidden_dim, num_classes)
+        # Usually final layer doesn't have BN/ReLU/Dropout if it's logits, but user said:
+        # "Two layers MLP (with BN, ReLU, Dropout=0.5) output bag-level logits"
+        # This implies the structure is applied. But typically the last linear outputs logits directly.
+        # I will assume: Linear -> BN -> ReLU -> Dropout -> Linear -> Logits.
+        # This fits "Two layers MLP".
+        
+    def forward(self, h, anchor_dist_index, anchor_mask=None):
+        """
+        Args:
+            h: Subgraph features [B, input_dim]
+            anchor_dist_index: Distance indices [B, k]
+            anchor_mask: Mask for valid anchors [B, k] (1=valid, 0=invalid)
+        Returns:
+            logits: [B, num_classes]
+        """
+        # 1. Embedding
+        # p_raw: [B, k, d_pos]
+        p_raw = self.pos_embedding(anchor_dist_index)
+        
+        # 2. Attention Pooling
+        # scores: [B, k, 1]
+        scores = self.attn_fc(p_raw)
+        
+        if anchor_mask is not None:
+            # Mask out unreachable anchors (set scores to very small number)
+            # anchor_mask is 1 for valid, 0 for invalid
+            # We want to mask where anchor_mask is 0
+            scores = scores.masked_fill(anchor_mask.unsqueeze(-1) == 0, -1e9)
+            
+        attn_weights = F.softmax(scores, dim=1) # [B, k, 1]
+        
+        # p: [B, d_pos] - Weighted sum
+        p = torch.sum(p_raw * attn_weights, dim=1)
+        
+        # 3. Fusion
+        # p_cat: [B, input_dim + d_pos]
+        p_cat = torch.cat([h, p], dim=1)
+        
+        # 4. Classifier
+        # Layer 1
+        out = self.mlp_1(p_cat)
+        out = self.bn_1(out)
+        out = F.relu(out)
+        out = self.dropout_1(out)
+        
+        # Layer 2 (Output)
+        logits = self.mlp_2(out)
+        
+        return logits

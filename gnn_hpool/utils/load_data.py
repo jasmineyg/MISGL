@@ -15,6 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from gnn_hpool.utils import hparams_lib
 from gnn_hpool.utils.global_variables import *
+from gnn_hpool.utils import reproducibility
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
@@ -78,6 +79,16 @@ class GraphDataLoaderWrapper(object):
     if data_name is None:
       data_name = getattr(self._hparams, 'data_name', None)
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
+    logging.warning(f'[DEBUG] Attempting to load dataset from: {dataset_path}')
+    if not os.path.exists(dataset_path):
+        logging.error(f'[ERROR] Dataset file not found: {dataset_path}')
+        logging.error(f'[ERROR] Current working directory: {os.getcwd()}')
+        # 尝试在当前目录或相对目录查找
+        alt_path = os.path.join('processed_data', f'{data_name}_processed.pkl')
+        if os.path.exists(alt_path):
+             logging.warning(f'[DEBUG] Found dataset at alternative path: {alt_path}')
+             dataset_path = alt_path
+    
     with open(dataset_path, 'rb') as f:
       dataset = pickle.load(f)
 
@@ -150,13 +161,13 @@ class GraphDataLoaderWrapper(object):
         inner_graphs = [train_graphs[i] for i in inner_idx]
         train_graphs = [train_graphs[i] for i in main_idx]
         inner_set = GraphDataset(self._hparams, inner_graphs)
-        inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False)
+        inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
   
     training_set = GraphDataset(self._hparams, train_graphs)
     validation_set = GraphDataset(self._hparams, val_graphs)
   
-    training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False)
+    training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
+    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
   
     return training_loader, inner_loader, validation_loader
 
@@ -178,17 +189,17 @@ class GraphDataLoaderWrapper(object):
       training_set = GraphDataset(self._hparams, main_graphs)
       inner_set = GraphDataset(self._hparams, inner_graphs)
   
-      training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
-      inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False)
+      training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
+      inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
       return training_loader, inner_loader
   
   def get_full_train_loader(self):
     training_set = GraphDataset(self._hparams, self.train_graphs)
-    return DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
+    return DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
 
   def get_test_loader(self):
     test_set = GraphDataset(self._hparams, self.test_graphs)
-    return DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False)
+    return DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
 
   def _resolve_group_ids(self, dataset, subgraphs, indices):
     # 优先从dataset字典尝试取组ID数组（必须与subgraphs一一对齐）
@@ -278,9 +289,9 @@ class GraphDataLoaderWrapper(object):
     validation_set = GraphDataset(self._hparams, val_graphs)
     test_set       = GraphDataset(self._hparams, test_graphs)
 
-    training_loader   = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False)
-    test_loader       = DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False)
+    training_loader   = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
+    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
+    test_loader       = DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
 
     return training_loader, validation_loader, test_loader
 

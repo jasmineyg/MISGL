@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 import random
 from gnn_hpool.utils import get_loss
 from gnn_hpool.utils import common_utils
+from gnn_hpool.utils import reproducibility
 from gnn_hpool.utils.global_variables import *
 from gnn_hpool.utils.evaluate import evaluate
 from gnn_hpool.utils import load_data
@@ -62,23 +63,23 @@ def train_eval(hparams, data_name=None):
   for run_idx, seed in enumerate(seeds):
     logging.warning('* holdout run: {} (seed={})'.format(run_idx, seed))
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if hparams.device == 'cuda':
-      torch.backends.cudnn.deterministic = True
-      torch.backends.cudnn.benchmark = False
+    reproducibility.set_seed(seed, cuda_deterministic=(hparams.device == 'cuda'))
 
     # 仅返回 train/val/test
     training_loader, validation_loader, test_loader = data_loader.get_holdout_loaders(
       seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
 
-    tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
-    logdir = os.path.join(tb_root, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
-    if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
-      logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
-    summary_writer = SummaryWriter(logdir)
+    # 默认关闭 tensorboard 以节省内存
+    enable_tensorboard = getattr(hparams, 'enable_tensorboard', False)
+    summary_writer = None
+
+    if enable_tensorboard:
+      tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
+      logdir = os.path.join(tb_root, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
+      if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
+        logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
+      summary_writer = SummaryWriter(logdir)
 
     model = gcn_hpool_encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     # 训练+早停都用val
@@ -111,10 +112,15 @@ def train_eval(hparams, data_name=None):
     #   )
 
     bb_cfg = getattr(hparams, 'branch_b', None)
+    logging.warning(f'[DEBUG] branch_b config: {bb_cfg}')
     if bool(bb_cfg and bb_cfg.get('use', False)):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
+      logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
       export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path, sample_frac=0.2)
-    summary_writer.close()
+    else:
+      logging.warning('[DEBUG] branch_b.use is False or not found, skipping attention export.')
+    if summary_writer is not None:
+      summary_writer.close()
 
   summary = {
     key: {

@@ -13,6 +13,80 @@ from gnn_hpool.utils.load_data import GraphDataLoaderWrapper
 from gnn_hpool.models.gcn_hpool_encoder import GcnHpoolEncoder
 
 
+def _write_summary_sheet(writer, stats):
+    """
+    将统计信息写入 'Summary' 工作表
+    """
+    try:
+        # 计算平均权重
+        avg_pos_weight = np.mean(stats['pos_weights']) if stats['pos_weights'] else 0.0
+        avg_neg_weight = np.mean(stats['neg_weights']) if stats['neg_weights'] else 0.0
+        avg_pos_bag_top1_hit_rate = np.mean(stats['pos_bag_top1_hits']) if stats['pos_bag_top1_hits'] else 0.0
+        avg_pos_bag_top3_hit_rate = np.mean(stats['pos_bag_top3_hits']) if stats['pos_bag_top3_hits'] else 0.0
+        avg_pos_bag_top5_hit_rate = np.mean(stats['pos_bag_top5_hits']) if stats['pos_bag_top5_hits'] else 0.0
+        
+        # 构建 Summary DataFrame
+        summary_data = {
+            'Metric': [
+                'Average Positive Node Weight',
+                'Average Negative Node Weight',
+                'Top-1 Hit Probability (Positive Bags)',
+                'Top-3 Hit Probability (Positive Bags)',
+                'Top-5 Hit Probability (Positive Bags)',
+                'Correctly Classified Positive Bags',
+                'Correctly Classified Negative Bags',
+                'Wrongly Classified Bags - Positive Node Counts'
+            ],
+            'Value': [
+                avg_pos_weight,
+                avg_neg_weight,
+                avg_pos_bag_top1_hit_rate,
+                avg_pos_bag_top3_hit_rate,
+                avg_pos_bag_top5_hit_rate,
+                stats['correct_pos_bag_count'],
+                stats['correct_neg_bag_count'],
+                str(stats['wrong_bag_pos_node_counts']) # 转为字符串以存储在单元格中
+            ]
+        }
+        
+        df_summary = pd.DataFrame(summary_data)
+        
+        # 将 Summary sheet 插入到第一个位置
+        # openpyxl 的 writer.book.create_sheet 可以指定 index
+        # 但 pandas 的 to_excel 默认是在末尾追加
+        # 所以先写入，然后通过 openpyxl 调整 sheet 顺序
+        
+        df_summary.to_excel(writer, sheet_name='Summary', index=False)
+        
+        # 也可以添加更详细的错误分类包的正节点数列表（如果列表很长，放在单独的列可能更好）
+        # 这里为了简单，如果需要详细展开，可以额外加列
+        if stats['wrong_bag_pos_node_counts']:
+            df_wrong_details = pd.DataFrame({
+                'Wrong_Bag_Index': range(len(stats['wrong_bag_pos_node_counts'])),
+                'Positive_Node_Count': stats['wrong_bag_pos_node_counts']
+            })
+            pass
+            
+    except Exception as e:
+        logging.error(f"Error writing summary sheet: {e}")
+        # 写入错误信息以防万一
+        pd.DataFrame({'Error': [str(e)]}).to_excel(writer, sheet_name='Summary_Error', index=False)
+
+def _reorder_sheets_to_front(writer, sheet_name='Summary'):
+    """
+    将指定的 sheet 移动到第一个位置
+    """
+    try:
+        book = writer.book
+        if sheet_name in book.sheetnames:
+            sheets = book._sheets
+            target_sheet = book[sheet_name]
+            sheets.remove(target_sheet)
+            sheets.insert(0, target_sheet)
+    except Exception as e:
+        logging.error(f"Error reordering sheets: {e}")
+
+
 def export_branchB_attention_to_excel(hparams, output_path, seed=None):
     # 构造数据加载器（使用 Holdout 划分）
     data_loader = GraphDataLoaderWrapper(hparams)
@@ -44,28 +118,57 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     writer = pd.ExcelWriter(output_path, engine='openpyxl')
 
+    # 统计容器
+    stats = {
+        'pos_weights': [],
+        'neg_weights': [],
+        'pos_bag_top1_hits': [],
+        'pos_bag_top3_hits': [],
+        'pos_bag_top5_hits': [],
+        'correct_pos_bag_count': 0,
+        'correct_neg_bag_count': 0,
+        'wrong_bag_pos_node_counts': []
+    }
+
+    current_idx = 0
+
     with torch.no_grad():
         sheet_name_used = set()
         for _, graph_data in enumerate(test_loader):
-            # 前向调用，获得分支B的对齐注意力（按 [B, M] 填充）
+            # 前向调用
             out = model(graph_data)
+            
+            # 获取预测结果和真实标签
+            if 'ypred_A' in out:
+                logits = out['ypred_A']
+            elif isinstance(out, dict) and 'ypred' in out: # 兼容旧接口
+                logits = out['ypred']
+            else:
+                # 无法获取预测结果，无法判断正确性
+                logits = None
+            
+            # 获取 Ground Truth
+            if g_key.y in graph_data:
+                labels = graph_data[g_key.y]
+            else:
+                labels = None
+
             if not isinstance(out, dict) or 'branch_b' not in out or out['branch_b'] is None:
                 logging.warning("当前批次没有分支B输出，已跳过。")
+                # 更新索引计数
+                batch_num_nodes = graph_data[g_key.node_num]
+                bs = len(batch_num_nodes) if not isinstance(batch_num_nodes, torch.Tensor) else batch_num_nodes.size(0)
+                current_idx += bs
                 continue
 
             b_out = out['branch_b']
             a_pad = b_out.get('a_pad', None)        # [B, M]
-            mask_valid = b_out.get('mask_valid', None)  # [B, M]，未使用，仅说明有效位置
-            if a_pad is None:
-                logging.warning("未找到 a_pad（分支B注意力对齐向量），已跳过。")
-                continue
-
+            a_flat = b_out.get('a', None)           # [Sum(N)]
+            
             # 取每个样本的真实节点数与原始图索引
             batch_num_nodes = graph_data[g_key.node_num]
             orig_idx_tensor = graph_data[g_key.orig_graph_idx]
 
-            # 转到 CPU 处理
-            a_pad_np = a_pad.detach().cpu().numpy()
             if isinstance(batch_num_nodes, torch.Tensor):
                 num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
             else:
@@ -75,20 +178,90 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
                 orig_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
             else:
                 orig_indices = [int(i) for i in orig_idx_tensor]
+            
+            # 处理 labels 和 preds
+            batch_preds = []
+            batch_labels = []
+            if logits is not None and labels is not None:
+                # 获取预测类别：对于二分类，通常是 argmax(logits) 或者 threshold=0.5
+                # 这里假设 logits 是 [B, 2] 或者 [B, 1]
+                if logits.dim() == 2 and logits.size(1) == 2:
+                     preds = logits.argmax(dim=1).detach().cpu().tolist()
+                elif logits.dim() == 2 and logits.size(1) == 1:
+                     preds = (torch.sigmoid(logits) > 0.5).long().view(-1).detach().cpu().tolist()
+                elif logits.dim() == 1:
+                     preds = (torch.sigmoid(logits) > 0.5).long().detach().cpu().tolist()
+                else:
+                     logging.warning(f"Unexpected logits shape: {logits.shape}")
+                     preds = [0] * len(num_list) # Fallback
 
-            # 逐图写入
+                batch_labels = labels.detach().cpu().tolist()
+                batch_preds = preds
+            else:
+                batch_preds = [None] * len(num_list)
+                batch_labels = [None] * len(num_list)
+
+            # 准备 weights_list
+            weights_list = []
+            if a_pad is not None:
+                a_pad_np = a_pad.detach().cpu().numpy()
+                for i, n_i in enumerate(num_list):
+                    weights_list.append(a_pad_np[i, :n_i])
+            elif a_flat is not None:
+                a_flat_np = a_flat.detach().cpu().numpy()
+                curr = 0
+                for n_i in num_list:
+                    weights_list.append(a_flat_np[curr : curr+n_i])
+                    curr += n_i
+            else:
+                logging.warning("未找到 a_pad 或 a（分支B注意力），已跳过。")
+                current_idx += len(num_list)
+                continue
+
+            # 逐图处理
             for i, n_i in enumerate(num_list):
                 if n_i <= 0:
+                    current_idx += 1
                     continue
-                weights = a_pad_np[i, :n_i]
+                
+                weights = weights_list[i]
                 orig_idx = orig_indices[i]
-
+                pred = batch_preds[i]
+                label = batch_labels[i]
+                
+                # 获取节点标签
                 if node_labels_collection is not None and 0 <= orig_idx < len(node_labels_collection):
                     node_bin_labels = np.asarray(node_labels_collection[orig_idx])
                     node_bin_labels = node_bin_labels[:n_i]
                 else:
                     node_bin_labels = np.zeros(n_i, dtype=np.int64)
 
+                # --- 统计逻辑 (针对所有图) ---
+                # 1. 权重统计
+                pos_mask = (node_bin_labels == 1)
+                neg_mask = (node_bin_labels == 0)
+                if pos_mask.any():
+                    stats['pos_weights'].extend(weights[pos_mask].tolist())
+                if neg_mask.any():
+                    stats['neg_weights'].extend(weights[neg_mask].tolist())
+                
+                # 2. Bag 分类统计
+                is_correct = False
+                if pred is not None and label is not None:
+                    if pred == label:
+                        is_correct = True
+                        if label == 1:
+                            stats['correct_pos_bag_count'] += 1
+                        else:
+                            stats['correct_neg_bag_count'] += 1
+                    else:
+                        # 分类错误
+                        is_correct = False
+                        # 统计正节点数量
+                        pos_node_count = np.sum(node_bin_labels)
+                        stats['wrong_bag_pos_node_counts'].append(int(pos_node_count))
+                
+                # --- 导出逻辑 (全部导出) ---
                 df = pd.DataFrame({
                     'weight': weights,
                     'node_binary_label': node_bin_labels
@@ -96,8 +269,25 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
                 # 按权重降序排列并重置索引
                 df = df.sort_values(by='weight', ascending=False).reset_index(drop=True)
 
-                # 每个sheet一个graph；避免重名
-                base_name = f'graph_{orig_idx}'
+                if label == 1:
+                    # Top-1 Hit
+                    top1_labels = df.head(1)['node_binary_label']
+                    hit1 = 1 if top1_labels.sum() > 0 else 0
+                    stats['pos_bag_top1_hits'].append(hit1)
+                    
+                    # Top-3 Hit
+                    top3_labels = df.head(3)['node_binary_label']
+                    hit3 = 1 if top3_labels.sum() > 0 else 0
+                    stats['pos_bag_top3_hits'].append(hit3)
+
+                    # Top-5 Hit
+                    top5_labels = df.head(5)['node_binary_label']
+                    hit5 = 1 if top5_labels.sum() > 0 else 0
+                    stats['pos_bag_top5_hits'].append(hit5)
+
+                # 命名规则: {id}_{correctness}
+                correct_flag = 1 if is_correct else 0
+                base_name = f'{orig_idx}_{correct_flag}'
                 sheet_name = base_name
                 suffix = 1
                 while sheet_name in sheet_name_used:
@@ -106,8 +296,16 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
                 sheet_name_used.add(sheet_name)
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                current_idx += 1
 
-    if len(sheet_name_used) == 0:
+    # 生成总结 Sheet
+    _write_summary_sheet(writer, stats)
+    
+    # 调整 Summary 到第一个位置
+    _reorder_sheets_to_front(writer, 'Summary')
+
+    if len(sheet_name_used) == 0 and len(stats['pos_weights']) == 0:
         logging.warning(f"No attention maps were exported to {output_path}. Saving an empty sheet.")
         pd.DataFrame({'info': ['No attention data exported']}).to_excel(writer, sheet_name='No_Data', index=False)
 
@@ -124,12 +322,18 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
     subgraphs = dataset_raw.get('subgraph_structures', None)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # 采样逻辑
-    total_graphs = len(test_loader.dataset)
-    num_sample = int(total_graphs * sample_frac)
-    if num_sample < 1 and total_graphs > 0: num_sample = 1
-    sampled_indices = set(random.sample(range(total_graphs), num_sample))
-    
+    # 统计容器
+    stats = {
+        'pos_weights': [],
+        'neg_weights': [],
+        'pos_bag_top1_hits': [],
+        'pos_bag_top3_hits': [],
+        'pos_bag_top5_hits': [],
+        'correct_pos_bag_count': 0,
+        'correct_neg_bag_count': 0,
+        'wrong_bag_pos_node_counts': []
+    }
+
     writer = pd.ExcelWriter(output_path, engine='openpyxl')
 
     with torch.no_grad():
@@ -137,9 +341,23 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
         current_idx = 0
         for _, graph_data in enumerate(test_loader):
             out = model(graph_data)
+            
+            # 获取预测结果和真实标签
+            if 'ypred_A' in out:
+                logits = out['ypred_A']
+            elif isinstance(out, dict) and 'ypred' in out:
+                logits = out['ypred']
+            else:
+                logits = None
+            
+            # 获取 Ground Truth
+            if g_key.y in graph_data:
+                labels = graph_data[g_key.y]
+            else:
+                labels = None
+                
             if not isinstance(out, dict) or 'branch_b' not in out or out['branch_b'] is None:
-                # 即使没有输出，也要增加计数以保持对齐（假设 batch size 是确定的）
-                # 但这里更安全的是根据 node_num 的长度来增加
+                # 即使没有输出，也要增加计数以保持对齐
                 batch_num_nodes = graph_data['node_num']
                 bs = len(batch_num_nodes) if not isinstance(batch_num_nodes, torch.Tensor) else batch_num_nodes.size(0)
                 current_idx += bs
@@ -147,16 +365,11 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
 
             b_out = out['branch_b']
             a_pad = b_out.get('a_pad', None)
-            if a_pad is None:
-                batch_num_nodes = graph_data['node_num']
-                bs = len(batch_num_nodes) if not isinstance(batch_num_nodes, torch.Tensor) else batch_num_nodes.size(0)
-                current_idx += bs
-                continue
+            a_flat = b_out.get('a', None)
 
             batch_num_nodes = graph_data['node_num']
             orig_idx_tensor = graph_data['orig_graph_idx']
 
-            a_pad_np = a_pad.detach().cpu().numpy()
             if isinstance(batch_num_nodes, torch.Tensor):
                 num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
             else:
@@ -165,17 +378,53 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 orig_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
             else:
                 orig_indices = [int(i) for i in orig_idx_tensor]
+            
+            # 处理 labels 和 preds
+            batch_preds = []
+            batch_labels = []
+            if logits is not None and labels is not None:
+                # 获取预测类别：对于二分类，通常是 argmax(logits) 或者 threshold=0.5
+                # 这里假设 logits 是 [B, 2] 或者 [B, 1]
+                if logits.dim() == 2 and logits.size(1) == 2:
+                     preds = logits.argmax(dim=1).detach().cpu().tolist()
+                elif logits.dim() == 2 and logits.size(1) == 1:
+                     preds = (torch.sigmoid(logits) > 0.5).long().view(-1).detach().cpu().tolist()
+                elif logits.dim() == 1:
+                     preds = (torch.sigmoid(logits) > 0.5).long().detach().cpu().tolist()
+                else:
+                     logging.warning(f"Unexpected logits shape: {logits.shape}")
+                     preds = [0] * len(num_list) # Fallback
+
+                batch_labels = labels.detach().cpu().tolist()
+                batch_preds = preds
+            else:
+                batch_preds = [None] * len(num_list)
+                batch_labels = [None] * len(num_list)
+
+            weights_list = []
+            if a_pad is not None:
+                a_pad_np = a_pad.detach().cpu().numpy()
+                for i, n_i in enumerate(num_list):
+                    weights_list.append(a_pad_np[i, :n_i])
+            elif a_flat is not None:
+                a_flat_np = a_flat.detach().cpu().numpy()
+                curr = 0
+                for n_i in num_list:
+                    weights_list.append(a_flat_np[curr : curr+n_i])
+                    curr += n_i
+            else:
+                current_idx += len(num_list)
+                continue
 
             for i, n_i in enumerate(num_list):
-                if current_idx not in sampled_indices:
-                    current_idx += 1
-                    continue
-                
                 if n_i <= 0:
                     current_idx += 1
                     continue
-                weights = a_pad_np[i, :n_i]
+                
+                weights = weights_list[i]
                 orig_idx = orig_indices[i]
+                pred = batch_preds[i]
+                label = batch_labels[i]
 
                 # 修复：按子图节点映射到原图索引再取标签
                 if node_labels_collection is not None and subgraphs is not None and 0 <= orig_idx < len(subgraphs):
@@ -184,6 +433,37 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 else:
                     node_bin_labels = np.zeros(n_i, dtype=np.int64)
 
+                # --- 统计逻辑 (针对所有图) ---
+                # 1. 权重统计
+                pos_mask = (node_bin_labels == 1)
+                neg_mask = (node_bin_labels == 0)
+                if pos_mask.any():
+                    stats['pos_weights'].extend(weights[pos_mask].tolist())
+                if neg_mask.any():
+                    stats['neg_weights'].extend(weights[neg_mask].tolist())
+                
+                # 2. Bag 分类统计
+                is_correct = False
+                if pred is not None and label is not None:
+                    if pred == label:
+                        is_correct = True
+                        if label == 1:
+                            stats['correct_pos_bag_count'] += 1
+                        else:
+                            stats['correct_neg_bag_count'] += 1
+                    else:
+                        is_correct = False
+                        # 统计错误分类包中的正节点数量
+                        # 注意：这里的“错误分类”是指：
+                        #   1. 真实为正(1) -> 预测为负(0) (False Negative)
+                        #   2. 真实为负(0) -> 预测为正(1) (False Positive)
+                        # 我们统计的是该包内真实标签为1的节点数
+                        pos_node_count = np.sum(node_bin_labels)
+                        stats['wrong_bag_pos_node_counts'].append(int(pos_node_count))
+                else:
+                    logging.warning(f"Graph {orig_idx}: pred={pred}, label={label}, skipping classification stats.")
+                
+                # --- 导出逻辑 (全部导出) ---
                 # 导出仅包含权重与节点二分类标签
                 df = pd.DataFrame({
                     'weight': weights,
@@ -191,7 +471,24 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 })
                 df = df.sort_values(by='weight', ascending=False).reset_index(drop=True)
 
-                base_name = f'graph_{orig_idx}'
+                if label == 1:
+                    # Top-1 Hit
+                    top1_labels = df.head(1)['node_binary_label']
+                    hit1 = 1 if top1_labels.sum() > 0 else 0
+                    stats['pos_bag_top1_hits'].append(hit1)
+                    
+                    # Top-3 Hit
+                    top3_labels = df.head(3)['node_binary_label']
+                    hit3 = 1 if top3_labels.sum() > 0 else 0
+                    stats['pos_bag_top3_hits'].append(hit3)
+
+                    # Top-5 Hit
+                    top5_labels = df.head(5)['node_binary_label']
+                    hit5 = 1 if top5_labels.sum() > 0 else 0
+                    stats['pos_bag_top5_hits'].append(hit5)
+
+                correct_flag = 1 if is_correct else 0
+                base_name = f'{orig_idx}_{correct_flag}'
                 sheet_name = base_name
                 suffix = 1
                 while sheet_name in sheet_name_used:
@@ -200,9 +497,16 @@ def export_branchB_attention_from_model(model, test_loader, hparams, dataset_raw
                 sheet_name_used.add(sheet_name)
 
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
                 current_idx += 1
 
-    if len(sheet_name_used) == 0:
+    # 生成总结 Sheet
+    _write_summary_sheet(writer, stats)
+    
+    # 调整 Summary 到第一个位置
+    _reorder_sheets_to_front(writer, 'Summary')
+
+    if len(sheet_name_used) == 0 and len(stats['pos_weights']) == 0:
         logging.warning(f"No attention maps were exported to {output_path} (no graphs selected or available). Saving an empty sheet.")
         pd.DataFrame({'info': ['No attention data exported']}).to_excel(writer, sheet_name='No_Data', index=False)
 
