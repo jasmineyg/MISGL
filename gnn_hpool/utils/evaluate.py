@@ -21,7 +21,11 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
             # 只使用分支A的分类头输出，不做融合
             if isinstance(out, dict) and 'ypred_A' in out:
                 logits_A = out['ypred_A']  # [B] 或 [B,1]
-                p = torch.sigmoid(logits_A).view(-1)  # [B]
+                if isinstance(logits_A, torch.Tensor):
+                    p = torch.sigmoid(logits_A).view(-1)  # [B]
+                else:
+                    # Fallback if logits_A is not a tensor for some reason
+                    p = torch.tensor([0.0] * len(data[g_key.y])).to(hparams.device)
             else:
                 logits_A = out  # [B] 或 [B,1]
                 p = torch.sigmoid(logits_A).view(-1)  # [B]

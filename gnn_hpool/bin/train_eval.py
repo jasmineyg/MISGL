@@ -83,7 +83,7 @@ def train_eval(hparams, data_name=None):
 
     model = gcn_hpool_encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     # 训练+早停都用val
-    train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams)
+    train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw)
 
     result = evaluate(test_loader, model, hparams, dataset_name="test")
     all_results.append(result)
@@ -135,7 +135,7 @@ def train_eval(hparams, data_name=None):
   return {'seeds': seeds, 'results': all_results, 'summary': summary}
 
 
-def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
+def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset_raw=None):
     """
     单次 holdout 下的训练循环（按 epoch 训练 + val 早停）。
 
@@ -210,6 +210,14 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams):
       val_accs.append(val_result['acc'])
       if writer is not None:
         writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
+        
+      # 导出 GAT1 特征，每 50 个 epoch 保存一次，第一次保存在第 50 epoch (即 epoch 49)
+      enable_gat_export = bool(getattr(hparams, 'enable_gat_export', False))
+      if enable_gat_export and (epoch + 1) % 50 == 0:
+          logging.warning(f"Triggering GAT1 feature export at epoch {epoch + 1}")
+          from gnn_hpool.utils.export_gat import export_gat1_features
+          export_gat1_features(model, eval_dataset, epoch + 1, dataset_raw, split="val")
+          
       if val_result['acc'] > best_val_result['acc'] - 1e-7:
         best_val_result.update({'acc': val_result['acc'], 'epoch': epoch, 'loss': avg_loss})
         best_model_state = copy.deepcopy(model.state_dict())

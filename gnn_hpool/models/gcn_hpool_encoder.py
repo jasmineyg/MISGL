@@ -12,7 +12,6 @@ from gnn_hpool.utils import hparams_lib
 from gnn_hpool.utils.coarse_graph_analyze import analyze_and_export, default_coarsegraph_analyze_out_xlsx
 from gnn_hpool.layers import gcn_layer
 from gnn_hpool.models.mil_head import MILBranchB
-from gnn_hpool.layers.gin_layer import GINLayer
 from gnn_hpool.layers.gat_layer import ResidualGATLayer
 from gnn_hpool.utils.pgnn_precompute import precompute_and_save_pgnn
 
@@ -20,15 +19,13 @@ from gnn_hpool.utils.pgnn_precompute import precompute_and_save_pgnn
 class GcnHpoolEncoder(nn.Module):
     """
     GCN/HPool Encoder Refactored.
-    
     Logic Flow:
-    1. Feature Projection -> x1
-    2. Backbone (GAT) -> x2
+    1. Feature Projection -> x1 # 线形层
+    2. Backbone (GAT) -> x2     # GAT
     3. Pooling: x1 -> h1, x2 -> h2
     4. Coarse Graph: h1 -> Coarse GCN -> h4
     5. MIL Branch: x2 -> MIL Head -> h3
     6. Classifier: [h1, h2, h4, h3] -> ypred
-    
     """
 
     def __init__(self, hparams, data_name=None):
@@ -156,7 +153,6 @@ class GcnHpoolEncoder(nn.Module):
         aux_out = {} # Store auxiliary outputs (like attention weights)
 
         # --- Step 3: Pooling (h1, h2) ---
-        # Common pooling for both branches
         # h1 = self._masked_mean_pool(x1, mask, batch_num_nodes)
         h2 = self._masked_mean_pool(x2, mask, batch_num_nodes)
 
@@ -237,6 +233,7 @@ class GcnHpoolEncoder(nn.Module):
         ypred = self.classifier(final_out)
                 
         # Return format consistent with expectations (can return dict or just ypred)
+        self.current_x2 = x2  # 暂存 x2 供外部提取，不改变原本的返回值结构
         if self.use_branch_b:
              return {'ypred_A': ypred, 'branch_b': aux_out.get('branch_b')}
         else:
@@ -359,10 +356,5 @@ class GcnHpoolEncoder(nn.Module):
         del _S_full
         del Ac
         del denom
-        # Optional: Force garbage collection
         import gc
         gc.collect()
-            
-        # --- PGNN Precompute Removed ---
-        # User has switched to GCN-based coarse graph, so PGNN anchors are no longer needed.
-        # Removing this saves memory and initialization time.

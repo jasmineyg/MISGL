@@ -27,13 +27,6 @@ def fused_loss(model_output, targets, epoch, hparams):
         lam = float(bb_cfg.get('lambda_attn', 0.2)) if use_b else 0.0
         eps = float(bb_cfg.get('attn_eps', 1e-6)) if use_b else 1e-6
 
-        # 新增 bind_loss 绑定正则
-        # bind_loss = model_output['branch_b'].get('bind_loss', None)
-        # lambda_bind = float(bb_cfg.get('lambda_bind', 0.2)) if use_b else 0.0 # 默认权重 0.2
-        
-        # if use_b and bind_loss is not None and lambda_bind > 0.0:
-        #     return bce + lambda_bind * bind_loss
-
         # 注意力正则 (已废弃/注释)
         if use_b and 'branch_b' in model_output and lam > 0.0:
             a_pad = model_output['branch_b'].get('a_pad', None)
