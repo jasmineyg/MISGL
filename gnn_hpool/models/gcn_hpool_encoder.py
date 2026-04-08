@@ -9,11 +9,9 @@ import torch.nn.functional as F
 
 from gnn_hpool.utils.global_variables import g_key
 from gnn_hpool.utils import hparams_lib
-from gnn_hpool.utils.coarse_graph_analyze import analyze_and_export, default_coarsegraph_analyze_out_xlsx
 from gnn_hpool.layers import gcn_layer
 from gnn_hpool.models.mil_head import MILBranchB
 from gnn_hpool.layers.graphormer_layer import GraphormerNodeEncoder
-from gnn_hpool.utils.pgnn_precompute import precompute_and_save_pgnn
 
 
 class GcnHpoolEncoder(nn.Module):
@@ -34,27 +32,13 @@ class GcnHpoolEncoder(nn.Module):
         self._hparams = hparams_lib.copy_hparams(hparams)
         self.data_name = data_name if data_name is not None else getattr(self._hparams, 'data_name', None)
         self._device = torch.device(self._hparams.device)
-        self._layer_norms = nn.ModuleDict()
 
-        # --- Configuration ---
         bb_cfg = getattr(self._hparams, 'branch_b', None)
         self.use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
         self.use_coarse_graph = bool(getattr(self._hparams, 'use_coarse_graph', False))
-        
-        # Dimensions
-        proj_dim = getattr(self._hparams, 'feat_proj_dim', 512)
+
         in_dim = self._hparams.channel_list[0]
-        hidden_dim = self._hparams.channel_list[1] # Main hidden dimension (x2/h2, h3)
-        
-        # --- 1. Backbone (Proj + Graphormer) ---
-        self.feat_proj = nn.Sequential(
-            nn.Linear(in_dim, 2048),
-            nn.LayerNorm(2048),
-            nn.ReLU(),
-            nn.Linear(2048, proj_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5)
-        )
+        hidden_dim = self._hparams.channel_list[1]
 
         graphormer_heads = getattr(self._hparams, "graphormer_heads", getattr(self._hparams, "gat_heads", 4))
         graphormer_attn_dp = getattr(
@@ -92,41 +76,24 @@ class GcnHpoolEncoder(nn.Module):
             degree_max=graphormer_degree_max,
         )
 
-        # --- 2. Branch B (MIL Head) ---
         if self.use_branch_b:
             attn_hidden = bb_cfg.get('attn_hidden', 128)
             gate_hidden = bb_cfg.get('gate_hidden', attn_hidden)
-            # Default to 2 classes for node-level weak supervision (pos vs neg)
-            self.mil_head = MILBranchB(hidden_dim, attn_hidden=attn_hidden, gate_hidden=gate_hidden) # , num_classes=2)
+            self.mil_head = MILBranchB(hidden_dim, attn_hidden=attn_hidden, gate_hidden=gate_hidden)
 
-        # --- 3. Coarse Graph (Residual GCN) ---
         if self.use_coarse_graph:
             self._init_coarse_graph()
             num_nodes = self._hatA_full.size(0)
-            
-            # Input to Coarse GCN is h2 (hidden_dim)
             self.coarse_gcn_dim = hidden_dim
-            
-            # Global feature buffer for all coarse nodes
             self.register_buffer('coarse_node_features', torch.zeros(num_nodes, self.coarse_gcn_dim))
-            
-            # Layer 1
             self.cg_conv1 = nn.Linear(self.coarse_gcn_dim, self.coarse_gcn_dim)
             self.cg_ln1 = nn.LayerNorm(self.coarse_gcn_dim)
-            
-            # Layer 2
             self.cg_conv2 = nn.Linear(self.coarse_gcn_dim, self.coarse_gcn_dim)
             self.cg_ln2 = nn.LayerNorm(self.coarse_gcn_dim)
-            
             self.cg_dropout = nn.Dropout(0.5)
 
-        # --- 4. Classifier ---
-        # Modified Logic:
-        # Base: h3 (if Branch B) or h2 (if not Branch B) -> Both are hidden_dim
         classifier_input_dim = hidden_dim
-        
         if self.use_coarse_graph:
-            # + h4 (coarse_gcn_dim = proj_dim)
             classifier_input_dim += self.coarse_gcn_dim
 
         self.classifier = nn.Sequential(
@@ -155,102 +122,57 @@ class GcnHpoolEncoder(nn.Module):
         adj = graph_input[g_key.adj_mat]
         batch_num_nodes = graph_input[g_key.node_num]
         
-        # --- Step 1: Feature Projection (x1) ---
-        # x1 = self.feat_proj(x)
-
-        # --- Step 2: Backbone (x2) ---
         x2 = self.graphormer_encoder(x, adj, batch_num_nodes)
 
-        # Prepare Mask [B, N, 1]
         max_nodes = adj.size(1)
         mask = self.construct_mask(max_nodes, batch_num_nodes)
         if mask is not None:
             x2 = x2 * mask
 
-        aux_out = {} # Store auxiliary outputs (like attention weights)
-
-        # --- Step 3: Pooling (h1, h2) ---
-        # h1 = self._masked_mean_pool(x1, mask, batch_num_nodes)
+        aux_out = {}
         h2 = self._masked_mean_pool(x2, mask, batch_num_nodes)
 
-        # --- Step 4: Coarse Graph GCN (h4) ---
         h4 = None
         if self.use_coarse_graph:
             subgraph_ids = graph_input[g_key.subgraph_id]
-            
-            # Ensure subgraph_ids are long
             if isinstance(subgraph_ids, torch.Tensor):
                 ids = subgraph_ids.long()
             else:
                 ids = torch.tensor([int(i) for i in subgraph_ids], dtype=torch.long, device=self._device)
-            
             if ids.device != self._device:
                 ids = ids.to(self._device)
-            
-            # Update global coarse features with h2 (was h1)
-            # 1. Prepare Full Feature Matrix
             X_full = self.coarse_node_features.detach().clone()
-            
-            # Update current batch locations with new features (allowing grad flow)
             X_full[ids] = h2
-            
-            # Update the buffer for next iteration (detached)
             self.coarse_node_features.data[ids] = h2.detach()
-            
-            # 2. Run GCN on Full Graph
             adj = self._hatA_full
-            
-            # Layer 1
             h_gcn = self.cg_conv1(X_full)
             h_gcn = torch.matmul(adj, h_gcn)
-            h_gcn = self.cg_ln1(h_gcn + X_full) # Residual
+            h_gcn = self.cg_ln1(h_gcn + X_full)
             h_gcn = F.relu(h_gcn)
             h_gcn = self.cg_dropout(h_gcn)
-            
             X_l1 = h_gcn
-            
-            # Layer 2
             h_gcn = self.cg_conv2(X_l1)
             h_gcn = torch.matmul(adj, h_gcn)
-            h_gcn = self.cg_ln2(h_gcn + X_l1) # Residual
+            h_gcn = self.cg_ln2(h_gcn + X_l1)
             h_gcn = F.relu(h_gcn)
             h_gcn = self.cg_dropout(h_gcn)
-            
-            # 3. Extract batch nodes
             h4 = h_gcn[ids]
 
-        # --- Step 5: Branch B (MIL Head, h3) ---
         h3 = None
         if self.use_branch_b:
-             # Prepare flattened input for MIL Head
-            h_flat, batch_vec, num_list = self._flatten_batch(x2, batch_num_nodes)
-            
-            # Run MIL Head
-            # Pass y labels for binding loss calculation if available
-            y_labels = graph_input.get(g_key.y, None)
-            mil_out = self.mil_head(h_flat, batch_vec) #, y=y_labels)
-            h3 = mil_out['z_B'] # [B, hidden_dim]
+            h_flat, batch_vec = self._flatten_batch(x2, batch_num_nodes)
+            mil_out = self.mil_head(h_flat, batch_vec)
+            h3 = mil_out['z_B']
             aux_out['branch_b'] = mil_out
 
-        # --- Step 6: Concatenation ---
-        # Modified Logic:
-        # 1. Base feature: h3 (if Branch B) else h2
-        # 2. Append h4 (if Coarse Graph)
-        concat_list = []
-        
-        if self.use_branch_b and h3 is not None:
-            concat_list.append(h3)
-        else:
-            concat_list.append(h2)
-        
+        concat_list = [h3 if self.use_branch_b and h3 is not None else h2]
         if self.use_coarse_graph and h4 is not None:
             concat_list.append(h4)
             
         final_out = torch.cat(concat_list, dim=1)
         ypred = self.classifier(final_out)
                 
-        # Return format consistent with expectations (can return dict or just ypred)
-        self.current_x2 = x2  # 暂存 x2 供外部提取，不改变原本的返回值结构
+        self.current_x2 = x2
         if self.use_branch_b:
              return {'ypred_A': ypred, 'branch_b': aux_out.get('branch_b')}
         else:
@@ -276,7 +198,7 @@ class GcnHpoolEncoder(nn.Module):
             for i in range(B)
         ], dim=0)
         
-        return h_flat, batch_vec, num_list
+        return h_flat, batch_vec
 
     def _masked_mean_pool(self, node_embeddings, embedding_mask, batch_num_nodes):
         if embedding_mask is not None:
@@ -290,18 +212,6 @@ class GcnHpoolEncoder(nn.Module):
         sum_vec = node_embeddings.sum(dim=1)
         denom = torch.clamp(num_list, min=1.0).unsqueeze(1)
         return sum_vec / denom
-
-    def apply_ln(self, x):
-        dim = int(x.size(-1))
-        key = str(dim)
-        if key not in self._layer_norms:
-            self._layer_norms[key] = torch.nn.LayerNorm(dim, elementwise_affine=True)
-        
-        ln = self._layer_norms[key]
-        if ln.weight.device != x.device:
-            ln = ln.to(device=x.device)
-            self._layer_norms[key] = ln
-        return ln(x)
 
     def construct_mask(self, max_nodes, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):

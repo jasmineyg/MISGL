@@ -3,12 +3,9 @@ cuda_visible_devices: '2'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['cs','eng','phy','chem','med']  #'cs'
+data_name_set: ['cs', 'eng', 'phy', 'chem', 'med']
 timestamp: output_x2
-max_num_nodes: 39  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
-channel_list: [6805, 256, 128, 64, 1] # 分支A改成二分类：最后一维改为1
-node_list: [6805, 10, 10]  # 第一个值为特征维度，cora 1433, citeseer 3703, pubmed 500, cs 6805, phy 8415, eng 4839, chem 4877, med 5538
-feat_proj_dim: 512
+channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 32
 epoch: 200
@@ -17,14 +14,14 @@ dropout: 0.5
 patience: 50
 grad_clip: 2
 
-holdout_runs: 5                                        # 重复留出次数
-holdout_seeds: [11,22,33,44,55]         # 可选：逐次运行的随机种子列表,66,77,88,99,110
-
-branch_a:
-  use: false
+cv_split_dir: '/data/yg/Subgraph-MIL/diffpool2/splits'
+cv_seed: 1024
+cv_num_folds: 10
+cv_val_policy: 'adjacent'
+cv_use_all_samples: true
 
 branch_b:
-  use: true
+  use: false
   attn_hidden: 128
   gate_hidden: 64
 
@@ -32,12 +29,3 @@ use_coarse_graph: false
 coarse_graph_topk: 16
 
 enable_gat_export: false
-
-# Graphormer backbone options
-# graphormer_num_layers: 1
-# graphormer_heads: 4
-# graphormer_dropout: 0.5
-# graphormer_attn_dropout: 0.5
-# graphormer_ffn_mult: 4
-# graphormer_spatial_pos_max: 39
-# graphormer_degree_max: 39

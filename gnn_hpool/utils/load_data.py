@@ -2,13 +2,11 @@
 
 import networkx as nx
 import numpy as np
-import scipy as sc
 import os
-import re
-import random
 import logging
 import pickle
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+import json
+from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -74,10 +72,11 @@ class GraphDataLoaderWrapper(object):
 
   def __init__(self, hparams, data_name=None):
     self._hparams = hparams_lib.copy_hparams(hparams)
+    self.data_name = data_name if data_name is not None else getattr(self._hparams, 'data_name', None)
 
     processed_data_dir = getattr(self._hparams, 'processed_data_dir', '/data/yg/Subgraph-MIL/Data/processed_data')
     if data_name is None:
-      data_name = getattr(self._hparams, 'data_name', None)
+      data_name = self.data_name
     dataset_path = os.path.join(processed_data_dir, f'{data_name}_processed.pkl')
     logging.warning(f'[DEBUG] Attempting to load dataset from: {dataset_path}')
     if not os.path.exists(dataset_path):
@@ -88,6 +87,12 @@ class GraphDataLoaderWrapper(object):
         if os.path.exists(alt_path):
              logging.warning(f'[DEBUG] Found dataset at alternative path: {alt_path}')
              dataset_path = alt_path
+        else:
+             raise FileNotFoundError(
+               'Dataset file not found for {}. Checked: {!r} and {!r}. '
+               'Update processed_data_dir in the yaml or pass --processed_data_dir.'
+               .format(data_name, dataset_path, alt_path)
+             )
     
     with open(dataset_path, 'rb') as f:
       dataset = pickle.load(f)
@@ -123,83 +128,24 @@ class GraphDataLoaderWrapper(object):
     self.all_labels = np.array([int(g.graph.get('label', 0)) for g in self.all_graphs])
     self.all_groups = self._resolve_group_ids(dataset, subgraphs, self.all_indices)
 
-    # 使用配置文件中的fold_num（原K折，不再用于Holdout，但保留）
-    self.fold_num = getattr(self._hparams, 'fold_num', 5)
-    self.train_count = len(self.train_graphs)
-    self.val_size = max(1, self.train_count // self.fold_num)
+    self.cv_seed = int(getattr(self._hparams, 'cv_seed', 1024))
+    self.cv_num_folds = int(getattr(self._hparams, 'cv_num_folds', getattr(self._hparams, 'fold_num', 10)))
+    self.cv_val_policy = str(getattr(self._hparams, 'cv_val_policy', 'adjacent'))
+    self.cv_use_all_samples = bool(getattr(self._hparams, 'cv_use_all_samples', True))
 
-    # 预生成分层K折索引（不重叠、类别均衡）
-    self._train_labels = np.array([int(g.graph.get('label', 0)) for g in self.train_graphs])
-    skf = StratifiedKFold(
-        n_splits=self.fold_num,
-        shuffle=True,
-        random_state=getattr(self._hparams, 'cv_seed', 1024)
-    )
-    self.folds = [(tr_idx, val_idx) for tr_idx, val_idx in skf.split(np.arange(self.train_count), self._train_labels)]
-
-  def get_loader(self, val_idx, inner_val_frac=None):
-    # 分层K折：严格不重叠
-    train_idx, val_idx_arr = self.folds[val_idx]
-    train_graphs = [self.train_graphs[i] for i in train_idx]
-    val_graphs = [self.train_graphs[i] for i in val_idx_arr]
-  
-    logging.info('\n * the length of training sets is {}; \n * the length of validation sets is {}'
-                 .format(len(train_graphs), len(val_graphs)))
-  
-    # 可选：在训练集内再切 inner-val（分层）
-    inner_loader = None
-    if inner_val_frac is None:
-        inner_val_frac = getattr(self._hparams, 'inner_val_frac', 0.1)
-    if inner_val_frac and inner_val_frac > 0.0:
-        labels_tr = np.array([int(g.graph.get('label', 0)) for g in train_graphs])
-        sss = StratifiedShuffleSplit(
-            n_splits=1,
-            test_size=inner_val_frac,
-            random_state=getattr(self._hparams, 'cv_seed', 1024)
-        )
-        main_idx, inner_idx = next(sss.split(np.arange(len(train_graphs)), labels_tr))
-        inner_graphs = [train_graphs[i] for i in inner_idx]
-        train_graphs = [train_graphs[i] for i in main_idx]
-        inner_set = GraphDataset(self._hparams, inner_graphs)
-        inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
-  
-    training_set = GraphDataset(self._hparams, train_graphs)
-    validation_set = GraphDataset(self._hparams, val_graphs)
-  
-    training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
-    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
-  
-    return training_loader, inner_loader, validation_loader
-
-  def get_full_train_with_inner_loader(self, inner_val_frac=None):
-      if inner_val_frac is None:
-          inner_val_frac = getattr(self._hparams, 'inner_val_frac', 0.1)
-      train_graphs = list(self.train_graphs)
-      labels_tr = np.array([int(g.graph.get('label', 0)) for g in train_graphs])
-  
-      sss = StratifiedShuffleSplit(
-          n_splits=1,
-          test_size=inner_val_frac,
-          random_state=getattr(self._hparams, 'cv_seed', 1024)
-      )
-      main_idx, inner_idx = next(sss.split(np.arange(len(train_graphs)), labels_tr))
-      main_graphs = [train_graphs[i] for i in main_idx]
-      inner_graphs = [train_graphs[i] for i in inner_idx]
-  
-      training_set = GraphDataset(self._hparams, main_graphs)
-      inner_set = GraphDataset(self._hparams, inner_graphs)
-  
-      training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
-      inner_loader = DataLoader(inner_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
-      return training_loader, inner_loader
-  
-  def get_full_train_loader(self):
-    training_set = GraphDataset(self._hparams, self.train_graphs)
-    return DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
-
-  def get_test_loader(self):
-    test_set = GraphDataset(self._hparams, self.test_graphs)
-    return DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
+    if self.cv_use_all_samples:
+      self.cv_graphs = list(self.all_graphs)
+      self.cv_labels = np.array(self.all_labels)
+      self.cv_groups = np.array(self.all_groups, dtype=object)
+      self.cv_orig_indices = list(self.all_indices)
+    else:
+      self.cv_graphs = list(self.train_graphs)
+      self.cv_labels = np.array([int(g.graph.get('label', 0)) for g in self.train_graphs])
+      self.cv_groups = np.array(self._resolve_group_ids(dataset, subgraphs, train_indices), dtype=object)
+      self.cv_orig_indices = list(train_indices)
+    self._cv_index_by_orig_idx = {int(orig_idx): idx for idx, orig_idx in enumerate(self.cv_orig_indices)}
+    self.cv_folds = None
+    self.cv_build_info = None
 
   def _resolve_group_ids(self, dataset, subgraphs, indices):
     # 优先从dataset字典尝试取组ID数组（必须与subgraphs一一对齐）
@@ -295,116 +241,209 @@ class GraphDataLoaderWrapper(object):
 
     return training_loader, validation_loader, test_loader
 
-  def get_original_graph(self):
-    return self.original_graph
-  
-  def get_assignment_matrix(self):
-    return self.assignment_matrix
+  def _build_cv_folds(self, labels, groups, num_folds, seed):
+    unique_groups, group_inverse = np.unique(groups, return_inverse=True)
+    num_groups = len(unique_groups)
+    if num_folds < 3:
+      raise ValueError(f'cv_num_folds must be at least 3, got {num_folds}')
+    if num_groups < num_folds:
+      raise ValueError(f'Not enough groups for {num_folds}-fold CV: only {num_groups} groups available')
 
+    group_labels_list = [[] for _ in range(num_groups)]
+    for sample_idx, g_idx in enumerate(group_inverse):
+      group_labels_list[g_idx].append(int(labels[sample_idx]))
+    group_labels = np.array([
+      int(np.round(np.mean(lst))) if len(set(lst)) > 1 else int(lst[0])
+      for lst in group_labels_list
+    ])
 
-def read_graphfile(datadir, dataname, max_nodes=None):
-  ''' Read data from https://ls11-www.cs.tu-dortmund.de/staff/morris/graphkerneldatasets
-      graph index starts with 1 in file
-  Returns:
-      List of networkx objects with graph and node labels
-  '''
-  prefix = os.path.join(datadir, dataname, dataname)
-  filename_graph_indic = prefix + '_graph_indicator.txt'
-  # index of graphs that a given node belongs to
-  graph_indic = {}
-  with open(filename_graph_indic) as f:
-    i = 1
-    for line in f:
-      line = line.strip("\n")
-      graph_indic[i] = int(line)
-      i += 1
+    group_indices = np.arange(num_groups)
+    used_group_stratified = True
+    try:
+      splitter = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+      group_fold_indices = [
+        np.array(test_idx, dtype=np.int64)
+        for _, test_idx in splitter.split(group_indices, group_labels)
+      ]
+    except ValueError as exc:
+      logging.warning('Falling back to non-stratified KFold for CV folds: %s', exc)
+      used_group_stratified = False
+      splitter = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
+      group_fold_indices = [
+        np.array(test_idx, dtype=np.int64)
+        for _, test_idx in splitter.split(group_indices)
+      ]
 
-  filename_nodes = prefix + '_node_labels.txt'
-  node_labels = []
-  try:
-    with open(filename_nodes) as f:
-      for line in f:
-        line = line.strip("\n")
-        node_labels += [int(line) - 1]
-    num_unique_node_labels = max(node_labels) + 1
-  except IOError:
-    print('No node labels')
+    sample_folds = []
+    fold_infos = []
+    for fold_id, fold_group_idx in enumerate(group_fold_indices):
+      fold_group_set = set(int(i) for i in fold_group_idx.tolist())
+      sample_idx = [sample_idx for sample_idx, g_idx in enumerate(group_inverse) if int(g_idx) in fold_group_set]
+      sample_folds.append(sample_idx)
+      label_hist = {}
+      for sample_id in sample_idx:
+        label_key = str(int(labels[sample_id]))
+        label_hist[label_key] = label_hist.get(label_key, 0) + 1
+      fold_infos.append({
+        'fold_id': int(fold_id),
+        'sample_positions': [int(i) for i in sample_idx],
+        'group_ids': [self._serialize_group_value(unique_groups[int(i)]) for i in fold_group_idx.tolist()],
+        'label_hist': label_hist,
+      })
+    build_info = {
+      'used_group_stratified': bool(used_group_stratified),
+      'num_groups': int(num_groups),
+    }
+    return sample_folds, build_info, fold_infos
 
-  filename_node_attrs = prefix + '_node_attributes.txt'
-  node_attrs = []
-  try:
-    with open(filename_node_attrs) as f:
-      for line in f:
-        line = line.strip("\s\n")
-        attrs = [float(attr) for attr in re.split("[,\s]+", line) if not attr == '']
-        node_attrs.append(np.array(attrs))
-  except IOError:
-    print('No node attributes')
+  def _serialize_group_value(self, value):
+    if isinstance(value, np.generic):
+      return value.item()
+    if isinstance(value, (int, float, str, bool)) or value is None:
+      return value
+    return str(value)
 
-  label_has_zero = False
-  filename_graphs = prefix + '_graph_labels.txt'
-  graph_labels = []
+  def get_cv_split_filename(self):
+    data_name = self.data_name if self.data_name is not None else 'dataset'
+    return f'{data_name}_cv{self.cv_num_folds}_seed{self.cv_seed}_{self.cv_val_policy}.json'
 
-  # assume that all graph labels appear in the dataset
-  # (set of labels don't have to be consecutive)
-  label_vals = []
-  with open(filename_graphs) as f:
-    for line in f:
-      line = line.strip("\n")
-      val = int(line)
-      # if val == 0:
-      #    label_has_zero = True
-      if val not in label_vals:
-        label_vals.append(val)
-      graph_labels.append(val)
-  # graph_labels = np.array(graph_labels)
-  label_map_to_int = {val: i for i, val in enumerate(label_vals)}
-  graph_labels = np.array([label_map_to_int[l] for l in graph_labels])
-  # if label_has_zero:
-  #    graph_labels += 1
+  def get_cv_split_path(self, ensure_dir=False):
+    split_dir = getattr(self._hparams, 'cv_split_dir', '/data/yg/Subgraph-MIL/diffpool2/splits')
+    if ensure_dir:
+      os.makedirs(split_dir, exist_ok=True)
+    return os.path.join(split_dir, self.get_cv_split_filename())
 
-  filename_adj = prefix + '_A.txt'
-  adj_list = {i: [] for i in range(1, len(graph_labels) + 1)}
-  index_graph = {i: [] for i in range(1, len(graph_labels) + 1)}
-  num_edges = 0
-  with open(filename_adj) as f:
-    for line in f:
-      line = line.strip("\n").split(",")
-      e0, e1 = (int(line[0].strip(" ")), int(line[1].strip(" ")))
-      adj_list[graph_indic[e0]].append((e0, e1))
-      index_graph[graph_indic[e0]] += [e0, e1]
-      num_edges += 1
-  for k in index_graph.keys():
-    index_graph[k] = [u - 1 for u in set(index_graph[k])]
+  def build_cv_split_manifest(self):
+    cv_folds, build_info, fold_infos = self._build_cv_folds(
+      labels=self.cv_labels,
+      groups=self.cv_groups,
+      num_folds=self.cv_num_folds,
+      seed=self.cv_seed
+    )
+    self.cv_folds = cv_folds
+    self.cv_build_info = build_info
 
-  graphs = []
-  for i in range(1, 1 + len(adj_list)):
-    # indexed from 1 here
-    G = nx.from_edgelist(adj_list[i])
-    if max_nodes is not None and G.number_of_nodes() > max_nodes:
-      continue
+    folds = []
+    for fold_info in fold_infos:
+      sample_positions = fold_info['sample_positions']
+      folds.append({
+        'fold_id': int(fold_info['fold_id']),
+        'sample_indices': [int(self.cv_orig_indices[i]) for i in sample_positions],
+        'group_ids': [self._serialize_group_value(self.cv_groups[i]) for i in sample_positions],
+        'label_hist': dict(fold_info['label_hist']),
+      })
 
-    # add features and labels
-    G.graph['label'] = graph_labels[i - 1]
-    for u in G.nodes():
-      if len(node_labels) > 0:
-        node_label_one_hot = [0] * num_unique_node_labels
-        node_label = node_labels[u - 1]
-        node_label_one_hot[node_label] = 1
-        # 兼容 NetworkX 3.x：使用 G.nodes
-        G.nodes[u]['label'] = node_label_one_hot
-      if len(node_attrs) > 0:
-        G.nodes[u]['feat'] = node_attrs[u - 1]
-    if len(node_attrs) > 0:
-      G.graph['feat_dim'] = node_attrs[0].shape[0]
+    return {
+      'data_name': self.data_name,
+      'cv_seed': int(self.cv_seed),
+      'cv_num_folds': int(self.cv_num_folds),
+      'cv_val_policy': self.cv_val_policy,
+      'cv_use_all_samples': bool(self.cv_use_all_samples),
+      'protocol': 'grouped_stratified_cv_8_1_1',
+      'build_info': build_info,
+      'folds': folds,
+    }
 
-    # relabeling（统一使用 NetworkX 2/3 通用写法）
-    mapping = {}
-    it = 0
-    for n in G.nodes:
-        mapping[n] = it
-        it += 1
+  def _validate_cv_split_manifest(self, manifest):
+    expected = {
+      'data_name': self.data_name,
+      'cv_seed': int(self.cv_seed),
+      'cv_num_folds': int(self.cv_num_folds),
+      'cv_val_policy': self.cv_val_policy,
+      'cv_use_all_samples': bool(self.cv_use_all_samples),
+    }
+    for key, expected_value in expected.items():
+      actual_value = manifest.get(key)
+      if actual_value != expected_value:
+        raise ValueError(f'Split manifest mismatch for {key}: expected {expected_value!r}, got {actual_value!r}')
 
-    # indexed from 0
-    graphs.append(nx.relabel_nodes(G, mapping))
-  return graphs
+    folds = manifest.get('folds', None)
+    if not isinstance(folds, list) or len(folds) != self.cv_num_folds:
+      raise ValueError(f'Split manifest must contain {self.cv_num_folds} folds')
+
+    seen_indices = set()
+    expected_indices = set(int(i) for i in self.cv_orig_indices)
+    for fold_id, fold in enumerate(folds):
+      if int(fold.get('fold_id', -1)) != fold_id:
+        raise ValueError(f'Split manifest fold_id mismatch at fold {fold_id}')
+      sample_indices = [int(i) for i in fold.get('sample_indices', [])]
+      overlap = seen_indices.intersection(sample_indices)
+      if overlap:
+        raise ValueError(f'Split manifest has overlapping sample indices across folds: {sorted(overlap)[:5]}')
+      seen_indices.update(sample_indices)
+      missing_in_dataset = [idx for idx in sample_indices if idx not in self._cv_index_by_orig_idx]
+      if missing_in_dataset:
+        raise ValueError(f'Split manifest references unknown sample indices: {missing_in_dataset[:5]}')
+    if seen_indices != expected_indices:
+      missing = sorted(expected_indices - seen_indices)
+      extra = sorted(seen_indices - expected_indices)
+      raise ValueError(f'Split manifest coverage mismatch: missing={missing[:5]}, extra={extra[:5]}')
+
+  def save_cv_split_manifest(self, split_path, overwrite=False):
+    manifest = self.build_cv_split_manifest()
+    if os.path.exists(split_path) and not overwrite:
+      raise FileExistsError(f'Split manifest already exists: {split_path}')
+    os.makedirs(os.path.dirname(split_path), exist_ok=True)
+    with open(split_path, 'w', encoding='utf-8') as f:
+      json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return manifest
+
+  def load_cv_split_manifest(self, split_path):
+    with open(split_path, 'r', encoding='utf-8') as f:
+      manifest = json.load(f)
+    self._validate_cv_split_manifest(manifest)
+    return manifest
+
+  def _build_loaders_from_indices(self, train_idx, val_idx, test_idx):
+    train_graphs = [self.cv_graphs[i] for i in train_idx]
+    val_graphs = [self.cv_graphs[i] for i in val_idx]
+    test_graphs = [self.cv_graphs[i] for i in test_idx]
+
+    training_set = GraphDataset(self._hparams, train_graphs)
+    validation_set = GraphDataset(self._hparams, val_graphs)
+    test_set = GraphDataset(self._hparams, test_graphs)
+
+    training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
+    validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
+    test_loader = DataLoader(test_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
+    return training_loader, validation_loader, test_loader
+
+  def get_cv_loaders_from_manifest(self, manifest, fold_idx):
+    self._validate_cv_split_manifest(manifest)
+    if self.cv_val_policy != 'adjacent':
+      raise ValueError(f'Unsupported cv_val_policy: {self.cv_val_policy}')
+    if not (0 <= int(fold_idx) < self.cv_num_folds):
+      raise IndexError(f'fold_idx out of range: {fold_idx}')
+
+    test_fold = int(fold_idx)
+    val_fold = (test_fold + 1) % self.cv_num_folds
+    train_folds = [i for i in range(self.cv_num_folds) if i not in (test_fold, val_fold)]
+
+    def _fold_positions(manifest_fold_id):
+      sample_indices = [int(i) for i in manifest['folds'][manifest_fold_id]['sample_indices']]
+      return sorted(self._cv_index_by_orig_idx[idx] for idx in sample_indices)
+
+    train_idx = sorted(idx for fold_id in train_folds for idx in _fold_positions(fold_id))
+    val_idx = _fold_positions(val_fold)
+    test_idx = _fold_positions(test_fold)
+
+    if set(train_idx) & set(val_idx) or set(train_idx) & set(test_idx) or set(val_idx) & set(test_idx):
+      raise RuntimeError('CV split overlap detected between train/val/test sets')
+
+    training_loader, validation_loader, test_loader = self._build_loaders_from_indices(train_idx, val_idx, test_idx)
+    split_meta = {
+      'fold_idx': test_fold,
+      'train_folds': train_folds,
+      'val_fold': val_fold,
+      'test_fold': test_fold,
+      'train_size': len(train_idx),
+      'val_size': len(val_idx),
+      'test_size': len(test_idx),
+      'train_indices': [int(self.cv_orig_indices[i]) for i in train_idx],
+      'val_indices': [int(self.cv_orig_indices[i]) for i in val_idx],
+      'test_indices': [int(self.cv_orig_indices[i]) for i in test_idx],
+      'train_groups': [self._serialize_group_value(self.cv_groups[i]) for i in train_idx],
+      'val_groups': [self._serialize_group_value(self.cv_groups[i]) for i in val_idx],
+      'test_groups': [self._serialize_group_value(self.cv_groups[i]) for i in test_idx],
+    }
+    return training_loader, validation_loader, test_loader, split_meta

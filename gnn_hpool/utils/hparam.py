@@ -127,14 +127,25 @@ class HParams(object):
           elif isinstance(x, list):
             return [remove_callables(i) for i in x if not callable(i)]
           return x
-      with open(save_dir, 'w') as yml_writer:
+      with open(save_dir, 'w', encoding='utf-8') as yml_writer:
         yaml = YAML()
         yaml.dump(remove_callables(self.values()), yml_writer)
 
   def from_yaml(self, read_dir):
-      with open(read_dir, 'r') as yml_reader:
-        yaml = YAML(typ='safe')
-        hparams_dict = yaml.load(yml_reader)
+      yaml = YAML(typ='safe')
+      last_error = None
+      for encoding in ('utf-8', 'utf-8-sig', None):
+        try:
+          open_kwargs = {'mode': 'r'}
+          if encoding is not None:
+            open_kwargs['encoding'] = encoding
+          with open(read_dir, **open_kwargs) as yml_reader:
+            hparams_dict = yaml.load(yml_reader)
+          break
+        except UnicodeDecodeError as exc:
+          last_error = exc
+      else:
+        raise last_error
       for name, value in hparams_dict.items():
         self.add_hparam(name, value)
 

@@ -3,6 +3,7 @@
 import os
 import time
 import logging
+import json
 import matplotlib
 
 try:
@@ -135,6 +136,111 @@ def train_eval(hparams, data_name=None):
   return {'seeds': seeds, 'results': all_results, 'summary': summary}
 
 
+def fixed_cv_train_eval(hparams, data_name=None):
+  """Training and evaluation entry point for fixed 10-fold CV."""
+  data_loader = load_data.GraphDataLoaderWrapper(hparams, data_name=data_name)
+  split_path = data_loader.get_cv_split_path(ensure_dir=False)
+  if not os.path.exists(split_path):
+    raise FileNotFoundError(
+      'CV split manifest not found: {}. Please run prepare_cv_split.py first.'.format(split_path)
+    )
+
+  split_manifest = data_loader.load_cv_split_manifest(split_path)
+  fold_count = int(split_manifest['cv_num_folds'])
+  test_metrics = {'acc': [], 'prec': [], 'rec': [], 'F1': []}
+  all_results = []
+
+  for fold_idx in range(fold_count):
+    seed = int(getattr(hparams, 'cv_seed', 1024)) + fold_idx
+    test_fold = int(fold_idx)
+    val_fold = (test_fold + 1) % fold_count
+    logging.warning('* cv fold: {} (train=8 folds, val_fold={}, test_fold={}, seed={})'.format(
+      fold_idx, val_fold, test_fold, seed
+    ))
+
+    reproducibility.set_seed(seed, cuda_deterministic=(hparams.device == 'cuda'))
+    training_loader, validation_loader, test_loader, split_meta = data_loader.get_cv_loaders_from_manifest(
+      split_manifest, fold_idx
+    )
+    logging.warning(
+      'CV fold {} sizes => train: {}, val: {}, test: {}'.format(
+        fold_idx, split_meta['train_size'], split_meta['val_size'], split_meta['test_size']
+      )
+    )
+
+    enable_tensorboard = getattr(hparams, 'enable_tensorboard', False)
+    summary_writer = None
+    if enable_tensorboard:
+      tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
+      logdir = os.path.join(tb_root, str(hparams.timestamp) + '/cv_fold_{}'.format(fold_idx))
+      if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
+        logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
+      summary_writer = SummaryWriter(logdir)
+
+    model = gcn_hpool_encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
+    model, _, best_val_result = train_eval_iter(
+      model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw
+    )
+
+    result = evaluate(test_loader, model, hparams, dataset_name='test')
+    all_results.append({
+      'fold_idx': int(fold_idx),
+      'seed': int(seed),
+      'split': split_meta,
+      'best_val': best_val_result,
+      'metrics': {
+        'acc': float(result['acc']),
+        'prec': float(result['prec']),
+        'rec': float(result['rec']),
+        'F1': float(result['F1']),
+      },
+    })
+    for key in test_metrics.keys():
+      test_metrics[key].append(result[key])
+    logging.warning('CV fold {} test => acc: {:.4f}, prec: {:.4f}, rec: {:.4f}, F1: {:.4f}'.format(
+      fold_idx, result['acc'], result['prec'], result['rec'], result['F1']
+    ))
+
+    bb_cfg = getattr(hparams, 'branch_b', None)
+    logging.warning(f'[DEBUG] branch_b config: {bb_cfg}')
+    if bool(bb_cfg and bb_cfg.get('use', False)):
+      out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_fold_{fold_idx}_attention.xlsx')
+      logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
+      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path, sample_frac=0.2)
+    else:
+      logging.warning('[DEBUG] branch_b.use is False or not found, skipping attention export.')
+    if summary_writer is not None:
+      summary_writer.close()
+
+  summary = {
+    key: {
+      'mean': float(np.mean(vals)),
+      'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    }
+    for key, vals in test_metrics.items()
+  }
+  msg_parts = [f'{k}: {summary[k]["mean"]:.4f} +/- {summary[k]["std"]:.4f}' for k in ['acc', 'prec', 'rec', 'F1']]
+  logging.warning('* Fixed 10-fold CV test results => {}'.format('; '.join(msg_parts)))
+
+  result_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_results.json')
+  with open(result_path, 'w', encoding='utf-8') as f:
+    json.dump({
+      'data_name': data_name,
+      'split_path': split_path,
+      'cv_seed': int(split_manifest['cv_seed']),
+      'cv_num_folds': int(split_manifest['cv_num_folds']),
+      'cv_val_policy': split_manifest['cv_val_policy'],
+      'summary': summary,
+      'fold_results': all_results,
+    }, f, indent=2, ensure_ascii=False)
+  logging.warning('Saved CV result summary to {}'.format(result_path))
+
+  return {'results': all_results, 'summary': summary, 'split_path': split_path, 'result_path': result_path}
+
+
+train_eval = fixed_cv_train_eval
+
+
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset_raw=None):
     """
     单次 holdout 下的训练循环（按 epoch 训练 + val 早停）。
@@ -236,7 +342,11 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
     if best_model_state is not None:
       model.load_state_dict(best_model_state)
 
-    return model, val_accs
+    return model, val_accs, {
+      'epoch': int(best_val_result['epoch']),
+      'acc': float(best_val_result['acc']),
+      'loss': float(best_val_result['loss']),
+    }
 
 
 def log_assignment(assign_tensor, writer, epoch, batch_idx):

@@ -47,6 +47,8 @@ def main(args):
 
   base_hparams = hparam.HParams()
   base_hparams.from_yaml(args.hparam_path)
+  if args.processed_data_dir:
+    base_hparams.processed_data_dir = args.processed_data_dir
 
   dataset_names = _parse_data_name_set(getattr(args, 'data_name_set', None))
   if not dataset_names:
@@ -61,6 +63,8 @@ def main(args):
     hparams = hparam.HParams()
     hparams.from_yaml(args.hparam_path)
     hparams.data_name = data_name
+    if args.processed_data_dir:
+      hparams.processed_data_dir = args.processed_data_dir
 
     if hparams.device == 'cuda':
       torch.backends.cudnn.deterministic = True
@@ -144,6 +148,8 @@ if __name__ == '__main__':
                       )
   parser.add_argument('--data_name_set', nargs='*', type=str, default=None,
                       help='Run multiple datasets in one shot, e.g. --data_name_set cs eng phy (also supports comma-separated string).')
+  parser.add_argument('--processed_data_dir', nargs='?', type=str, default=None,
+                      help='Override processed_data_dir from the yaml for the current run.')
 
   args = parser.parse_args()
   main(args)
