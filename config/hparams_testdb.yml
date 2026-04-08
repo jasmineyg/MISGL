@@ -3,7 +3,7 @@ cuda_visible_devices: '2'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['cs']  #'cs','eng','phy','chem','med'
+data_name_set: ['cs','eng','phy','chem','med']  #'cs'
 timestamp: output_x2
 max_num_nodes: 39  # 最大子图包含的节点个数: cora 25, citeseer 26, pubmed 47, cs 35, phy 37, eng 33, chem 39, med 35
 channel_list: [6805, 256, 128, 64, 1] # 分支A改成二分类：最后一维改为1
@@ -32,3 +32,12 @@ use_coarse_graph: false
 coarse_graph_topk: 16
 
 enable_gat_export: false
+
+# Graphormer backbone options
+# graphormer_num_layers: 1
+# graphormer_heads: 4
+# graphormer_dropout: 0.5
+# graphormer_attn_dropout: 0.5
+# graphormer_ffn_mult: 4
+# graphormer_spatial_pos_max: 39
+# graphormer_degree_max: 39

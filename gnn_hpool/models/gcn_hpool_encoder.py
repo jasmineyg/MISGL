@@ -12,7 +12,7 @@ from gnn_hpool.utils import hparams_lib
 from gnn_hpool.utils.coarse_graph_analyze import analyze_and_export, default_coarsegraph_analyze_out_xlsx
 from gnn_hpool.layers import gcn_layer
 from gnn_hpool.models.mil_head import MILBranchB
-from gnn_hpool.layers.gat_layer import ResidualGATLayer
+from gnn_hpool.layers.graphormer_layer import GraphormerNodeEncoder
 from gnn_hpool.utils.pgnn_precompute import precompute_and_save_pgnn
 
 
@@ -21,7 +21,7 @@ class GcnHpoolEncoder(nn.Module):
     GCN/HPool Encoder Refactored.
     Logic Flow:
     1. Feature Projection -> x1 # 线形层
-    2. Backbone (GAT) -> x2     # GAT
+    2. Backbone (Graphormer) -> x2
     3. Pooling: x1 -> h1, x2 -> h2
     4. Coarse Graph: h1 -> Coarse GCN -> h4
     5. MIL Branch: x2 -> MIL Head -> h3
@@ -46,7 +46,7 @@ class GcnHpoolEncoder(nn.Module):
         in_dim = self._hparams.channel_list[0]
         hidden_dim = self._hparams.channel_list[1] # Main hidden dimension (x2/h2, h3)
         
-        # --- 1. Backbone (Proj + GAT) ---
+        # --- 1. Backbone (Proj + Graphormer) ---
         self.feat_proj = nn.Sequential(
             nn.Linear(in_dim, 2048),
             nn.LayerNorm(2048),
@@ -56,22 +56,41 @@ class GcnHpoolEncoder(nn.Module):
             nn.Dropout(0.5)
         )
 
-        gat_heads = getattr(self._hparams, "gat_heads", 4)
-        gat_attn_dp = getattr(self._hparams, "gat_attn_dropout", getattr(self._hparams, "dropout", 0.3))
-        gat_feat_dp = getattr(self._hparams, "gat_feat_dropout", getattr(self._hparams, "dropout", 0.3))
-        
-        self.gat_layer = ResidualGATLayer(
-            in_dim=in_dim,
-            out_dim=hidden_dim,
-            hparams=self._hparams,
-            heads=gat_heads,
-            attn_dropout=gat_attn_dp,
-            feat_dropout=gat_feat_dp,
-            alpha=getattr(self._hparams, "gat_alpha", 0.2),
-            concat=getattr(self._hparams, "gat_concat", True),
-            residual=getattr(self._hparams, "gat_residual", True)
+        graphormer_heads = getattr(self._hparams, "graphormer_heads", getattr(self._hparams, "gat_heads", 4))
+        graphormer_attn_dp = getattr(
+            self._hparams,
+            "graphormer_attn_dropout",
+            getattr(self._hparams, "gat_attn_dropout", getattr(self._hparams, "dropout", 0.3))
         )
-        self.dropout_gat = nn.Dropout(p=getattr(self._hparams, "dropout", 0.3))
+        graphormer_dp = getattr(
+            self._hparams,
+            "graphormer_dropout",
+            getattr(self._hparams, "dropout", 0.3)
+        )
+        graphormer_num_layers = getattr(self._hparams, "graphormer_num_layers", 1)
+        graphormer_ffn_mult = getattr(self._hparams, "graphormer_ffn_mult", 4)
+        graphormer_spatial_pos_max = getattr(
+            self._hparams,
+            "graphormer_spatial_pos_max",
+            getattr(self._hparams, "max_num_nodes", 32)
+        )
+        graphormer_degree_max = getattr(
+            self._hparams,
+            "graphormer_degree_max",
+            getattr(self._hparams, "max_num_nodes", 32)
+        )
+
+        self.graphormer_encoder = GraphormerNodeEncoder(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            num_heads=graphormer_heads,
+            num_layers=graphormer_num_layers,
+            dropout=graphormer_dp,
+            attn_dropout=graphormer_attn_dp,
+            ffn_mult=graphormer_ffn_mult,
+            spatial_pos_max=graphormer_spatial_pos_max,
+            degree_max=graphormer_degree_max,
+        )
 
         # --- 2. Branch B (MIL Head) ---
         if self.use_branch_b:
@@ -140,9 +159,7 @@ class GcnHpoolEncoder(nn.Module):
         # x1 = self.feat_proj(x)
 
         # --- Step 2: Backbone (x2) ---
-        x2 = F.relu(self.gat_layer(x, adj))
-        x2 = self.apply_ln(x2)
-        x2 = self.dropout_gat(x2)
+        x2 = self.graphormer_encoder(x, adj, batch_num_nodes)
 
         # Prepare Mask [B, N, 1]
         max_nodes = adj.size(1)
