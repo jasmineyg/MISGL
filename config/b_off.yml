@@ -1,5 +1,5 @@
 device: 'cuda'
-cuda_visible_devices: '2'
+cuda_visible_devices: '0'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'

@@ -1,10 +1,10 @@
 device: 'cuda'
-cuda_visible_devices: '2'
+cuda_visible_devices: '1'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['cs', 'eng', 'phy', 'chem', 'med']
-timestamp: graphormer_baseline
+timestamp: graphormer_b
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 32
@@ -21,7 +21,7 @@ cv_val_policy: 'adjacent'
 cv_use_all_samples: true
 
 branch_b:
-  use: false
+  use: true
   attn_hidden: 128
   gate_hidden: 64
 

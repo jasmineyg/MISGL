@@ -104,7 +104,7 @@ class GraphDataLoaderWrapper(object):
     feature_dim = int(dataset.get('feature_dimension', dataset['dataset_metadata']['feature_dim']))
     self._hparams.channel_list[0] = feature_dim
     max_num_nodes = int(dataset['dataset_metadata'].get('max_num_nodes', max(len(g.nodes()) for g in subgraphs)))
-    self._hparams.max_num_nodes = max_num_nodes
+    self._set_or_add_hparam('max_num_nodes', max_num_nodes)
 
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
@@ -146,6 +146,12 @@ class GraphDataLoaderWrapper(object):
     self._cv_index_by_orig_idx = {int(orig_idx): idx for idx, orig_idx in enumerate(self.cv_orig_indices)}
     self.cv_folds = None
     self.cv_build_info = None
+
+  def _set_or_add_hparam(self, name, value):
+    if name in self._hparams:
+      self._hparams.set_hparam(name, value)
+    else:
+      self._hparams.add_hparam(name, value)
 
   def _resolve_group_ids(self, dataset, subgraphs, indices):
     # 优先从dataset字典尝试取组ID数组（必须与subgraphs一一对齐）
