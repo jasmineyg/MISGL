@@ -4,10 +4,10 @@ import torch
 from torch.nn.modules.module import Module
 import torch.nn.functional as F
 
-from gnn_hpool.layers.hierarchical_diff_pooling import dense_diff_pool
-from gnn_hpool.utils import hparams_lib
-from gnn_hpool.layers import gcn_layer
-from gnn_hpool.layers.gat_layer import ResidualGATLayer
+from MISGL.layers.hierarchical_diff_pooling import dense_diff_pool
+from MISGL.utils import hparams_lib
+from MISGL.layers import gcn_layer
+from MISGL.layers.gat_layer import ResidualGATLayer
 
 
 class GcnHpoolSubmodel(Module):

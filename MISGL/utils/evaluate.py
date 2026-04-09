@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import sklearn.metrics as metrics
 
-from gnn_hpool.utils.global_variables import *
+from MISGL.utils.global_variables import *
 
 
 def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):

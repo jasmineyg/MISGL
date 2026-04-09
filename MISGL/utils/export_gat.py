@@ -2,7 +2,7 @@ import os
 import pickle
 import torch
 import numpy as np
-from gnn_hpool.utils.global_variables import g_key
+from MISGL.utils.global_variables import g_key
 
 def export_gat1_features(model, dataloader, epoch, dataset_raw, split="val", output_dir="/data/yg/Subgraph-MIL/DataAnalyze"):
     """

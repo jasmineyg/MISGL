@@ -4,8 +4,8 @@ import argparse
 import logging
 import os
 
-from gnn_hpool.utils import hparam
-from gnn_hpool.utils.load_data import GraphDataLoaderWrapper
+from MISGL.utils import hparam
+from MISGL.utils.load_data import GraphDataLoaderWrapper
 
 
 def _parse_data_name_set(raw):

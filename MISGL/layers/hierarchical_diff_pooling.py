@@ -1,7 +1,7 @@
 # coding=utf-8
 
 import torch
-from gnn_hpool.utils.global_variables import *
+from MISGL.utils.global_variables import *
 
 
 def dense_diff_pool(x, adj, s, mask=None):

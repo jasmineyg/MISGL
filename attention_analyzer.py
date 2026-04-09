@@ -7,10 +7,10 @@ import torch
 import pandas as pd
 import random
 
-from gnn_hpool.utils.hparam import HParams
-from gnn_hpool.utils.global_variables import g_key
-from gnn_hpool.utils.load_data import GraphDataLoaderWrapper
-from gnn_hpool.models.gcn_hpool_encoder import GcnHpoolEncoder
+from MISGL.utils.hparam import HParams
+from MISGL.utils.global_variables import g_key
+from MISGL.utils.load_data import GraphDataLoaderWrapper
+from MISGL.models.encoder import GcnHpoolEncoder
 
 
 def _write_summary_sheet(writer, stats):

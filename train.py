@@ -9,8 +9,8 @@ import argparse
 import random
 import time
 
-from gnn_hpool.utils import hparam
-from gnn_hpool.utils import reproducibility
+from MISGL.utils import hparam
+from MISGL.utils import reproducibility
 
 def _parse_data_name_set(raw):
   if raw is None:
@@ -43,7 +43,7 @@ def main(args):
   # reproducibility
   reproducibility.set_seed(1024)
 
-  from gnn_hpool.bin import train_eval
+  from MISGL.bin import train_eval
 
   base_hparams = hparam.HParams()
   base_hparams.from_yaml(args.hparam_path)

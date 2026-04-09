@@ -25,14 +25,14 @@ except ModuleNotFoundError:
   from torch.utils.tensorboard import SummaryWriter
   _figure_to_image = None
 import random
-from gnn_hpool.utils import get_loss
-from gnn_hpool.utils import common_utils
-from gnn_hpool.utils import reproducibility
-from gnn_hpool.utils.global_variables import *
-from gnn_hpool.utils.evaluate import evaluate
-from gnn_hpool.utils import load_data
-from gnn_hpool.utils.result_analyze_export import export_test_result_analyze_excel
-from gnn_hpool.models import gcn_hpool_encoder
+from MISGL.utils import get_loss
+from MISGL.utils import common_utils
+from MISGL.utils import reproducibility
+from MISGL.utils.global_variables import *
+from MISGL.utils.evaluate import evaluate
+from MISGL.utils import load_data
+from MISGL.utils.result_analyze_export import export_test_result_analyze_excel
+from MISGL.models import encoder
 from attention_analyzer import export_branchB_attention_from_model
 
 
@@ -321,7 +321,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       enable_gat_export = bool(getattr(hparams, 'enable_gat_export', False))
       if enable_gat_export and (epoch + 1) % 50 == 0:
           logging.warning(f"Triggering GAT1 feature export at epoch {epoch + 1}")
-          from gnn_hpool.utils.export_gat import export_gat1_features
+          from MISGL.utils.export_gat import export_gat1_features
           export_gat1_features(model, eval_dataset, epoch + 1, dataset_raw, split="val")
           
       if val_result['acc'] > best_val_result['acc'] - 1e-7:

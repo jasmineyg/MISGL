@@ -6,7 +6,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from gnn_hpool.utils import hparam
+from MISGL.utils import hparam
 
 
 def copy_hparams(hparams):

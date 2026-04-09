@@ -1,11 +1,11 @@
 import torch
 from torch.nn.modules.module import Module
 import torch.nn.functional as F
-from gnn_hpool.utils.global_variables import g_key
-from gnn_hpool.utils import hparams_lib
-from gnn_hpool.utils.coarse_graph_analyze import analyze_and_export, default_coarsegraph_analyze_out_xlsx
-from gnn_hpool.layers.gat_layer import ResidualGATLayer
-from gnn_hpool.layers.gcn_layer import GraphConvolution
+from MISGL.utils.global_variables import g_key
+from MISGL.utils import hparams_lib
+from MISGL.utils.coarse_graph_analyze import analyze_and_export, default_coarsegraph_analyze_out_xlsx
+from MISGL.layers.gat_layer import ResidualGATLayer
+from MISGL.layers.gcn_layer import GraphConvolution
 import os
 import pickle
 import networkx as nx

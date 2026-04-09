@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from gnn_hpool.utils.global_variables import g_key
+from MISGL.utils.global_variables import g_key
 
 
 def _export_subgraph_distance_heatmap_xlsx(D, labels, out_xlsx_path):

@@ -11,9 +11,9 @@ from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSpl
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from gnn_hpool.utils import hparams_lib
-from gnn_hpool.utils.global_variables import *
-from gnn_hpool.utils import reproducibility
+from MISGL.utils import hparams_lib
+from MISGL.utils.global_variables import *
+from MISGL.utils import reproducibility
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17

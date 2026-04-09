@@ -7,11 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gnn_hpool.utils.global_variables import g_key
-from gnn_hpool.utils import hparams_lib
-from gnn_hpool.layers import gcn_layer
-from gnn_hpool.models.mil_head import MILBranchB
-from gnn_hpool.layers.graphormer_layer import GraphormerNodeEncoder
+from MISGL.utils.global_variables import g_key
+from MISGL.utils import hparams_lib
+from MISGL.layers import gcn_layer
+from MISGL.models.mil_head import MILBranchB
+from MISGL.layers.graphormer_layer import GraphormerNodeEncoder
 
 
 class GcnHpoolEncoder(nn.Module):
