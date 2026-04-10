@@ -4,7 +4,7 @@ cuda_visible_devices: '0'
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['cs', 'eng', 'phy', 'chem', 'med']
-timestamp: graphormer_baseline
+timestamp: gat_maxpo
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 32

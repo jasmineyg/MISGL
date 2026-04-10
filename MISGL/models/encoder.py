@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from MISGL.utils.global_variables import g_key
 from MISGL.utils import hparams_lib
 from MISGL.layers import gcn_layer
+from MISGL.layers.gat_layer import ResidualGATLayer
 from MISGL.models.mil_head import MILBranchB
-from MISGL.layers.graphormer_layer import GraphormerNodeEncoder
 
 
 class GcnHpoolEncoder(nn.Module):
@@ -19,7 +19,7 @@ class GcnHpoolEncoder(nn.Module):
     GCN/HPool Encoder Refactored.
     Logic Flow:
     1. Feature Projection -> x1 # 线形层
-    2. Backbone (Graphormer) -> x2
+    2. Backbone (Residual GAT) -> x2
     3. Pooling: x1 -> h1, x2 -> h2
     4. Coarse Graph: h1 -> Coarse GCN -> h4
     5. MIL Branch: x2 -> MIL Head -> h3
@@ -36,44 +36,39 @@ class GcnHpoolEncoder(nn.Module):
         bb_cfg = getattr(self._hparams, 'branch_b', None)
         self.use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
         self.use_coarse_graph = bool(getattr(self._hparams, 'use_coarse_graph', False))
+        default_x2_pool = 'mean' if self.use_branch_b else 'max'
+        self.x2_pool_type = str(getattr(self._hparams, 'x2_pool_type', default_x2_pool)).lower()
+        if self.x2_pool_type not in {'mean', 'max'}:
+            raise ValueError(f"Unsupported x2_pool_type: {self.x2_pool_type}")
 
         in_dim = self._hparams.channel_list[0]
         hidden_dim = self._hparams.channel_list[1]
 
-        graphormer_heads = getattr(self._hparams, "graphormer_heads", getattr(self._hparams, "gat_heads", 4))
-        graphormer_attn_dp = getattr(
+        gat_heads = getattr(self._hparams, "gat_heads", 4)
+        gat_attn_dp = getattr(
             self._hparams,
-            "graphormer_attn_dropout",
-            getattr(self._hparams, "gat_attn_dropout", getattr(self._hparams, "dropout", 0.3))
-        )
-        graphormer_dp = getattr(
-            self._hparams,
-            "graphormer_dropout",
+            "gat_attn_dropout",
             getattr(self._hparams, "dropout", 0.3)
         )
-        graphormer_num_layers = getattr(self._hparams, "graphormer_num_layers", 1)
-        graphormer_ffn_mult = getattr(self._hparams, "graphormer_ffn_mult", 4)
-        graphormer_spatial_pos_max = getattr(
+        gat_feat_dp = getattr(
             self._hparams,
-            "graphormer_spatial_pos_max",
-            getattr(self._hparams, "max_num_nodes", 32)
+            "gat_feat_dropout",
+            getattr(self._hparams, "dropout", 0.3)
         )
-        graphormer_degree_max = getattr(
-            self._hparams,
-            "graphormer_degree_max",
-            getattr(self._hparams, "max_num_nodes", 32)
-        )
+        gat_alpha = getattr(self._hparams, "gat_alpha", 0.2)
+        gat_concat = getattr(self._hparams, "gat_concat", True)
+        gat_residual = getattr(self._hparams, "gat_residual", True)
 
-        self.graphormer_encoder = GraphormerNodeEncoder(
+        self.backbone = ResidualGATLayer(
             in_dim=in_dim,
-            hidden_dim=hidden_dim,
-            num_heads=graphormer_heads,
-            num_layers=graphormer_num_layers,
-            dropout=graphormer_dp,
-            attn_dropout=graphormer_attn_dp,
-            ffn_mult=graphormer_ffn_mult,
-            spatial_pos_max=graphormer_spatial_pos_max,
-            degree_max=graphormer_degree_max,
+            out_dim=hidden_dim,
+            hparams=self._hparams,
+            heads=gat_heads,
+            attn_dropout=gat_attn_dp,
+            feat_dropout=gat_feat_dp,
+            alpha=gat_alpha,
+            concat=gat_concat,
+            residual=gat_residual,
         )
 
         if self.use_branch_b:
@@ -122,15 +117,12 @@ class GcnHpoolEncoder(nn.Module):
         adj = graph_input[g_key.adj_mat]
         batch_num_nodes = graph_input[g_key.node_num]
         
-        x2 = self.graphormer_encoder(x, adj, batch_num_nodes)
-
         max_nodes = adj.size(1)
         mask = self.construct_mask(max_nodes, batch_num_nodes)
-        if mask is not None:
-            x2 = x2 * mask
+        x2 = self.backbone(x, adj, mask)
 
         aux_out = {}
-        h2 = self._masked_mean_pool(x2, mask, batch_num_nodes)
+        h2 = self._pool_x2(x2, mask, batch_num_nodes)
 
         h4 = None
         if self.use_coarse_graph:
@@ -212,6 +204,31 @@ class GcnHpoolEncoder(nn.Module):
         sum_vec = node_embeddings.sum(dim=1)
         denom = torch.clamp(num_list, min=1.0).unsqueeze(1)
         return sum_vec / denom
+
+    def _masked_max_pool(self, node_embeddings, embedding_mask, batch_num_nodes):
+        if embedding_mask is not None:
+            fill_value = torch.finfo(node_embeddings.dtype).min
+            valid_mask = embedding_mask.bool()
+            node_embeddings = node_embeddings.masked_fill(~valid_mask, fill_value)
+
+        max_vec = node_embeddings.max(dim=1).values
+
+        if isinstance(batch_num_nodes, torch.Tensor):
+            empty_mask = batch_num_nodes.view(-1).to(device=node_embeddings.device) <= 0
+        else:
+            empty_mask = torch.tensor(
+                [int(n) <= 0 for n in batch_num_nodes],
+                dtype=torch.bool,
+                device=node_embeddings.device
+            )
+        if empty_mask.any():
+            max_vec[empty_mask] = 0.0
+        return max_vec
+
+    def _pool_x2(self, node_embeddings, embedding_mask, batch_num_nodes):
+        if self.x2_pool_type == 'max':
+            return self._masked_max_pool(node_embeddings, embedding_mask, batch_num_nodes)
+        return self._masked_mean_pool(node_embeddings, embedding_mask, batch_num_nodes)
 
     def construct_mask(self, max_nodes, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):
