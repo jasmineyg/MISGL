@@ -1,6 +1,5 @@
 # coding=utf-8
 
-import math
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
@@ -18,9 +17,7 @@ class ResidualGATLayer(Module):
     self.residual = residual
     per_head = out_dim if not concat else max(1, out_dim // heads)
     self.w = Parameter(torch.empty(heads, in_dim, per_head))
-    self.a_src = Parameter(torch.empty(heads, per_head, 1))
-    self.a_dst = Parameter(torch.empty(heads, per_head, 1))
-    self.leakyrelu = torch.nn.LeakyReLU(alpha)
+    self.score_mlp = torch.nn.Linear(in_dim, 1)
     self.attn_drop = torch.nn.Dropout(attn_dropout)
     self.feat_drop = torch.nn.Dropout(feat_dropout)
     need_proj = residual and (in_dim != (per_head if not concat else heads * per_head))
@@ -33,8 +30,9 @@ class ResidualGATLayer(Module):
     gain = torch.nn.init.calculate_gain('relu')
     for h in range(self.heads):
       torch.nn.init.xavier_uniform_(self.w[h], gain=gain)
-      torch.nn.init.xavier_uniform_(self.a_src[h], gain=gain)
-      torch.nn.init.xavier_uniform_(self.a_dst[h], gain=gain)
+    torch.nn.init.xavier_uniform_(self.score_mlp.weight, gain=gain)
+    if self.score_mlp.bias is not None:
+      torch.nn.init.constant_(self.score_mlp.bias, 0.0)
     if self.res_proj is not None:
       torch.nn.init.xavier_uniform_(self.res_proj.weight, gain=gain)
       if self.res_proj.bias is not None:
@@ -49,11 +47,10 @@ class ResidualGATLayer(Module):
     x = self.feat_drop(x)
     B, N, Fin = x.size()
     Wh = torch.einsum('bni,hio->bhno', x, self.w)
-    src = torch.einsum('bhno,hoc->bhnc', Wh, self.a_src).squeeze(-1)
-    dst = torch.einsum('bhno,hoc->bhnc', Wh, self.a_dst).squeeze(-1)
-    e = self.leakyrelu(src.unsqueeze(3) + dst.unsqueeze(2))
+    scores = self.score_mlp(x).squeeze(-1)
     eye = torch.eye(N, device=device).unsqueeze(0).expand(B, N, N)
     adj_eff = adj + eye
+    e = scores.unsqueeze(1).unsqueeze(2).expand(B, self.heads, N, N)
     e = e.masked_fill(adj_eff.unsqueeze(1) == 0, float('-inf'))
     alpha = torch.softmax(e, dim=3)
     alpha = self.attn_drop(alpha)

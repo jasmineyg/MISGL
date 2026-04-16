@@ -295,6 +295,11 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       val_accs.append(val_result['acc'])
       if writer is not None:
         writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
+      logging.info(
+        'Epoch {} => loss: {:.4f}, train acc: {:.4f}, val acc: {:.4f}'.format(
+          epoch, avg_loss, result['acc'], val_result['acc']
+        )
+      )
         
       # 导出 GAT1 特征，每 50 个 epoch 保存一次，第一次保存在第 50 epoch (即 epoch 49)
       enable_gat_export = bool(getattr(hparams, 'enable_gat_export', False))
@@ -401,11 +406,7 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
   data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
   writer.add_image('graphs_colored', data, epoch)
 def _mpl_figure_to_image(fig):
-  """
-  将 matplotlib Figure 转成 CHW 格式的 uint8 图像（用于 TensorBoard add_image）。
 
-  当 tensorboardX 不可用时，使用该函数替代 figure_to_image。
-  """
   import numpy as np
   fig.canvas.draw()
   w, h = fig.canvas.get_width_height()

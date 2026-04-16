@@ -24,7 +24,7 @@ def fused_loss(model_output, targets, epoch, hparams):
         bce = F.binary_cross_entropy_with_logits(logits_A.view(-1), targets.view(-1).float())
         bb_cfg = getattr(hparams, 'branch_b', None)
         use_b = bool(bb_cfg and bb_cfg.get('use', False))
-        lam = float(bb_cfg.get('lambda_attn', 0.2)) if use_b else 0.0
+        lam = float(bb_cfg.get('lambda_attn', 0.0)) if use_b else 0.0
         eps = float(bb_cfg.get('attn_eps', 1e-6)) if use_b else 1e-6
 
         # 注意力正则 (已废弃/注释)
