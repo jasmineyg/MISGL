@@ -3,8 +3,8 @@ cuda_visible_devices: '1'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['cs', 'eng', 'phy', 'chem', 'med']
-timestamp: gat_b_transMIL
+data_name_set: ['ogbn_arxiv']
+timestamp: gat_b
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 32

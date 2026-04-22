@@ -10,7 +10,12 @@ import random
 from MISGL.utils.hparam import HParams
 from MISGL.utils.global_variables import g_key
 from MISGL.utils.load_data import GraphDataLoaderWrapper
-from MISGL.models.encoder import GcnHpoolEncoder
+from MISGL.models.encoder import MISGLEncoder
+from attention_analyzer_impl import (
+    export_branchB_attention_from_model as _new_export_branchB_attention_from_model,
+    export_branchB_attention_to_excel as _new_export_branchB_attention_to_excel,
+    main as _new_main,
+)
 
 
 def _write_summary_sheet(writer, stats):
@@ -102,7 +107,7 @@ def export_branchB_attention_to_excel(hparams, output_path, seed=None):
         seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
 
-    model = GcnHpoolEncoder(hparams).to(torch.device(hparams.device))
+    model = MISGLEncoder(hparams).to(torch.device(hparams.device))
     model.eval()
 
     if not hasattr(hparams, 'branch_b') or not hparams.branch_b.get('use', False):
@@ -585,6 +590,11 @@ def main():
         output_path = args.output
 
     export_branchB_attention_to_excel(hparams, output_path, seed=args.seed)
+
+
+export_branchB_attention_from_model = _new_export_branchB_attention_from_model
+export_branchB_attention_to_excel = _new_export_branchB_attention_to_excel
+main = _new_main
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)

@@ -27,7 +27,7 @@ def fused_loss(model_output, targets, epoch, hparams):
         lam = float(bb_cfg.get('lambda_attn', 0.0)) if use_b else 0.0
         eps = float(bb_cfg.get('attn_eps', 1e-6)) if use_b else 1e-6
 
-        # 注意力正则 (已废弃/注释)
+        # 注意力正则
         if use_b and 'branch_b' in model_output and lam > 0.0:
             a_pad = model_output['branch_b'].get('a_pad', None)
             mask_valid = model_output['branch_b'].get('mask_valid', None)

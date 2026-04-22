@@ -4,15 +4,16 @@ import torch
 import torch.nn as nn
 
 from MISGL.layers.gat_layer import ResidualGATLayer
+from MISGL.models.mil_head import MILBranchB
 from MISGL.utils.global_variables import g_key
 from MISGL.utils import hparams_lib
 
 
-class GcnHpoolEncoder(nn.Module):
-    """Simple encoder: raw node features -> 1-layer GAT -> mean pooling(h1) -> classifier."""
+class MISGLEncoder(nn.Module):
+    """Simple encoder: raw node features -> 1-layer GAT -> pooled graph embedding -> classifier."""
 
     def __init__(self, hparams, data_name=None):
-        super(GcnHpoolEncoder, self).__init__()
+        super(MISGLEncoder, self).__init__()
 
         self._hparams = hparams_lib.copy_hparams(hparams)
         self.data_name = data_name if data_name is not None else getattr(self._hparams, 'data_name', None)
@@ -54,6 +55,17 @@ class GcnHpoolEncoder(nn.Module):
             nn.Linear(classifier_hidden_dim, classifier_out_dim),
         )
 
+        if self.use_branch_b:
+            bb_attn_hidden = int(bb_cfg.get('attn_hidden', 128))
+            bb_gate_hidden = int(bb_cfg.get('gate_hidden', bb_attn_hidden))
+            self.branch_b_head = MILBranchB(
+                node_dim=hidden_dim,
+                attn_hidden=bb_attn_hidden,
+                gate_hidden=bb_gate_hidden,
+            )
+        else:
+            self.branch_b_head = None
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -81,14 +93,24 @@ class GcnHpoolEncoder(nn.Module):
         mask = self.construct_mask(max_nodes, batch_num_nodes, x.device)
         h = self.gat_layer(x, adj, mask)
         h1 = self._masked_mean_pool(h, batch_num_nodes)
-        ypred = self.classifier(h1)
+        classifier_input = h1
+        branch_b_out = None
+
+        if self.use_branch_b:
+            h_flat, batch_index = self._flatten_valid_nodes(h, batch_num_nodes)
+            branch_b_out = self.branch_b_head(h_flat, batch_index) if h_flat.size(0) > 0 else None
+            if branch_b_out is not None:
+                classifier_input = branch_b_out['z_B']
+
+        ypred = self.classifier(classifier_input)
 
         # Keep compatibility with existing analysis/export scripts.
         self.current_x2 = h
         self.current_h1 = h1
+        self.current_graph_emb_classifier = classifier_input
 
         if self.use_branch_b:
-            model_out = {'ypred_A': ypred, 'branch_b': None}
+            model_out = {'ypred_A': ypred, 'branch_b': branch_b_out}
         else:
             model_out = ypred
 
@@ -99,10 +121,42 @@ class GcnHpoolEncoder(nn.Module):
             'h': h,
             'mean_vec': h1,
             'graph_emb_H1': h1,
-            'graph_emb_classifier': h1,
-            'graph_emb': h1,
+            'graph_emb_classifier': classifier_input,
+            'graph_emb': classifier_input,
         }
+        if branch_b_out is not None:
+            emb['z_B'] = branch_b_out['z_B']
         return model_out, emb
+
+    def _flatten_valid_nodes(self, node_embeddings, batch_num_nodes):
+        if isinstance(batch_num_nodes, torch.Tensor):
+            num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+        else:
+            num_list = [int(n) for n in batch_num_nodes]
+
+        chunks = []
+        batch_chunks = []
+        for bag_idx, num_nodes in enumerate(num_list):
+            if num_nodes <= 0:
+                continue
+            chunks.append(node_embeddings[bag_idx, :num_nodes, :])
+            batch_chunks.append(
+                torch.full(
+                    (num_nodes,),
+                    bag_idx,
+                    dtype=torch.long,
+                    device=node_embeddings.device,
+                )
+            )
+
+        if chunks:
+            return torch.cat(chunks, dim=0), torch.cat(batch_chunks, dim=0)
+
+        hidden_dim = node_embeddings.size(-1)
+        return (
+            node_embeddings.new_zeros((0, hidden_dim)),
+            torch.zeros((0,), dtype=torch.long, device=node_embeddings.device),
+        )
 
     def _masked_mean_pool(self, node_embeddings, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):

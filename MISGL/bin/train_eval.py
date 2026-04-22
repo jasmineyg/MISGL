@@ -33,6 +33,22 @@ from MISGL.models import encoder
 from attention_analyzer import export_branchB_attention_from_model
 
 
+def _attention_train_output_path(path):
+  base, ext = os.path.splitext(path)
+  return f'{base}_train10p{ext}'
+
+
+_METRIC_KEYS = ('acc', 'prec', 'rec', 'F1')
+
+
+def _basic_metrics(result):
+  return {key: float(result[key]) for key in _METRIC_KEYS}
+
+
+def _format_metrics(result):
+  return ', '.join(f'{key}: {result[key]:.4f}' for key in _METRIC_KEYS)
+
+
 def train_eval(hparams, data_name=None):
   """
   训练与评估主入口（Repeated Holdout）。
@@ -79,7 +95,7 @@ def train_eval(hparams, data_name=None):
         logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
       summary_writer = SummaryWriter(logdir)
 
-    model = encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
+    model = encoder.MISGLEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     # 训练+早停都用val
     train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw)
 
@@ -96,7 +112,26 @@ def train_eval(hparams, data_name=None):
     if bool(bb_cfg and bb_cfg.get('use', False)):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_attention.xlsx')
       logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
-      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path, sample_frac=0.2)
+      export_branchB_attention_from_model(
+        model,
+        test_loader,
+        hparams,
+        data_loader._dataset_raw,
+        out_path,
+        sample_frac=1.0,
+        split_name='test',
+        sample_seed=seed,
+      )
+      export_branchB_attention_from_model(
+        model,
+        training_loader,
+        hparams,
+        data_loader._dataset_raw,
+        _attention_train_output_path(out_path),
+        sample_frac=0.1,
+        split_name='train',
+        sample_seed=seed,
+      )
     else:
       logging.warning('[DEBUG] branch_b.use is False or not found, skipping attention export.')
     if summary_writer is not None:
@@ -127,6 +162,10 @@ def fixed_cv_train_eval(hparams, data_name=None):
   split_manifest = data_loader.load_cv_split_manifest(split_path)
   fold_count = int(split_manifest['cv_num_folds'])
   test_metrics = {'acc': [], 'prec': [], 'rec': [], 'F1': []}
+  split_metrics = {
+    split_name: {key: [] for key in _METRIC_KEYS}
+    for split_name in ('train', 'val', 'test')
+  }
   all_results = []
 
   for fold_idx in range(fold_count):
@@ -156,28 +195,37 @@ def fixed_cv_train_eval(hparams, data_name=None):
         logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
       summary_writer = SummaryWriter(logdir)
 
-    model = encoder.GcnHpoolEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
+    model = encoder.MISGLEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     model, _, best_val_result = train_eval_iter(
       model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw
     )
 
-    result = evaluate(test_loader, model, hparams, dataset_name='test')
+    train_result = evaluate(training_loader, model, hparams, dataset_name='train')
+    val_result = evaluate(validation_loader, model, hparams, dataset_name='val')
+    test_result = evaluate(test_loader, model, hparams, dataset_name='test')
+    metrics_by_split = {
+      'train': _basic_metrics(train_result),
+      'val': _basic_metrics(val_result),
+      'test': _basic_metrics(test_result),
+    }
     all_results.append({
       'fold_idx': int(fold_idx),
       'seed': int(seed),
       'split': split_meta,
       'best_val': best_val_result,
-      'metrics': {
-        'acc': float(result['acc']),
-        'prec': float(result['prec']),
-        'rec': float(result['rec']),
-        'F1': float(result['F1']),
-      },
+      'metrics': dict(metrics_by_split['test']),
+      'split_metrics': metrics_by_split,
     })
     for key in test_metrics.keys():
-      test_metrics[key].append(result[key])
-    logging.warning('CV fold {} test => acc: {:.4f}, prec: {:.4f}, rec: {:.4f}, F1: {:.4f}'.format(
-      fold_idx, result['acc'], result['prec'], result['rec'], result['F1']
+      test_metrics[key].append(test_result[key])
+    for split_name, split_result in metrics_by_split.items():
+      for key in _METRIC_KEYS:
+        split_metrics[split_name][key].append(split_result[key])
+    logging.warning('CV fold {} selected model metrics => train [{}]; val [{}]; test [{}]'.format(
+      fold_idx,
+      _format_metrics(metrics_by_split['train']),
+      _format_metrics(metrics_by_split['val']),
+      _format_metrics(metrics_by_split['test']),
     ))
 
     bb_cfg = getattr(hparams, 'branch_b', None)
@@ -185,7 +233,26 @@ def fixed_cv_train_eval(hparams, data_name=None):
     if bool(bb_cfg and bb_cfg.get('use', False)):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_fold_{fold_idx}_attention.xlsx')
       logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
-      export_branchB_attention_from_model(model, test_loader, hparams, data_loader._dataset_raw, out_path, sample_frac=0.2)
+      export_branchB_attention_from_model(
+        model,
+        test_loader,
+        hparams,
+        data_loader._dataset_raw,
+        out_path,
+        sample_frac=1.0,
+        split_name='test',
+        sample_seed=seed,
+      )
+      export_branchB_attention_from_model(
+        model,
+        training_loader,
+        hparams,
+        data_loader._dataset_raw,
+        _attention_train_output_path(out_path),
+        sample_frac=0.1,
+        split_name='train',
+        sample_seed=seed,
+      )
     else:
       logging.warning('[DEBUG] branch_b.use is False or not found, skipping attention export.')
     if summary_writer is not None:
@@ -198,8 +265,23 @@ def fixed_cv_train_eval(hparams, data_name=None):
     }
     for key, vals in test_metrics.items()
   }
+  split_summary = {
+    split_name: {
+      key: {
+        'mean': float(np.mean(vals)),
+        'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+      }
+      for key, vals in split_result.items()
+    }
+    for split_name, split_result in split_metrics.items()
+  }
   msg_parts = [f'{k}: {summary[k]["mean"]:.4f} +/- {summary[k]["std"]:.4f}' for k in ['acc', 'prec', 'rec', 'F1']]
-  logging.warning('* Fixed 10-fold CV test results => {}'.format('; '.join(msg_parts)))
+  for split_name in ('train', 'val', 'test'):
+    msg_parts = [
+      f'{k}: {split_summary[split_name][k]["mean"]:.4f} +/- {split_summary[split_name][k]["std"]:.4f}'
+      for k in _METRIC_KEYS
+    ]
+    logging.warning('* Fixed 10-fold CV {} results => {}'.format(split_name, '; '.join(msg_parts)))
 
   result_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_results.json')
   with open(result_path, 'w', encoding='utf-8') as f:
@@ -210,6 +292,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
       'cv_num_folds': int(split_manifest['cv_num_folds']),
       'cv_val_policy': split_manifest['cv_val_policy'],
       'summary': summary,
+      'split_summary': split_summary,
       'fold_results': all_results,
     }, f, indent=2, ensure_ascii=False)
   logging.warning('Saved CV result summary to {}'.format(result_path))
@@ -245,10 +328,10 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
     
     # 暂时移除projector相关参数和逻辑，因为dataset_raw传递比较复杂，且非核心功能
     writer_batch_idx = list(range(10)) # 默认可视化前10个图
+    log_interval = 10
 
     for epoch in range(hparams.epoch):
-      if not epoch % 10:
-        logging.info('* Start the {}_th epoch'.format(epoch))
+      should_log_epoch = (epoch % log_interval == 0)
 
       total_time = 0
       avg_loss = 0.0
@@ -295,11 +378,12 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       val_accs.append(val_result['acc'])
       if writer is not None:
         writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
-      logging.info(
-        'Epoch {} => loss: {:.4f}, train acc: {:.4f}, val acc: {:.4f}'.format(
-          epoch, avg_loss, result['acc'], val_result['acc']
+      if should_log_epoch:
+        logging.info(
+          'Epoch {} => loss: {:.4f}, train acc: {:.4f}, val acc: {:.4f}'.format(
+            epoch, avg_loss, result['acc'], val_result['acc']
+          )
         )
-      )
         
       # 导出 GAT1 特征，每 50 个 epoch 保存一次，第一次保存在第 50 epoch (即 epoch 49)
       enable_gat_export = bool(getattr(hparams, 'enable_gat_export', False))
@@ -311,7 +395,8 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       if val_result['acc'] > best_val_result['acc'] - 1e-7:
         best_val_result.update({'acc': val_result['acc'], 'epoch': epoch, 'loss': avg_loss})
         best_model_state = copy.deepcopy(model.state_dict())
-        logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
+        if should_log_epoch:
+          logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
         no_improve = 0
       else:
         no_improve += 1
