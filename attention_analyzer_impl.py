@@ -22,14 +22,37 @@ def _init_stats():
         'pos_bag_top1_hits': [],
         'pos_bag_top3_hits': [],
         'pos_bag_top5_hits': [],
+        'evaluated_bag_count': 0,
+        'evaluated_pos_bag_count': 0,
+        'evaluated_neg_bag_count': 0,
+        'correct_bag_count': 0,
         'correct_pos_bag_count': 0,
         'correct_neg_bag_count': 0,
         'wrong_bag_pos_node_counts': [],
     }
 
 
+def _safe_divide(numerator, denominator):
+    if denominator == 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
 def _write_summary_sheet(writer, stats):
     try:
+        overall_bag_accuracy = _safe_divide(
+            stats['correct_bag_count'],
+            stats['evaluated_bag_count'],
+        )
+        pos_bag_accuracy = _safe_divide(
+            stats['correct_pos_bag_count'],
+            stats['evaluated_pos_bag_count'],
+        )
+        neg_bag_accuracy = _safe_divide(
+            stats['correct_neg_bag_count'],
+            stats['evaluated_neg_bag_count'],
+        )
+
         summary_data = {
             'Metric': [
                 'Average Positive Node Weight',
@@ -37,6 +60,9 @@ def _write_summary_sheet(writer, stats):
                 'Top-1 Hit Probability (Positive Bags)',
                 'Top-3 Hit Probability (Positive Bags)',
                 'Top-5 Hit Probability (Positive Bags)',
+                'Overall Bag Accuracy',
+                'Positive Bag Accuracy',
+                'Negative Bag Accuracy',
                 'Correctly Classified Positive Bags',
                 'Correctly Classified Negative Bags',
                 'Wrongly Classified Bags - Positive Node Counts',
@@ -47,6 +73,9 @@ def _write_summary_sheet(writer, stats):
                 np.mean(stats['pos_bag_top1_hits']) if stats['pos_bag_top1_hits'] else 0.0,
                 np.mean(stats['pos_bag_top3_hits']) if stats['pos_bag_top3_hits'] else 0.0,
                 np.mean(stats['pos_bag_top5_hits']) if stats['pos_bag_top5_hits'] else 0.0,
+                overall_bag_accuracy,
+                pos_bag_accuracy,
+                neg_bag_accuracy,
                 stats['correct_pos_bag_count'],
                 stats['correct_neg_bag_count'],
                 str(stats['wrong_bag_pos_node_counts']),
@@ -105,6 +134,20 @@ def _ensure_parent_dir(path):
         os.makedirs(parent_dir, exist_ok=True)
 
 
+def _move_batch_to_device(data, device):
+    def _needs_device_move(value):
+        if not isinstance(value, torch.Tensor):
+            return False
+        if value.device.type != device.type:
+            return True
+        return device.index is not None and value.device.index != device.index
+
+    return {
+        key: value.to(device, non_blocking=True) if _needs_device_move(value) else value
+        for key, value in data.items()
+    }
+
+
 def _build_export_loader(loader):
     return DataLoader(
         loader.dataset,
@@ -145,7 +188,7 @@ def _extract_batch_preds_and_labels(logits, labels, batch_size):
         logging.warning('Unexpected logits shape: %s', tuple(logits.shape))
         preds = [0] * batch_size
 
-    return preds, labels.detach().cpu().tolist()
+    return preds, labels.detach().cpu().view(-1).tolist()
 
 
 def _extract_weights_per_graph(branch_b_out, num_list):
@@ -214,6 +257,277 @@ def _resolve_node_binary_labels(dataset_raw, orig_idx, num_nodes):
     return np.zeros(num_nodes, dtype=np.int64)
 
 
+def _resolve_node_orig_ids(dataset_raw, orig_idx, num_nodes):
+    if dataset_raw is None:
+        return np.arange(num_nodes, dtype=np.int64)
+
+    subgraphs = dataset_raw.get('subgraph_structures', None)
+    if subgraphs is None or not (0 <= orig_idx < len(subgraphs)):
+        return np.arange(num_nodes, dtype=np.int64)
+
+    nodes = list(subgraphs[orig_idx].nodes())
+    out = np.full(len(nodes), -1, dtype=np.int64)
+    for idx, node_id in enumerate(nodes):
+        node_orig_id = None
+        if isinstance(node_id, (int, np.integer)):
+            node_orig_id = int(node_id)
+        else:
+            attr = subgraphs[orig_idx].nodes[node_id]
+            for key in ('original_id', 'original_index', 'orig_id', 'node_index'):
+                if key in attr and attr[key] is not None:
+                    try:
+                        node_orig_id = int(attr[key])
+                        break
+                    except Exception:
+                        pass
+        out[idx] = idx if node_orig_id is None else node_orig_id
+    return out[:num_nodes]
+
+
+def _extract_logits(out):
+    if isinstance(out, dict) and 'ypred_A' in out:
+        return out['ypred_A']
+    if isinstance(out, dict) and 'ypred' in out:
+        return out['ypred']
+    if isinstance(out, torch.Tensor):
+        return out
+    return None
+
+
+def _extract_lightweight_attention(model, out, num_list):
+    if isinstance(out, dict):
+        branch_b_out = out.get('branch_b', None)
+        if branch_b_out is not None:
+            weights_list = _extract_weights_per_graph(branch_b_out, num_list)
+            if weights_list is not None:
+                return weights_list, [None for _ in weights_list], 'branch_b'
+
+    candidate_layers = [
+        getattr(model, 'gat_layer', None),
+        getattr(model, 'entry_conv2', None),
+        getattr(model, 'entry_conv1', None),
+    ]
+    for layer in candidate_layers:
+        if layer is None:
+            continue
+        attention = getattr(layer, 'last_attention_summary', None)
+        if attention is None:
+            continue
+        attention_np = attention.detach().cpu().numpy()
+        scores = getattr(layer, 'last_attention_scores', None)
+        scores_np = scores.detach().cpu().numpy() if isinstance(scores, torch.Tensor) else None
+        weights_list = []
+        score_list = []
+        for idx, num_nodes in enumerate(num_list):
+            weights_list.append(attention_np[idx, :num_nodes])
+            score_list.append(None if scores_np is None else scores_np[idx, :num_nodes])
+        return weights_list, score_list, 'gat'
+
+    return None, None, 'none'
+
+
+def export_lightweight_attention_from_model(
+    model,
+    loader,
+    hparams,
+    dataset_raw,
+    output_path,
+    sample_frac=0.1,
+    split_name='test',
+    sample_seed=None,
+    top_k=20,
+):
+    """Export compact attention analysis: summary + per-graph metrics + top-k nodes."""
+    model.eval()
+    device = torch.device(getattr(hparams, 'device', 'cpu'))
+    export_loader = _build_export_loader(loader)
+    total_graphs = len(export_loader.dataset)
+    selected_positions = _resolve_sample_positions(total_graphs, float(sample_frac), sample_seed)
+    top_k = max(1, int(top_k))
+
+    stats = {
+        'evaluated_bag_count': 0,
+        'evaluated_pos_bag_count': 0,
+        'evaluated_neg_bag_count': 0,
+        'correct_bag_count': 0,
+        'correct_pos_bag_count': 0,
+        'correct_neg_bag_count': 0,
+        'pos_weight_sum': 0.0,
+        'pos_weight_count': 0,
+        'neg_weight_sum': 0.0,
+        'neg_weight_count': 0,
+        'top1_hit_sum': 0,
+        'top3_hit_sum': 0,
+        'top5_hit_sum': 0,
+        'pos_bag_for_hit': 0,
+        'wrong_bag_count': 0,
+        'wrong_bag_pos_node_sum': 0,
+        'wrong_bag_pos_node_max': 0,
+    }
+    per_graph_rows = []
+    top_node_rows = []
+    attention_source = 'none'
+
+    with torch.no_grad():
+        global_pos = 0
+        for raw_graph_data in export_loader:
+            graph_data = _move_batch_to_device(raw_graph_data, device)
+            out = model(graph_data)
+
+            labels = graph_data[g_key.y] if g_key.y in graph_data else None
+            batch_num_nodes = graph_data[g_key.node_num]
+            orig_idx_tensor = graph_data[g_key.orig_graph_idx]
+            subgraph_id_tensor = graph_data.get(g_key.subgraph_id, None)
+
+            if isinstance(batch_num_nodes, torch.Tensor):
+                num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+            else:
+                num_list = [int(n) for n in batch_num_nodes]
+
+            if isinstance(orig_idx_tensor, torch.Tensor):
+                orig_indices = [int(i) for i in orig_idx_tensor.detach().cpu().tolist()]
+            else:
+                orig_indices = [int(i) for i in orig_idx_tensor]
+
+            if isinstance(subgraph_id_tensor, torch.Tensor):
+                subgraph_ids = [int(i) for i in subgraph_id_tensor.detach().cpu().tolist()]
+            else:
+                subgraph_ids = [-1 for _ in num_list]
+
+            logits = _extract_logits(out)
+            batch_preds, batch_labels = _extract_batch_preds_and_labels(logits, labels, len(num_list))
+            weights_list, score_list, source = _extract_lightweight_attention(model, out, num_list)
+            if source != 'none':
+                attention_source = source
+            if weights_list is None:
+                global_pos += len(num_list)
+                continue
+
+            for idx, num_nodes in enumerate(num_list):
+                current_pos = global_pos
+                global_pos += 1
+                if num_nodes <= 0:
+                    continue
+
+                orig_idx = orig_indices[idx]
+                subgraph_id = subgraph_ids[idx]
+                pred = batch_preds[idx]
+                label = batch_labels[idx]
+                weights = np.asarray(weights_list[idx], dtype=np.float64).reshape(-1)[:num_nodes]
+                raw_scores = None if score_list[idx] is None else np.asarray(score_list[idx], dtype=np.float64).reshape(-1)[:num_nodes]
+                node_labels = _resolve_node_binary_labels(dataset_raw, orig_idx, num_nodes)
+                pos_mask = node_labels == 1
+                neg_mask = node_labels == 0
+                pos_node_count = int(np.sum(pos_mask))
+
+                if pos_mask.any():
+                    stats['pos_weight_sum'] += float(np.sum(weights[pos_mask]))
+                    stats['pos_weight_count'] += int(np.sum(pos_mask))
+                if neg_mask.any():
+                    stats['neg_weight_sum'] += float(np.sum(weights[neg_mask]))
+                    stats['neg_weight_count'] += int(np.sum(neg_mask))
+
+                is_correct = None
+                if pred is not None and label is not None:
+                    stats['evaluated_bag_count'] += 1
+                    if int(label) == 1:
+                        stats['evaluated_pos_bag_count'] += 1
+                    else:
+                        stats['evaluated_neg_bag_count'] += 1
+                    is_correct = int(pred) == int(label)
+                    if is_correct:
+                        stats['correct_bag_count'] += 1
+                        if int(label) == 1:
+                            stats['correct_pos_bag_count'] += 1
+                        else:
+                            stats['correct_neg_bag_count'] += 1
+                    else:
+                        stats['wrong_bag_count'] += 1
+                        stats['wrong_bag_pos_node_sum'] += pos_node_count
+                        stats['wrong_bag_pos_node_max'] = max(stats['wrong_bag_pos_node_max'], pos_node_count)
+
+                order = np.argsort(-weights)
+                if label == 1:
+                    stats['pos_bag_for_hit'] += 1
+                    stats['top1_hit_sum'] += int(np.any(node_labels[order[:1]] == 1))
+                    stats['top3_hit_sum'] += int(np.any(node_labels[order[:min(3, num_nodes)]] == 1))
+                    stats['top5_hit_sum'] += int(np.any(node_labels[order[:min(5, num_nodes)]] == 1))
+
+                if current_pos in selected_positions:
+                    top_order = order[:min(top_k, num_nodes)]
+                    node_orig_ids = _resolve_node_orig_ids(dataset_raw, orig_idx, num_nodes)
+                    top1_is_pos = int(np.any(node_labels[order[:1]] == 1)) if int(label or 0) == 1 else None
+                    top3_is_pos = int(np.any(node_labels[order[:min(3, num_nodes)]] == 1)) if int(label or 0) == 1 else None
+                    top5_is_pos = int(np.any(node_labels[order[:min(5, num_nodes)]] == 1)) if int(label or 0) == 1 else None
+                    per_graph_rows.append({
+                        'split': split_name,
+                        'global_pos': current_pos,
+                        'orig_graph_idx': orig_idx,
+                        'subgraph_id': subgraph_id,
+                        'y_true': label,
+                        'y_pred': pred,
+                        'correct': None if is_correct is None else int(is_correct),
+                        'num_nodes': num_nodes,
+                        'num_pos_nodes': pos_node_count,
+                        'max_attention': float(np.max(weights)),
+                        'mean_attention': float(np.mean(weights)),
+                        'top1_hit_pos': top1_is_pos,
+                        'top3_hit_pos': top3_is_pos,
+                        'top5_hit_pos': top5_is_pos,
+                    })
+                    for rank, node_pos in enumerate(top_order, start=1):
+                        top_node_rows.append({
+                            'split': split_name,
+                            'global_pos': current_pos,
+                            'orig_graph_idx': orig_idx,
+                            'subgraph_id': subgraph_id,
+                            'y_true': label,
+                            'y_pred': pred,
+                            'correct': None if is_correct is None else int(is_correct),
+                            'rank': rank,
+                            'node_pos_in_subgraph': int(node_pos),
+                            'original_node_id': int(node_orig_ids[node_pos]),
+                            'node_binary_label': int(node_labels[node_pos]),
+                            'attention': float(weights[node_pos]),
+                            'raw_score': None if raw_scores is None else float(raw_scores[node_pos]),
+                        })
+
+    summary_rows = [
+        {'Metric': 'Attention Source', 'Value': attention_source},
+        {'Metric': 'Split', 'Value': split_name},
+        {'Metric': 'Total Graphs', 'Value': total_graphs},
+        {'Metric': 'Sampled Graphs Written', 'Value': len(per_graph_rows)},
+        {'Metric': 'Top K Nodes Per Sampled Graph', 'Value': top_k},
+        {'Metric': 'Average Positive Node Attention', 'Value': _safe_divide(stats['pos_weight_sum'], stats['pos_weight_count'])},
+        {'Metric': 'Average Negative Node Attention', 'Value': _safe_divide(stats['neg_weight_sum'], stats['neg_weight_count'])},
+        {'Metric': 'Top-1 Hit Probability (Positive Bags)', 'Value': _safe_divide(stats['top1_hit_sum'], stats['pos_bag_for_hit'])},
+        {'Metric': 'Top-3 Hit Probability (Positive Bags)', 'Value': _safe_divide(stats['top3_hit_sum'], stats['pos_bag_for_hit'])},
+        {'Metric': 'Top-5 Hit Probability (Positive Bags)', 'Value': _safe_divide(stats['top5_hit_sum'], stats['pos_bag_for_hit'])},
+        {'Metric': 'Overall Bag Accuracy', 'Value': _safe_divide(stats['correct_bag_count'], stats['evaluated_bag_count'])},
+        {'Metric': 'Positive Bag Accuracy', 'Value': _safe_divide(stats['correct_pos_bag_count'], stats['evaluated_pos_bag_count'])},
+        {'Metric': 'Negative Bag Accuracy', 'Value': _safe_divide(stats['correct_neg_bag_count'], stats['evaluated_neg_bag_count'])},
+        {'Metric': 'Wrong Bag Count', 'Value': stats['wrong_bag_count']},
+        {'Metric': 'Average Positive Nodes In Wrong Bags', 'Value': _safe_divide(stats['wrong_bag_pos_node_sum'], stats['wrong_bag_count'])},
+        {'Metric': 'Max Positive Nodes In Wrong Bags', 'Value': stats['wrong_bag_pos_node_max']},
+    ]
+
+    _ensure_parent_dir(output_path)
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
+        pd.DataFrame(per_graph_rows).to_excel(writer, sheet_name='PerGraph', index=False)
+        pd.DataFrame(top_node_rows).to_excel(writer, sheet_name='TopNodes', index=False)
+
+    logging.info(
+        'Exported lightweight attention for %s split to %s (sampled %d / %d graphs, top_k=%d).',
+        split_name,
+        output_path,
+        len(per_graph_rows),
+        total_graphs,
+        top_k,
+    )
+    return output_path
+
+
 def _export_branchB_attention(
     model,
     loader,
@@ -227,6 +541,7 @@ def _export_branchB_attention(
     total_graphs = len(export_loader.dataset)
     selected_positions = _resolve_sample_positions(total_graphs, sample_frac, sample_seed)
     stats = _init_stats()
+    device = next(model.parameters()).device
 
     _ensure_parent_dir(output_path)
     writer = pd.ExcelWriter(output_path, engine='openpyxl')
@@ -234,7 +549,8 @@ def _export_branchB_attention(
 
     with torch.no_grad():
         global_pos = 0
-        for graph_data in export_loader:
+        for raw_graph_data in export_loader:
+            graph_data = _move_batch_to_device(raw_graph_data, device)
             out = model(graph_data)
 
             if isinstance(out, dict) and 'ypred_A' in out:
@@ -259,41 +575,37 @@ def _export_branchB_attention(
                 orig_indices = [int(i) for i in orig_idx_tensor]
 
             batch_preds, batch_labels = _extract_batch_preds_and_labels(logits, labels, len(num_list))
-
-            if not isinstance(out, dict) or out.get('branch_b') is None:
-                logging.warning('Split %s: current batch has no branch_b output, skipped.', split_name)
-                global_pos += len(num_list)
-                continue
-
-            weights_list = _extract_weights_per_graph(out['branch_b'], num_list)
-            if weights_list is None:
-                logging.warning('Split %s: branch_b attention weights not found, skipped batch.', split_name)
-                global_pos += len(num_list)
-                continue
+            branch_b_out = out.get('branch_b') if isinstance(out, dict) else None
+            weights_list = None
+            if branch_b_out is None:
+                logging.warning('Split %s: current batch has no branch_b output, attention export skipped.', split_name)
+            else:
+                weights_list = _extract_weights_per_graph(branch_b_out, num_list)
+                if weights_list is None:
+                    logging.warning(
+                        'Split %s: branch_b attention weights not found, attention export skipped for batch.',
+                        split_name,
+                    )
 
             for idx, num_nodes in enumerate(num_list):
                 current_pos = global_pos
                 global_pos += 1
-                if current_pos not in selected_positions or num_nodes <= 0:
-                    continue
-
-                weights = weights_list[idx]
                 orig_idx = orig_indices[idx]
                 pred = batch_preds[idx]
                 label = batch_labels[idx]
                 node_bin_labels = _resolve_node_binary_labels(dataset_raw, orig_idx, num_nodes)
 
-                pos_mask = node_bin_labels == 1
-                neg_mask = node_bin_labels == 0
-                if pos_mask.any():
-                    stats['pos_weights'].extend(weights[pos_mask].tolist())
-                if neg_mask.any():
-                    stats['neg_weights'].extend(weights[neg_mask].tolist())
-
                 is_correct = False
                 if pred is not None and label is not None:
+                    stats['evaluated_bag_count'] += 1
+                    if label == 1:
+                        stats['evaluated_pos_bag_count'] += 1
+                    else:
+                        stats['evaluated_neg_bag_count'] += 1
+
                     if pred == label:
                         is_correct = True
+                        stats['correct_bag_count'] += 1
                         if label == 1:
                             stats['correct_pos_bag_count'] += 1
                         else:
@@ -308,6 +620,17 @@ def _export_branchB_attention(
                         pred,
                         label,
                     )
+
+                if current_pos not in selected_positions or num_nodes <= 0 or weights_list is None:
+                    continue
+
+                weights = weights_list[idx]
+                pos_mask = node_bin_labels == 1
+                neg_mask = node_bin_labels == 0
+                if pos_mask.any():
+                    stats['pos_weights'].extend(weights[pos_mask].tolist())
+                if neg_mask.any():
+                    stats['neg_weights'].extend(weights[neg_mask].tolist())
 
                 df = pd.DataFrame({
                     'weight': weights,
@@ -473,5 +796,6 @@ def main():
 __all__ = [
     'export_branchB_attention_from_model',
     'export_branchB_attention_to_excel',
+    'export_lightweight_attention_from_model',
     'main',
 ]

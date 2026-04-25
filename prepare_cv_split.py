@@ -89,7 +89,7 @@ if __name__ == '__main__':
   logging.getLogger().setLevel(logging.INFO)
   parser = argparse.ArgumentParser(description='Prepare and persist fixed 10-fold CV split manifests.')
   parser.add_argument('--hparam_path', nargs='?', type=str,
-                      default='./config/hparams_testdb.yml',
+                      default='./config/b_off.yml',
                       help='The path to the .yml file which contains all the hyperparameters.')
   parser.add_argument('--data_name_set', nargs='*', type=str, default=None,
                       help='Prepare split manifests for one or more datasets.')

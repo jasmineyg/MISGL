@@ -22,7 +22,9 @@ class GraphDataset(Dataset):
 
   def __init__(self, hparams, graph_list):
     self._hparams = hparams_lib.copy_hparams(hparams)
-    self._device = torch.device(self._hparams.device)
+    preload_to_gpu = bool(getattr(self._hparams, 'preload_data_to_gpu', True))
+    target_device = self._hparams.device if preload_to_gpu else 'cpu'
+    self._device = torch.device(target_device)
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 

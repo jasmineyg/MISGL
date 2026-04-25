@@ -48,6 +48,7 @@ class MISGLEncoder(nn.Module):
             residual=gat_residual,
         )
 
+        # 分类器 两层MLP
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, classifier_hidden_dim),
             nn.LeakyReLU(negative_slope=negative_slope),

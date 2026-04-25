@@ -10,13 +10,24 @@ from MISGL.utils.global_variables import *
 def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
     model.eval()
     preds, labels = [], []
+    device = torch.device(hparams.device)
+
+    def _needs_device_move(value):
+        if not isinstance(value, torch.Tensor):
+            return False
+        if value.device.type != device.type:
+            return True
+        return device.index is not None and value.device.index != device.index
     
     with torch.no_grad():
         for batch_idx, data in enumerate(dataset):
-            for key, value in data.items():
-                data[key] = value.to(hparams.device)
+            batch = {
+                key: value.to(device, non_blocking=True)
+                if _needs_device_move(value) else value
+                for key, value in data.items()
+            }
             
-            out = model(data)
+            out = model(batch)
             
             # 只使用分支A的分类头输出，不做融合
             if isinstance(out, dict) and 'ypred_A' in out:
@@ -25,13 +36,13 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
                     p = torch.sigmoid(logits_A).view(-1)  # [B]
                 else:
                     # Fallback if logits_A is not a tensor for some reason
-                    p = torch.tensor([0.0] * len(data[g_key.y])).to(hparams.device)
+                    p = torch.zeros(len(batch[g_key.y]), device=device)
             else:
                 logits_A = out  # [B] 或 [B,1]
                 p = torch.sigmoid(logits_A).view(-1)  # [B]
 
             pred = (p > 0.5).long().cpu().numpy()
-            y = data[g_key.y].view(-1).cpu().numpy()
+            y = batch[g_key.y].view(-1).cpu().numpy()
             
             preds.append(pred)
             labels.append(y)

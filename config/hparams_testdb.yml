@@ -29,3 +29,7 @@ use_coarse_graph: false
 coarse_graph_topk: 16
 
 enable_gat_export: false
+enable_tensorboard: false
+train_eval_interval: 10
+final_eval_splits: ['test']
+export_attention: false

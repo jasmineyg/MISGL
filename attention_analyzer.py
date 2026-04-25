@@ -14,6 +14,7 @@ from MISGL.models.encoder import MISGLEncoder
 from attention_analyzer_impl import (
     export_branchB_attention_from_model as _new_export_branchB_attention_from_model,
     export_branchB_attention_to_excel as _new_export_branchB_attention_to_excel,
+    export_lightweight_attention_from_model as _new_export_lightweight_attention_from_model,
     main as _new_main,
 )
 
@@ -594,6 +595,7 @@ def main():
 
 export_branchB_attention_from_model = _new_export_branchB_attention_from_model
 export_branchB_attention_to_excel = _new_export_branchB_attention_to_excel
+export_lightweight_attention_from_model = _new_export_lightweight_attention_from_model
 main = _new_main
 
 if __name__ == '__main__':
