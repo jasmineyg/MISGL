@@ -19,7 +19,7 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
             return True
         return device.index is not None and value.device.index != device.index
     
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, data in enumerate(dataset):
             batch = {
                 key: value.to(device, non_blocking=True)

@@ -1,37 +1,22 @@
 # coding=utf-8
 
 import os
-import time
 import logging
 import json
 import gc
-import matplotlib
-
-try:
-  import matplotlib.pyplot as plt
-except ModuleNotFoundError:
-  matplotlib.use('Agg')
-  import matplotlib.pyplot as plt
 
 import numpy as np
-import networkx as nx
 
 import torch
-try:
-  import tensorboardX
-  SummaryWriter = tensorboardX.SummaryWriter
-  _figure_to_image = tensorboardX.utils.figure_to_image
-except ModuleNotFoundError:
-  tensorboardX = None
-  from torch.utils.tensorboard import SummaryWriter
-  _figure_to_image = None
 from MISGL.utils import get_loss
 from MISGL.utils import reproducibility
 from MISGL.utils.global_variables import *
 from MISGL.utils.evaluate import evaluate
 from MISGL.utils import load_data
 from MISGL.models import encoder
-from attention_analyzer import export_lightweight_attention_from_model
+
+
+_LIGHTWEIGHT_ATTENTION_EXPORTER = None
 
 
 def _attention_train_output_path(path):
@@ -40,6 +25,7 @@ def _attention_train_output_path(path):
 
 
 _METRIC_KEYS = ('acc', 'prec', 'rec', 'F1')
+_FINAL_EVAL_SPLITS = ('train', 'val', 'test')
 
 
 def _basic_metrics(result):
@@ -51,13 +37,13 @@ def _format_metrics(result):
 
 
 def _final_eval_splits(hparams):
-  raw = getattr(hparams, 'final_eval_splits', ['test'])
+  raw = getattr(hparams, 'final_eval_splits', list(_FINAL_EVAL_SPLITS))
   if isinstance(raw, str):
     splits = [s.strip() for s in raw.split(',') if s.strip()]
   elif isinstance(raw, (list, tuple, set)):
     splits = [str(s).strip() for s in raw if str(s).strip()]
   else:
-    splits = ['test']
+    splits = list(_FINAL_EVAL_SPLITS)
 
   valid = {'train', 'val', 'test'}
   selected = []
@@ -77,7 +63,7 @@ def _should_export_attention(hparams):
 
 def _attention_sample_frac(hparams, split_name):
   if split_name == 'train':
-    return float(getattr(hparams, 'attention_train_sample_frac', 0.02))
+    return float(getattr(hparams, 'attention_train_sample_frac', 0.1))
   return float(getattr(hparams, 'attention_sample_frac', 0.1))
 
 
@@ -86,7 +72,37 @@ def _attention_top_k(hparams):
 
 
 def _should_export_train_attention(hparams):
-  return bool(getattr(hparams, 'attention_export_train', False))
+  return bool(getattr(hparams, 'attention_export_train', True))
+
+
+def _get_lightweight_attention_exporter():
+  global _LIGHTWEIGHT_ATTENTION_EXPORTER
+  if _LIGHTWEIGHT_ATTENTION_EXPORTER is not None:
+    return _LIGHTWEIGHT_ATTENTION_EXPORTER
+
+  try:
+    from attention_analyzer_impl import export_lightweight_attention_from_model
+  except ImportError as impl_error:
+    try:
+      from attention_analyzer import export_lightweight_attention_from_model
+    except ImportError as wrapper_error:
+      raise ImportError(
+        'Cannot import export_lightweight_attention_from_model from '
+        'attention_analyzer_impl or attention_analyzer.'
+      ) from wrapper_error
+    except AttributeError as wrapper_error:
+      raise ImportError(
+        'attention_analyzer does not define export_lightweight_attention_from_model.'
+      ) from wrapper_error
+    else:
+      logging.warning(
+        'Using export_lightweight_attention_from_model from attention_analyzer '
+        'because attention_analyzer_impl import failed: %s',
+        impl_error,
+      )
+
+  _LIGHTWEIGHT_ATTENTION_EXPORTER = export_lightweight_attention_from_model
+  return _LIGHTWEIGHT_ATTENTION_EXPORTER
 
 
 def _move_batch_to_device(data, device):
@@ -131,7 +147,12 @@ def train_eval(hparams, data_name=None):
     base_seed = int(getattr(hparams, 'cv_seed', 1024))
     seeds = [base_seed + i for i in range(holdout_runs)]
 
+  final_splits = _final_eval_splits(hparams)
   test_metrics = {'acc': [], 'prec': [], 'rec': [], 'F1': []}
+  split_metrics = {
+    split_name: {key: [] for key in _METRIC_KEYS}
+    for split_name in final_splits
+  }
   all_results = []
 
   for run_idx, seed in enumerate(seeds):
@@ -144,33 +165,49 @@ def train_eval(hparams, data_name=None):
       seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
 
-    # 默认关闭 tensorboard 以节省内存
-    enable_tensorboard = getattr(hparams, 'enable_tensorboard', False)
     summary_writer = None
-
-    if enable_tensorboard:
-      tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
-      logdir = os.path.join(tb_root, str(hparams.timestamp) + '/holdout_{}'.format(run_idx))
-      if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
-        logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
-      summary_writer = SummaryWriter(logdir)
 
     model = encoder.MISGLEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     # 训练+早停都用val
-    train_eval_iter(model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw)
+    model, _, best_val_result = train_eval_iter(
+      model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw
+    )
 
-    result = evaluate(test_loader, model, hparams, dataset_name="test")
-    all_results.append(result)
+    loaders_by_split = {
+      'train': training_loader,
+      'val': validation_loader,
+      'test': test_loader,
+    }
+    metrics_by_split = {}
+    for split_name in final_splits:
+      split_result = evaluate(loaders_by_split[split_name], model, hparams, dataset_name=split_name)
+      metrics_by_split[split_name] = _basic_metrics(split_result)
+    result = metrics_by_split['test']
+    all_results.append({
+      'run_idx': int(run_idx),
+      'seed': int(seed),
+      'best_val': best_val_result,
+      'metrics': dict(result),
+      'split_metrics': metrics_by_split,
+    })
     for key in test_metrics.keys():
       test_metrics[key].append(result[key])
-    logging.warning('Holdout {} test => acc: {:.4f}, prec: {:.4f}, rec: {:.4f}, F1: {:.4f}'.format(
-      run_idx, result['acc'], result['prec'], result['rec'], result['F1']
+    for split_name, split_result in metrics_by_split.items():
+      for key in _METRIC_KEYS:
+        split_metrics[split_name][key].append(split_result[key])
+    logging.warning('Holdout {} selected model metrics => {}'.format(
+      run_idx,
+      '; '.join(
+        '{} [{}]'.format(split_name, _format_metrics(metrics_by_split[split_name]))
+        for split_name in final_splits
+      ),
     ))
 
     if _should_export_attention(hparams):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_analyze_attention.xlsx')
       logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
-      export_lightweight_attention_from_model(
+      attention_exporter = _get_lightweight_attention_exporter()
+      attention_exporter(
         model,
         test_loader,
         hparams,
@@ -182,7 +219,7 @@ def train_eval(hparams, data_name=None):
         top_k=_attention_top_k(hparams),
       )
       if _should_export_train_attention(hparams):
-        export_lightweight_attention_from_model(
+        attention_exporter(
           model,
           training_loader,
           hparams,
@@ -197,7 +234,7 @@ def train_eval(hparams, data_name=None):
       logging.warning('[DEBUG] export_attention is disabled, skipping attention export.')
     if summary_writer is not None:
       summary_writer.close()
-    del model, training_loader, validation_loader, test_loader, result
+    del model, training_loader, validation_loader, test_loader, loaders_by_split, metrics_by_split, result
     _clear_cuda_cache(hparams)
 
   summary = {
@@ -207,10 +244,32 @@ def train_eval(hparams, data_name=None):
     }
     for key, vals in test_metrics.items()
   }
-  msg_parts = [f'{k}: {summary[k]["mean"]:.4f} ± {summary[k]["std"]:.4f}' for k in ['acc', 'prec', 'rec', 'F1']]
-  logging.warning('* Repeated Holdout (k={}) test results => {}'.format(len(seeds), '; '.join(msg_parts)))
+  split_summary = {
+    split_name: {
+      key: {
+        'mean': float(np.mean(vals)),
+        'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+      }
+      for key, vals in split_result.items()
+    }
+    for split_name, split_result in split_metrics.items()
+  }
+  for split_name in final_splits:
+    msg_parts = [
+      f'{k}: {split_summary[split_name][k]["mean"]:.4f} +/- {split_summary[split_name][k]["std"]:.4f}'
+      for k in _METRIC_KEYS
+    ]
+    logging.warning('* Repeated Holdout (k={}) {} results => {}'.format(
+      len(seeds), split_name, '; '.join(msg_parts)
+    ))
 
-  return {'seeds': seeds, 'results': all_results, 'summary': summary}
+  return {
+    'seeds': seeds,
+    'results': all_results,
+    'summary': summary,
+    'split_summary': split_summary,
+    'final_eval_splits': list(final_splits),
+  }
 
 
 def fixed_cv_train_eval(hparams, data_name=None):
@@ -250,14 +309,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
       )
     )
 
-    enable_tensorboard = getattr(hparams, 'enable_tensorboard', False)
     summary_writer = None
-    if enable_tensorboard:
-      tb_root = getattr(hparams, 'tb_logdir', os.path.join('..', 'result'))
-      logdir = os.path.join(tb_root, str(hparams.timestamp) + '/cv_fold_{}'.format(fold_idx))
-      if bool(getattr(hparams, 'tb_unique_run_dir', True)) and os.path.exists(logdir):
-        logdir = os.path.join(logdir, time.strftime('%Y%m%d-%H%M%S'))
-      summary_writer = SummaryWriter(logdir)
 
     model = encoder.MISGLEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
     model, _, best_val_result = train_eval_iter(
@@ -298,7 +350,8 @@ def fixed_cv_train_eval(hparams, data_name=None):
     if _should_export_attention(hparams):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_fold_{fold_idx}_analyze_attention.xlsx')
       logging.warning(f'[DEBUG] Exporting attention to: {out_path}')
-      export_lightweight_attention_from_model(
+      attention_exporter = _get_lightweight_attention_exporter()
+      attention_exporter(
         model,
         test_loader,
         hparams,
@@ -310,7 +363,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
         top_k=_attention_top_k(hparams),
       )
       if _should_export_train_attention(hparams):
-        export_lightweight_attention_from_model(
+        attention_exporter(
           model,
           training_loader,
           hparams,
@@ -345,7 +398,6 @@ def fixed_cv_train_eval(hparams, data_name=None):
     }
     for split_name, split_result in split_metrics.items()
   }
-  msg_parts = [f'{k}: {summary[k]["mean"]:.4f} +/- {summary[k]["std"]:.4f}' for k in ['acc', 'prec', 'rec', 'F1']]
   for split_name in final_splits:
     msg_parts = [
       f'{k}: {split_summary[split_name][k]["mean"]:.4f} +/- {split_summary[split_name][k]["std"]:.4f}'
@@ -368,7 +420,14 @@ def fixed_cv_train_eval(hparams, data_name=None):
     }, f, indent=2, ensure_ascii=False)
   logging.warning('Saved CV result summary to {}'.format(result_path))
 
-  return {'results': all_results, 'summary': summary, 'split_path': split_path, 'result_path': result_path}
+  return {
+    'results': all_results,
+    'summary': summary,
+    'split_summary': split_summary,
+    'final_eval_splits': list(final_splits),
+    'split_path': split_path,
+    'result_path': result_path,
+  }
 
 
 train_eval = fixed_cv_train_eval
@@ -380,7 +439,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
 
     - train_dataset：用于反向传播更新参数
     - eval_dataset：用于评估与 early stopping（val）
-    - writer：TensorBoard 记录器（可为 None）
+    - writer：保留旧接口兼容，当前训练流程不写可视化日志
     
     返回：
       (model, val_accs) 其中 model 会在结束前恢复到 val 最优权重。
@@ -396,9 +455,12 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
     patience = int(getattr(hparams, 'patience', 50))
     no_improve = 0
 
-    writer_batch_idx = list(range(10)) # 默认可视化前10个图
     log_interval = 10
-    train_eval_interval = int(getattr(hparams, 'train_eval_interval', 10))
+    train_eval_interval = int(getattr(hparams, 'train_eval_interval', log_interval))
+    enable_train_eval = bool(getattr(hparams, 'enable_train_eval_during_training', True))
+    train_eval_max_num_examples = getattr(hparams, 'train_eval_max_num_examples', 100)
+    if train_eval_max_num_examples is not None:
+      train_eval_max_num_examples = int(train_eval_max_num_examples)
     last_train_acc = None
 
     for epoch in range(hparams.epoch):
@@ -422,39 +484,29 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
         avg_loss += loss.item()
         num_batches += 1
 
-        if epoch % 10 == 0 and batch_idx == len(train_dataset) // 2 and writer is not None:
-          layer = getattr(model, 'gcn_hpool_layer', None)
-          assign_tensor = getattr(layer, 'pool_tensor', None)
-          if assign_tensor is not None:
-            bs = assign_tensor.size(0)
-            safe_idx = [i for i in writer_batch_idx if i < bs]
-            if len(safe_idx) > 0:
-              log_assignment(assign_tensor, writer, epoch, safe_idx)
-              log_graph(graph_data[g_key.adj_mat], graph_data[g_key.node_num], writer, epoch, safe_idx, assign_tensor)
-
       if num_batches == 0:
         raise RuntimeError('Training dataset is empty.')
       avg_loss /= num_batches
-      if writer is not None:
-        writer.add_scalar('loss/avg_loss', avg_loss, epoch)
 
       # 训练集评估
-      should_eval_train = train_eval_interval > 0 and epoch % train_eval_interval == 0
+      should_eval_train = (
+        enable_train_eval
+        and should_log_epoch
+        and train_eval_interval > 0
+        and epoch % train_eval_interval == 0
+      )
       if should_eval_train:
-        train_result = evaluate(train_dataset, model, hparams, max_num_examples=100)
+        train_result = evaluate(train_dataset, model, hparams, max_num_examples=train_eval_max_num_examples)
         last_train_acc = train_result['acc']
-        if writer is not None:
-          writer.add_scalar('acc/train_acc', last_train_acc, epoch)
 
       # 验证：用于早停与报告
       val_result = evaluate(eval_dataset, model, hparams)
       val_accs.append(val_result['acc'])
-      if writer is not None:
-        writer.add_scalar('acc/val_acc', val_result['acc'], epoch)
       if should_log_epoch:
+        train_acc_msg = '{:.4f}'.format(last_train_acc) if last_train_acc is not None else 'n/a'
         logging.info(
-          'Epoch {} => loss: {:.4f}, train acc: {:.4f}, val acc: {:.4f}'.format(
-            epoch, avg_loss, last_train_acc if last_train_acc is not None else float('nan'), val_result['acc']
+          'Epoch {} => loss: {:.4f}, train acc: {}, val acc: {:.4f}'.format(
+            epoch, avg_loss, train_acc_msg, val_result['acc']
           )
         )
         
@@ -491,83 +543,3 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
     }
 
 
-def log_assignment(assign_tensor, writer, epoch, batch_idx):
-  """
-  将 DiffPool 的 assignment 矩阵（每个子图：node->cluster 的软分配）可视化并写入 TensorBoard。
-
-  assign_tensor: shape 通常为 [batch_size, num_nodes, num_clusters]
-  batch_idx: 选取 batch 中要展示的子图索引列表
-  """
-  plt.switch_backend('agg')
-  fig = plt.figure(figsize=(8, 6), dpi=300)
-
-  # has to be smaller than args.batch_size
-  for i in range(len(batch_idx)):
-      plt.subplot(2, 2, i + 1)
-      plt.imshow(assign_tensor.cpu().detach().numpy()[batch_idx[i]], cmap=plt.get_cmap('BuPu'))
-      cbar = plt.colorbar()
-      cbar.solids.set_edgecolor("face")
-  plt.tight_layout()
-  fig.canvas.draw()
-  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
-  writer.add_image('assignment', data, epoch)
-
-
-def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None):
-  """
-  可视化原始子图结构与按 cluster 着色后的子图，并写入 TensorBoard。
-
-  - 第 1 张图：直接画子图的邻接结构（带节点标签）
-  - 第 2 张图：根据 assignment 的 argmax 得到 cluster label，对节点着色
-  """
-  plt.switch_backend('agg')
-  fig = plt.figure(figsize=(8, 6), dpi=300)
-
-  for i in range(len(batch_idx)):
-      ax = plt.subplot(2, 2, i + 1)
-      num_nodes = int(batch_num_nodes[batch_idx[i]].item()) if isinstance(batch_num_nodes, torch.Tensor) else int(batch_num_nodes[batch_idx[i]])
-      adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().detach().numpy()
-      G = nx.from_numpy_array(adj_matrix)
-      nx.draw(G, pos=nx.spring_layout(G), with_labels=True, node_color='#336699',
-              edge_color='grey', width=0.5, node_size=300,
-              alpha=0.7)
-      ax.xaxis.set_visible(False)
-
-  plt.tight_layout()
-  fig.canvas.draw()
-  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
-  writer.add_image('graphs', data, epoch)
-
-  assignment = assign_tensor.cpu().detach().numpy()
-  fig = plt.figure(figsize=(8, 6), dpi=300)
-
-  num_clusters = assignment.shape[2]
-  all_colors = np.array(range(num_clusters))
-
-  for i in range(len(batch_idx)):
-      ax = plt.subplot(2, 2, i + 1)
-      num_nodes = int(batch_num_nodes[batch_idx[i]].item()) if isinstance(batch_num_nodes, torch.Tensor) else int(batch_num_nodes[batch_idx[i]])
-      adj_matrix = adj[batch_idx[i], :num_nodes, :num_nodes].cpu().detach().numpy()
-
-      label = np.argmax(assignment[batch_idx[i]], axis=1).astype(int)
-      label = label[: batch_num_nodes[batch_idx[i]]]
-      node_colors = all_colors[label]
-
-      G = nx.from_numpy_array(adj_matrix)
-      nx.draw(G, pos=nx.spring_layout(G), with_labels=False, node_color=node_colors,
-              edge_color='grey', width=0.4, node_size=50, cmap=plt.get_cmap('Set1'),
-              vmin=0, vmax=num_clusters - 1,
-              alpha=0.8)
-
-  plt.tight_layout()
-  fig.canvas.draw()
-  data = _figure_to_image(fig) if _figure_to_image is not None else _mpl_figure_to_image(fig)
-  writer.add_image('graphs_colored', data, epoch)
-def _mpl_figure_to_image(fig):
-
-  import numpy as np
-  fig.canvas.draw()
-  w, h = fig.canvas.get_width_height()
-  buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-  img = buf.reshape(h, w, 3)
-  return img.transpose(2, 0, 1)

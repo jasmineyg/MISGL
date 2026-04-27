@@ -53,15 +53,27 @@ class MILBranchB(nn.Module):
             raise ValueError('scores and batch must have the same first dimension.')
 
         batch = batch.long()
-        weights = torch.zeros_like(scores)
         bag_count = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
-        for bag_idx in range(bag_count):
-            node_mask = batch == bag_idx
-            if not torch.any(node_mask):
-                continue
-            bag_scores = scores[node_mask] / tau
-            bag_weights = torch.softmax(bag_scores, dim=0)
-            weights[node_mask] = bag_weights
+        if bag_count == 0:
+            return torch.zeros_like(scores)
+
+        scaled_scores = scores / tau
+        max_per_bag = scores.new_full((bag_count,), -torch.inf)
+        if not hasattr(max_per_bag, 'scatter_reduce_'):
+            weights = torch.zeros_like(scores)
+            for bag_idx in range(bag_count):
+                node_mask = batch == bag_idx
+                if not torch.any(node_mask):
+                    continue
+                weights[node_mask] = torch.softmax(scaled_scores[node_mask], dim=0)
+            return weights.clamp(1e-6, 1.0 - 1e-6).clamp_min(eps)
+
+        max_per_bag.scatter_reduce_(0, batch, scaled_scores, reduce='amax', include_self=True)
+
+        exp_scores = torch.exp(scaled_scores - max_per_bag[batch])
+        sum_per_bag = scores.new_zeros((bag_count,))
+        sum_per_bag.scatter_add_(0, batch, exp_scores)
+        weights = exp_scores / sum_per_bag[batch].clamp_min(eps)
         return weights.clamp(1e-6, 1.0 - 1e-6).clamp_min(eps)
 
     def _pad_attention(self, attention, batch):
@@ -83,7 +95,7 @@ class MILBranchB(nn.Module):
 
         return a_pad, mask_valid
 
-    def forward(self, h, batch, eps=None, y=None, k=5):
+    def forward(self, h, batch, eps=None, y=None, k=5, return_padded_attention=False):
         del y, k
         if h.dim() != 2:
             raise ValueError(f'Expected h to have shape [N, D], got {tuple(h.shape)}')
@@ -106,10 +118,12 @@ class MILBranchB(nn.Module):
         z_B = h.new_zeros((bag_count, h.size(1)))
         z_B.index_add_(0, batch, weighted_nodes)
 
-        a_pad, mask_valid = self._pad_attention(attention, batch)
-        return {
+        output = {
             'z_B': z_B,
             'a': attention,
-            'a_pad': a_pad,
-            'mask_valid': mask_valid,
         }
+        if return_padded_attention:
+            a_pad, mask_valid = self._pad_attention(attention, batch)
+            output['a_pad'] = a_pad
+            output['mask_valid'] = mask_valid
+        return output

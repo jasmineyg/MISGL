@@ -4,7 +4,7 @@ preload_data_to_gpu: false
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['ogbn_products_light'] #'cs', 'eng', 'phy', 'chem', 'med', 'ogbn_arxiv'
+data_name_set: ['reddit'] #'cs', 'eng', 'phy', 'chem', 'med', 'ogbn_arxiv', 'ogbn_products_light'
 timestamp: gat
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -32,9 +32,9 @@ coarse_graph_topk: 16
 enable_gat_export: false
 enable_tensorboard: false
 train_eval_interval: 10
-final_eval_splits: ['test']
-export_attention: true
-analyze_attention: true
+final_eval_splits: ['train', 'val', 'test']
+export_attention: false
+analyze_attention: false
 attention_sample_frac: 0.1
 attention_top_k: 20
 attention_export_train: false

@@ -546,7 +546,7 @@ def _map_subgraph_nodes_to_labels(subgraph, node_binary_labels, n_i):
 
 def main():
     parser = argparse.ArgumentParser(description='Export Branch B attention (a) to Excel.')
-    parser.add_argument('--hparam_path', type=str, default='./config/hparams_testdb.yml',
+    parser.add_argument('--hparam_path', type=str, default='./config/b_on.yml',
                         help='配置文件路径（.yml）。')
     parser.add_argument('--seed', type=int, default=None,
                         help='Holdout 随机种子（默认取配置中的第一个 holdout_seeds 或 cv_seed）。')

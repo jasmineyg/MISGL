@@ -99,7 +99,14 @@ class MISGLEncoder(nn.Module):
 
         if self.use_branch_b:
             h_flat, batch_index = self._flatten_valid_nodes(h, batch_num_nodes)
-            branch_b_out = self.branch_b_head(h_flat, batch_index) if h_flat.size(0) > 0 else None
+            branch_b_out = (
+                self.branch_b_head(
+                    h_flat,
+                    batch_index,
+                    return_padded_attention=return_embeddings,
+                )
+                if h_flat.size(0) > 0 else None
+            )
             if branch_b_out is not None:
                 classifier_input = branch_b_out['z_B']
 
@@ -131,29 +138,20 @@ class MISGLEncoder(nn.Module):
 
     def _flatten_valid_nodes(self, node_embeddings, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):
-            num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+            lengths = batch_num_nodes.to(device=node_embeddings.device, dtype=torch.long).view(-1)
         else:
-            num_list = [int(n) for n in batch_num_nodes]
-
-        chunks = []
-        batch_chunks = []
-        for bag_idx, num_nodes in enumerate(num_list):
-            if num_nodes <= 0:
-                continue
-            chunks.append(node_embeddings[bag_idx, :num_nodes, :])
-            batch_chunks.append(
-                torch.full(
-                    (num_nodes,),
-                    bag_idx,
-                    dtype=torch.long,
-                    device=node_embeddings.device,
-                )
+            lengths = torch.tensor(
+                [int(n) for n in batch_num_nodes],
+                dtype=torch.long,
+                device=node_embeddings.device,
             )
 
-        if chunks:
-            return torch.cat(chunks, dim=0), torch.cat(batch_chunks, dim=0)
+        batch_size, max_nodes, hidden_dim = node_embeddings.size()
+        valid_mask = torch.arange(max_nodes, device=node_embeddings.device).unsqueeze(0) < lengths.unsqueeze(1)
+        if torch.any(valid_mask):
+            batch_index = torch.arange(batch_size, device=node_embeddings.device).repeat_interleave(lengths.clamp_min(0))
+            return node_embeddings[valid_mask], batch_index
 
-        hidden_dim = node_embeddings.size(-1)
         return (
             node_embeddings.new_zeros((0, hidden_dim)),
             torch.zeros((0,), dtype=torch.long, device=node_embeddings.device),
@@ -175,13 +173,13 @@ class MISGLEncoder(nn.Module):
     def construct_mask(self, max_nodes, batch_num_nodes, device=None):
         mask_device = self._device if device is None else device
         if isinstance(batch_num_nodes, torch.Tensor):
-            num_list = [int(n) for n in batch_num_nodes.detach().cpu().tolist()]
+            lengths = batch_num_nodes.to(device=mask_device, dtype=torch.long).view(-1)
         else:
-            num_list = [int(n) for n in batch_num_nodes]
+            lengths = torch.tensor(
+                [int(n) for n in batch_num_nodes],
+                dtype=torch.long,
+                device=mask_device,
+            )
 
-        batch_size = len(num_list)
-        out_tensor = torch.zeros(batch_size, max_nodes, device=mask_device)
-        for i, n in enumerate(num_list):
-            out_tensor[i, :n] = 1.0
-        return out_tensor.unsqueeze(2)
-
+        mask = torch.arange(max_nodes, device=mask_device).unsqueeze(0) < lengths.unsqueeze(1)
+        return mask.to(dtype=torch.float32).unsqueeze(2)

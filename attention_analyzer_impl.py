@@ -38,6 +38,18 @@ def _safe_divide(numerator, denominator):
     return float(numerator) / float(denominator)
 
 
+def _attention_ranking_auc(weights, node_labels):
+    pos_weights = weights[node_labels == 1]
+    neg_weights = weights[node_labels == 0]
+    if len(pos_weights) == 0 or len(neg_weights) == 0:
+        return None
+
+    diff = pos_weights[:, None] - neg_weights[None, :]
+    wins = diff > 0
+    ties = np.isclose(diff, 0.0)
+    return float(np.mean(wins + 0.5 * ties))
+
+
 def _write_summary_sheet(writer, stats):
     try:
         overall_bag_accuracy = _safe_divide(
@@ -337,13 +349,12 @@ def export_lightweight_attention_from_model(
     sample_seed=None,
     top_k=20,
 ):
-    """Export compact attention analysis: summary + per-graph metrics + top-k nodes."""
+    """Export compact attention analysis: summary + sampled per-graph metrics."""
     model.eval()
     device = torch.device(getattr(hparams, 'device', 'cpu'))
     export_loader = _build_export_loader(loader)
     total_graphs = len(export_loader.dataset)
     selected_positions = _resolve_sample_positions(total_graphs, float(sample_frac), sample_seed)
-    top_k = max(1, int(top_k))
 
     stats = {
         'evaluated_bag_count': 0,
@@ -360,12 +371,13 @@ def export_lightweight_attention_from_model(
         'top3_hit_sum': 0,
         'top5_hit_sum': 0,
         'pos_bag_for_hit': 0,
+        'ranking_auc_sum': 0.0,
+        'ranking_auc_count': 0,
         'wrong_bag_count': 0,
         'wrong_bag_pos_node_sum': 0,
         'wrong_bag_pos_node_max': 0,
     }
     per_graph_rows = []
-    top_node_rows = []
     attention_source = 'none'
 
     with torch.no_grad():
@@ -413,12 +425,14 @@ def export_lightweight_attention_from_model(
                 subgraph_id = subgraph_ids[idx]
                 pred = batch_preds[idx]
                 label = batch_labels[idx]
+                label_int = None if label is None else int(label)
                 weights = np.asarray(weights_list[idx], dtype=np.float64).reshape(-1)[:num_nodes]
-                raw_scores = None if score_list[idx] is None else np.asarray(score_list[idx], dtype=np.float64).reshape(-1)[:num_nodes]
                 node_labels = _resolve_node_binary_labels(dataset_raw, orig_idx, num_nodes)
                 pos_mask = node_labels == 1
                 neg_mask = node_labels == 0
                 pos_node_count = int(np.sum(pos_mask))
+                avg_pos_attention = float(np.mean(weights[pos_mask])) if pos_mask.any() else 0.0
+                avg_neg_attention = float(np.mean(weights[neg_mask])) if neg_mask.any() else 0.0
 
                 if pos_mask.any():
                     stats['pos_weight_sum'] += float(np.sum(weights[pos_mask]))
@@ -447,57 +461,37 @@ def export_lightweight_attention_from_model(
                         stats['wrong_bag_pos_node_max'] = max(stats['wrong_bag_pos_node_max'], pos_node_count)
 
                 order = np.argsort(-weights)
-                if label == 1:
+                top1_is_pos = 0
+                top3_is_pos = 0
+                top5_is_pos = 0
+                ranking_auc = None
+                if label_int == 1:
+                    top1_is_pos = int(np.any(node_labels[order[:1]] == 1))
+                    top3_is_pos = int(np.any(node_labels[order[:min(3, num_nodes)]] == 1))
+                    top5_is_pos = int(np.any(node_labels[order[:min(5, num_nodes)]] == 1))
                     stats['pos_bag_for_hit'] += 1
-                    stats['top1_hit_sum'] += int(np.any(node_labels[order[:1]] == 1))
-                    stats['top3_hit_sum'] += int(np.any(node_labels[order[:min(3, num_nodes)]] == 1))
-                    stats['top5_hit_sum'] += int(np.any(node_labels[order[:min(5, num_nodes)]] == 1))
+                    stats['top1_hit_sum'] += top1_is_pos
+                    stats['top3_hit_sum'] += top3_is_pos
+                    stats['top5_hit_sum'] += top5_is_pos
+                    ranking_auc = _attention_ranking_auc(weights, node_labels)
+                    if ranking_auc is not None:
+                        stats['ranking_auc_sum'] += ranking_auc
+                        stats['ranking_auc_count'] += 1
 
                 if current_pos in selected_positions:
-                    top_order = order[:min(top_k, num_nodes)]
-                    node_orig_ids = _resolve_node_orig_ids(dataset_raw, orig_idx, num_nodes)
-                    top1_is_pos = int(np.any(node_labels[order[:1]] == 1)) if int(label or 0) == 1 else None
-                    top3_is_pos = int(np.any(node_labels[order[:min(3, num_nodes)]] == 1)) if int(label or 0) == 1 else None
-                    top5_is_pos = int(np.any(node_labels[order[:min(5, num_nodes)]] == 1)) if int(label or 0) == 1 else None
                     per_graph_rows.append({
-                        'split': split_name,
-                        'global_pos': current_pos,
-                        'orig_graph_idx': orig_idx,
                         'subgraph_id': subgraph_id,
                         'y_true': label,
-                        'y_pred': pred,
                         'correct': None if is_correct is None else int(is_correct),
-                        'num_nodes': num_nodes,
                         'num_pos_nodes': pos_node_count,
-                        'max_attention': float(np.max(weights)),
-                        'mean_attention': float(np.mean(weights)),
                         'top1_hit_pos': top1_is_pos,
                         'top3_hit_pos': top3_is_pos,
                         'top5_hit_pos': top5_is_pos,
+                        'avg_pos_node_attention': avg_pos_attention if label_int == 1 else 0.0,
+                        'avg_neg_node_attention': avg_neg_attention if label_int == 1 else 0.0,
                     })
-                    for rank, node_pos in enumerate(top_order, start=1):
-                        top_node_rows.append({
-                            'split': split_name,
-                            'global_pos': current_pos,
-                            'orig_graph_idx': orig_idx,
-                            'subgraph_id': subgraph_id,
-                            'y_true': label,
-                            'y_pred': pred,
-                            'correct': None if is_correct is None else int(is_correct),
-                            'rank': rank,
-                            'node_pos_in_subgraph': int(node_pos),
-                            'original_node_id': int(node_orig_ids[node_pos]),
-                            'node_binary_label': int(node_labels[node_pos]),
-                            'attention': float(weights[node_pos]),
-                            'raw_score': None if raw_scores is None else float(raw_scores[node_pos]),
-                        })
 
     summary_rows = [
-        {'Metric': 'Attention Source', 'Value': attention_source},
-        {'Metric': 'Split', 'Value': split_name},
-        {'Metric': 'Total Graphs', 'Value': total_graphs},
-        {'Metric': 'Sampled Graphs Written', 'Value': len(per_graph_rows)},
-        {'Metric': 'Top K Nodes Per Sampled Graph', 'Value': top_k},
         {'Metric': 'Average Positive Node Attention', 'Value': _safe_divide(stats['pos_weight_sum'], stats['pos_weight_count'])},
         {'Metric': 'Average Negative Node Attention', 'Value': _safe_divide(stats['neg_weight_sum'], stats['neg_weight_count'])},
         {'Metric': 'Top-1 Hit Probability (Positive Bags)', 'Value': _safe_divide(stats['top1_hit_sum'], stats['pos_bag_for_hit'])},
@@ -506,24 +500,20 @@ def export_lightweight_attention_from_model(
         {'Metric': 'Overall Bag Accuracy', 'Value': _safe_divide(stats['correct_bag_count'], stats['evaluated_bag_count'])},
         {'Metric': 'Positive Bag Accuracy', 'Value': _safe_divide(stats['correct_pos_bag_count'], stats['evaluated_pos_bag_count'])},
         {'Metric': 'Negative Bag Accuracy', 'Value': _safe_divide(stats['correct_neg_bag_count'], stats['evaluated_neg_bag_count'])},
-        {'Metric': 'Wrong Bag Count', 'Value': stats['wrong_bag_count']},
-        {'Metric': 'Average Positive Nodes In Wrong Bags', 'Value': _safe_divide(stats['wrong_bag_pos_node_sum'], stats['wrong_bag_count'])},
-        {'Metric': 'Max Positive Nodes In Wrong Bags', 'Value': stats['wrong_bag_pos_node_max']},
+        {'Metric': 'Average Ranking AUC (Positive Bags)', 'Value': _safe_divide(stats['ranking_auc_sum'], stats['ranking_auc_count'])},
     ]
 
     _ensure_parent_dir(output_path)
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
         pd.DataFrame(per_graph_rows).to_excel(writer, sheet_name='PerGraph', index=False)
-        pd.DataFrame(top_node_rows).to_excel(writer, sheet_name='TopNodes', index=False)
 
     logging.info(
-        'Exported lightweight attention for %s split to %s (sampled %d / %d graphs, top_k=%d).',
+        'Exported lightweight attention for %s split to %s (sampled %d / %d graphs).',
         split_name,
         output_path,
         len(per_graph_rows),
         total_graphs,
-        top_k,
     )
     return output_path
 
@@ -680,11 +670,12 @@ def export_branchB_attention_from_model(
     if dataset_raw is not None and dataset_raw.get('node_binary_labels', None) is None:
         logging.warning("node_binary_labels is missing in dataset_raw; exporting zero labels as fallback.")
 
-    _export_branchB_attention(
-        model=model,
-        loader=loader,
-        dataset_raw=dataset_raw,
-        output_path=output_path,
+    return export_lightweight_attention_from_model(
+        model,
+        loader,
+        hparams,
+        dataset_raw,
+        output_path,
         sample_frac=sample_frac,
         split_name=split_name,
         sample_seed=sample_seed,

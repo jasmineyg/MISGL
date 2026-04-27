@@ -3,7 +3,7 @@ cuda_visible_devices: '1'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['ogbn_products_light']
+data_name_set: ['reddit']
 timestamp: gat_b
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -31,9 +31,9 @@ coarse_graph_topk: 16
 enable_gat_export: false
 enable_tensorboard: false
 train_eval_interval: 10
-final_eval_splits: ['test']
+final_eval_splits: ['train', 'val', 'test']
 export_attention: true
 analyze_attention: true
 attention_sample_frac: 0.1
 attention_top_k: 20
-attention_export_train: false
+attention_export_train: true
