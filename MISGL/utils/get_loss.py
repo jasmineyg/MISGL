@@ -17,7 +17,6 @@ def bce_from_probs(probs, targets):
     targets = targets.view(-1).float()
     return -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs)).mean()
 
-
 def fused_loss(model_output, targets, epoch, hparams):
     if isinstance(model_output, dict) and 'ypred_A' in model_output:
         logits_A = model_output['ypred_A']

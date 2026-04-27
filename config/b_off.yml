@@ -4,11 +4,11 @@ preload_data_to_gpu: false
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['reddit'] #'cs', 'eng', 'phy', 'chem', 'med', 'ogbn_arxiv', 'ogbn_products_light'
+data_name_set: ['flickr'] #'cs', 'eng', 'phy', 'chem', 'med', 'ogbn_arxiv', 'ogbn_products_light','flickr'
 timestamp: gat
 channel_list: [6805, 256, 128, 64, 1]
 
-batch_size: 128
+batch_size: 64
 epoch: 200
 learning_rate: 0.001
 dropout: 0.5

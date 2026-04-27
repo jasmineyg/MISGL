@@ -3,11 +3,11 @@ cuda_visible_devices: '1'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['reddit']
+data_name_set: ['flickr']
 timestamp: gat_b
 channel_list: [6805, 256, 128, 64, 1]
 
-batch_size: 128
+batch_size: 64
 epoch: 200
 learning_rate: 0.001
 dropout: 0.5

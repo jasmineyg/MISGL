@@ -17,7 +17,9 @@ class ResidualGATLayer(Module):
     self.residual = residual
     per_head = out_dim if not concat else max(1, out_dim // heads)
     self.w = Parameter(torch.empty(heads, in_dim, per_head))
-    self.score_mlp = torch.nn.Linear(in_dim, 1)
+    self.attn_src = Parameter(torch.empty(heads, per_head))
+    self.attn_dst = Parameter(torch.empty(heads, per_head))
+    self.leaky_relu = torch.nn.LeakyReLU(alpha)
     self.attn_drop = torch.nn.Dropout(attn_dropout)
     self.feat_drop = torch.nn.Dropout(feat_dropout)
     need_proj = residual and (in_dim != (per_head if not concat else heads * per_head))
@@ -29,12 +31,11 @@ class ResidualGATLayer(Module):
     self.reset_parameters()
 
   def reset_parameters(self):
-    gain = torch.nn.init.calculate_gain('relu')
+    gain = torch.nn.init.calculate_gain('leaky_relu', self.alpha)
     for h in range(self.heads):
       torch.nn.init.xavier_uniform_(self.w[h], gain=gain)
-    torch.nn.init.xavier_uniform_(self.score_mlp.weight, gain=gain)
-    if self.score_mlp.bias is not None:
-      torch.nn.init.constant_(self.score_mlp.bias, 0.0)
+    torch.nn.init.xavier_uniform_(self.attn_src, gain=gain)
+    torch.nn.init.xavier_uniform_(self.attn_dst, gain=gain)
     if self.res_proj is not None:
       torch.nn.init.xavier_uniform_(self.res_proj.weight, gain=gain)
       if self.res_proj.bias is not None:
@@ -45,21 +46,25 @@ class ResidualGATLayer(Module):
         torch.nn.init.constant_(self.out_proj.bias, 0.0)
 
   def forward(self, x, adj, mask=None):
-    device = getattr(self._hparams, 'device', x.device) if self._hparams is not None else x.device
+    device = x.device
     x = self.feat_drop(x)
     B, N, Fin = x.size()
     Wh = torch.einsum('bni,hio->bhno', x, self.w)
-    scores = self.score_mlp(x).squeeze(-1)
-    eye = torch.eye(N, device=device).unsqueeze(0).expand(B, N, N)
+    src_scores = (Wh * self.attn_src.view(1, self.heads, 1, -1)).sum(dim=-1)
+    dst_scores = (Wh * self.attn_dst.view(1, self.heads, 1, -1)).sum(dim=-1)
+    e = self.leaky_relu(src_scores.unsqueeze(3) + dst_scores.unsqueeze(2))
+    eye = torch.eye(N, device=device, dtype=adj.dtype).unsqueeze(0).expand(B, N, N)
     adj_eff = adj + eye
-    e = scores.unsqueeze(1).unsqueeze(2).expand(B, self.heads, N, N)
-    e = e.masked_fill(adj_eff.unsqueeze(1) == 0, float('-inf'))
+    attn_mask = adj_eff != 0
+    score_summary = (e * attn_mask.unsqueeze(1).to(dtype=e.dtype)).sum(dim=(1, 2))
+    score_summary = score_summary / (attn_mask.sum(dim=1).clamp_min(1).to(dtype=e.dtype) * self.heads)
+    e = e.masked_fill(attn_mask.unsqueeze(1) == 0, float('-inf'))
     alpha = torch.softmax(e, dim=3)
     alpha_summary = alpha.mean(dim=(1, 2))
     if mask is not None:
       alpha_summary = alpha_summary * mask.squeeze(-1)
     self.last_attention_summary = alpha_summary.detach()
-    self.last_attention_scores = scores.detach()
+    self.last_attention_scores = score_summary.detach()
     alpha = self.attn_drop(alpha)
     z = torch.einsum('bhij,bhjo->bhio', alpha, Wh)
     if self.concat:
