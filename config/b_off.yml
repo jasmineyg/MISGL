@@ -1,5 +1,13 @@
 device: 'cuda'
 cuda_visible_devices: '0'
+auto_select_gpu: false
+gpu_candidate_devices: null
+gpu_memory_used_max_mb: 1024
+gpu_utilization_max_pct: 10
+gpu_select_wait_seconds: 0
+gpu_select_poll_interval: 30
+gpu_lock_idle_card: true
+gpu_lock_dir: '/tmp/misgl_gpu_locks'
 preload_data_to_gpu: false
 
 model_save_path: 'results'

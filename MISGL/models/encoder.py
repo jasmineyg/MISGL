@@ -59,12 +59,26 @@ class MISGLEncoder(nn.Module):
         if self.use_branch_b:
             bb_attn_hidden = int(bb_cfg.get('attn_hidden', 128))
             bb_gate_hidden = int(bb_cfg.get('gate_hidden', bb_attn_hidden))
+            self.branch_b_use_structural_features = bool(
+                bb_cfg.get('use_structural_features', bb_cfg.get('structural_features', False))
+            )
+            self.branch_b_structure_undirected = bool(bb_cfg.get('structural_undirected', True))
+            self.branch_b_structural_feature_names = (
+                'degree_norm',
+                'log_degree_norm',
+                'avg_neighbor_degree_norm',
+                '2_hop_walk_log_norm',
+            ) if self.branch_b_use_structural_features else ()
             self.branch_b_head = MILBranchB(
                 node_dim=hidden_dim,
                 attn_hidden=bb_attn_hidden,
                 gate_hidden=bb_gate_hidden,
+                structural_dim=len(self.branch_b_structural_feature_names),
             )
         else:
+            self.branch_b_use_structural_features = False
+            self.branch_b_structure_undirected = True
+            self.branch_b_structural_feature_names = ()
             self.branch_b_head = None
 
         self.reset_parameters()
@@ -99,11 +113,20 @@ class MISGLEncoder(nn.Module):
 
         if self.use_branch_b:
             h_flat, batch_index = self._flatten_valid_nodes(h, batch_num_nodes)
+            structural_flat = None
+            if self.branch_b_use_structural_features:
+                structural_features = self._compute_branch_b_structural_features(
+                    adj,
+                    batch_num_nodes,
+                    dtype=h.dtype,
+                )
+                structural_flat, _ = self._flatten_valid_nodes(structural_features, batch_num_nodes)
             branch_b_out = (
                 self.branch_b_head(
                     h_flat,
                     batch_index,
                     return_padded_attention=return_embeddings,
+                    structural_features=structural_flat,
                 )
                 if h_flat.size(0) > 0 else None
             )
@@ -135,6 +158,51 @@ class MISGLEncoder(nn.Module):
         if branch_b_out is not None:
             emb['z_B'] = branch_b_out['z_B']
         return model_out, emb
+
+    def _compute_branch_b_structural_features(self, adj, batch_num_nodes, dtype=None):
+        if adj.dim() != 3:
+            raise ValueError(f'Expected adj to have shape [B, N, N], got {tuple(adj.shape)}')
+
+        batch_size, max_nodes, _ = adj.size()
+        device = adj.device
+        out_dtype = dtype if dtype is not None else torch.float32
+        lengths = self._lengths_tensor(batch_num_nodes, device=device)
+        valid_mask = torch.arange(max_nodes, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        valid_pair_mask = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
+
+        adj_bool = adj != 0
+        if self.branch_b_structure_undirected:
+            adj_bool = adj_bool | (adj.transpose(1, 2) != 0)
+        eye = torch.eye(max_nodes, device=device, dtype=torch.bool).unsqueeze(0)
+        adj_bool = adj_bool & valid_pair_mask & (~eye)
+        adj_float = adj_bool.to(dtype=out_dtype)
+
+        graph_size = lengths.to(dtype=out_dtype).clamp_min(1.0)
+        max_degree = (graph_size - 1.0).clamp_min(1.0)
+        degree = adj_float.sum(dim=-1)
+        degree_norm = degree / max_degree.view(batch_size, 1)
+        log_degree_norm = torch.log1p(degree) / torch.log1p(max_degree).view(batch_size, 1)
+
+        neighbor_degree_sum = torch.bmm(adj_float, degree.unsqueeze(-1)).squeeze(-1)
+        avg_neighbor_degree = neighbor_degree_sum / degree.clamp_min(1.0)
+        avg_neighbor_degree_norm = avg_neighbor_degree / max_degree.view(batch_size, 1)
+
+        two_hop_walk_count = neighbor_degree_sum
+        two_hop_denom = torch.pow(max_degree, 2).clamp_min(1.0)
+        two_hop_walk_log_norm = (
+            torch.log1p(two_hop_walk_count) / torch.log1p(two_hop_denom).view(batch_size, 1)
+        )
+
+        structural_features = torch.stack(
+            [
+                degree_norm,
+                log_degree_norm,
+                avg_neighbor_degree_norm,
+                two_hop_walk_log_norm,
+            ],
+            dim=-1,
+        )
+        return structural_features * valid_mask.unsqueeze(-1).to(dtype=out_dtype)
 
     def _flatten_valid_nodes(self, node_embeddings, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):
@@ -183,3 +251,12 @@ class MISGLEncoder(nn.Module):
 
         mask = torch.arange(max_nodes, device=mask_device).unsqueeze(0) < lengths.unsqueeze(1)
         return mask.to(dtype=torch.float32).unsqueeze(2)
+
+    def _lengths_tensor(self, batch_num_nodes, device):
+        if isinstance(batch_num_nodes, torch.Tensor):
+            return batch_num_nodes.to(device=device, dtype=torch.long).view(-1)
+        return torch.tensor(
+            [int(n) for n in batch_num_nodes],
+            dtype=torch.long,
+            device=device,
+        )

@@ -35,11 +35,14 @@ class MILBranchB(nn.Module):
         mlp_ratio=2.0,
         dropout=0.1,
         attn_dropout=0.0,
+        structural_dim=0,
     ):
         del num_classes, num_layers, num_heads, mlp_ratio, dropout, attn_dropout
         super().__init__()
+        self.node_dim = int(node_dim)
+        self.structural_dim = int(structural_dim)
         self.scorer = _GatedAttentionScorer(
-            in_dim=node_dim,
+            in_dim=self.node_dim + self.structural_dim,
             attn_hidden=attn_hidden,
             gate_hidden=gate_hidden,
         )
@@ -95,7 +98,16 @@ class MILBranchB(nn.Module):
 
         return a_pad, mask_valid
 
-    def forward(self, h, batch, eps=None, y=None, k=5, return_padded_attention=False):
+    def forward(
+        self,
+        h,
+        batch,
+        eps=None,
+        y=None,
+        k=5,
+        return_padded_attention=False,
+        structural_features=None,
+    ):
         del y, k
         if h.dim() != 2:
             raise ValueError(f'Expected h to have shape [N, D], got {tuple(h.shape)}')
@@ -110,7 +122,23 @@ class MILBranchB(nn.Module):
             eps = 1e-9
 
         batch = batch.long()
-        scores = self.scorer(h).clamp(min=-12.0, max=12.0)
+        score_input = h
+        if self.structural_dim > 0:
+            if structural_features is None:
+                raise ValueError('structural_features is required when structural_dim > 0.')
+            if structural_features.dim() != 2:
+                raise ValueError(
+                    f'Expected structural_features to have shape [N, G], got {tuple(structural_features.shape)}'
+                )
+            if structural_features.size(0) != h.size(0):
+                raise ValueError('structural_features and h must have the same first dimension.')
+            if structural_features.size(1) != self.structural_dim:
+                raise ValueError(
+                    f'Expected structural_features dim {self.structural_dim}, got {structural_features.size(1)}.'
+                )
+            score_input = torch.cat([h, structural_features.to(device=h.device, dtype=h.dtype)], dim=-1)
+
+        scores = self.scorer(score_input).clamp(min=-12.0, max=12.0)
         attention = self.graph_softmax(scores, batch, tau=1.0, eps=eps)
 
         weighted_nodes = attention.unsqueeze(-1) * h
