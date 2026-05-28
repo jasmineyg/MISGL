@@ -68,6 +68,9 @@ class MISGLEncoder(nn.Module):
                 'log_degree_norm',
                 'avg_neighbor_degree_norm',
                 '2_hop_walk_log_norm',
+                'triangle_count_log_norm',
+                'clustering_coeff',
+                'core_number_norm',
             ) if self.branch_b_use_structural_features else ()
             self.branch_b_head = MILBranchB(
                 node_dim=hidden_dim,
@@ -193,16 +196,66 @@ class MISGLEncoder(nn.Module):
             torch.log1p(two_hop_walk_count) / torch.log1p(two_hop_denom).view(batch_size, 1)
         )
 
+        two_path_count = torch.bmm(adj_float, adj_float)
+        closed_wedge_count = (two_path_count * adj_float).sum(dim=-1)
+        triangle_count = closed_wedge_count / 2.0
+        max_triangle_count = (max_degree * (max_degree - 1.0) / 2.0).clamp_min(1.0)
+        triangle_count_log_norm = (
+            torch.log1p(triangle_count) / torch.log1p(max_triangle_count).view(batch_size, 1)
+        )
+
+        possible_wedge_count = degree * (degree - 1.0)
+        clustering_coeff = torch.where(
+            possible_wedge_count > 0,
+            closed_wedge_count / possible_wedge_count.clamp_min(1.0),
+            torch.zeros_like(degree),
+        )
+
+        core_number_norm = self._compute_core_number_norm(adj_float, lengths, max_degree)
+
         structural_features = torch.stack(
             [
                 degree_norm,
                 log_degree_norm,
                 avg_neighbor_degree_norm,
                 two_hop_walk_log_norm,
+                triangle_count_log_norm,
+                clustering_coeff,
+                core_number_norm,
             ],
             dim=-1,
         )
         return structural_features * valid_mask.unsqueeze(-1).to(dtype=out_dtype)
+
+    def _compute_core_number_norm(self, adj_float, lengths, max_degree):
+        batch_size, max_nodes, _ = adj_float.size()
+        device = adj_float.device
+        out_dtype = adj_float.dtype
+        core_number = adj_float.new_zeros((batch_size, max_nodes))
+
+        for graph_idx in range(batch_size):
+            num_nodes = int(lengths[graph_idx].item())
+            if num_nodes <= 0:
+                continue
+
+            local_adj = adj_float[graph_idx, :num_nodes, :num_nodes]
+            remaining = torch.ones(num_nodes, dtype=torch.bool, device=device)
+            working_degree = local_adj.sum(dim=-1)
+            local_core = working_degree.new_zeros((num_nodes,))
+            running_core = working_degree.new_tensor(0.0)
+
+            for _ in range(num_nodes):
+                masked_degree = working_degree.masked_fill(~remaining, float('inf'))
+                node_idx = torch.argmin(masked_degree)
+                node_degree = masked_degree[node_idx]
+                running_core = torch.maximum(running_core, node_degree)
+                local_core[node_idx] = running_core
+                remaining[node_idx] = False
+                working_degree = (working_degree - local_adj[:, node_idx]).clamp_min(0.0)
+
+            core_number[graph_idx, :num_nodes] = local_core
+
+        return core_number / max_degree.view(batch_size, 1)
 
     def _flatten_valid_nodes(self, node_embeddings, batch_num_nodes):
         if isinstance(batch_num_nodes, torch.Tensor):
