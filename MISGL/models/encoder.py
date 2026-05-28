@@ -118,11 +118,14 @@ class MISGLEncoder(nn.Module):
             h_flat, batch_index = self._flatten_valid_nodes(h, batch_num_nodes)
             structural_flat = None
             if self.branch_b_use_structural_features:
-                structural_features = self._compute_branch_b_structural_features(
-                    adj,
-                    batch_num_nodes,
-                    dtype=h.dtype,
-                )
+                if g_key.structural_features in graph_input:
+                    structural_features = graph_input[g_key.structural_features].to(device=h.device, dtype=h.dtype)
+                else:
+                    structural_features = self._compute_branch_b_structural_features(
+                        adj,
+                        batch_num_nodes,
+                        dtype=h.dtype,
+                    )
                 structural_flat, _ = self._flatten_valid_nodes(structural_features, batch_num_nodes)
             branch_b_out = (
                 self.branch_b_head(

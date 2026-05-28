@@ -25,6 +25,12 @@ class GraphDataset(Dataset):
     preload_to_gpu = bool(getattr(self._hparams, 'preload_data_to_gpu', True))
     target_device = self._hparams.device if preload_to_gpu else 'cpu'
     self._device = torch.device(target_device)
+    bb_cfg = getattr(self._hparams, 'branch_b', None)
+    self._use_structural_features = bool(
+      bb_cfg and bb_cfg.get('use', False) and bb_cfg.get('use_structural_features', bb_cfg.get('structural_features', False))
+    )
+    self._structure_undirected = bool(bb_cfg.get('structural_undirected', True)) if bb_cfg else True
+    self._structural_feature_dim = 7
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -48,6 +54,11 @@ class GraphDataset(Dataset):
       graph_tmp_dict[g_key.node_num] = torch.tensor(num_nodes, dtype=torch.int16).to(self._device)
       graph_tmp_dict[g_key.adj_mat] = torch.zeros(self._hparams.max_num_nodes, self._hparams.max_num_nodes).to(self._device)
       graph_tmp_dict[g_key.adj_mat][:num_nodes, :num_nodes] = torch.tensor(adj, dtype=torch.float32).to(self._device)
+      if self._use_structural_features:
+        structural_features = np.zeros((self._hparams.max_num_nodes, self._structural_feature_dim), dtype=np.float32)
+        if num_nodes > 0:
+          structural_features[:num_nodes, :] = self._compute_structural_features_np(adj)
+        graph_tmp_dict[g_key.structural_features] = torch.tensor(structural_features, dtype=torch.float32).to(self._device)
       orig_idx = graph.graph.get('orig_idx', -1)
       try:
         orig_idx = int(orig_idx)
@@ -62,6 +73,76 @@ class GraphDataset(Dataset):
       graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
+
+  def _compute_structural_features_np(self, adj):
+    adj_bool = adj != 0
+    if self._structure_undirected:
+      adj_bool = np.logical_or(adj_bool, adj_bool.T)
+    np.fill_diagonal(adj_bool, False)
+    adj_float = adj_bool.astype(np.float32, copy=False)
+
+    num_nodes = adj_float.shape[0]
+    max_degree = max(float(num_nodes - 1), 1.0)
+    degree = adj_float.sum(axis=-1)
+    degree_norm = degree / max_degree
+    log_degree_norm = np.log1p(degree) / np.log1p(max_degree)
+
+    neighbor_degree_sum = adj_float @ degree
+    avg_neighbor_degree = neighbor_degree_sum / np.maximum(degree, 1.0)
+    avg_neighbor_degree_norm = avg_neighbor_degree / max_degree
+
+    two_hop_walk_count = neighbor_degree_sum
+    two_hop_denom = max(max_degree ** 2, 1.0)
+    two_hop_walk_log_norm = np.log1p(two_hop_walk_count) / np.log1p(two_hop_denom)
+
+    two_path_count = adj_float @ adj_float
+    closed_wedge_count = (two_path_count * adj_float).sum(axis=-1)
+    triangle_count = closed_wedge_count / 2.0
+    max_triangle_count = max(max_degree * (max_degree - 1.0) / 2.0, 1.0)
+    triangle_count_log_norm = np.log1p(triangle_count) / np.log1p(max_triangle_count)
+
+    possible_wedge_count = degree * (degree - 1.0)
+    clustering_coeff = np.divide(
+      closed_wedge_count,
+      np.maximum(possible_wedge_count, 1.0),
+      out=np.zeros_like(degree),
+      where=possible_wedge_count > 0,
+    )
+
+    core_number_norm = self._compute_core_number_norm_np(adj_float, max_degree)
+    return np.stack(
+      [
+        degree_norm,
+        log_degree_norm,
+        avg_neighbor_degree_norm,
+        two_hop_walk_log_norm,
+        triangle_count_log_norm,
+        clustering_coeff,
+        core_number_norm,
+      ],
+      axis=-1,
+    ).astype(np.float32, copy=False)
+
+  @staticmethod
+  def _compute_core_number_norm_np(adj_float, max_degree):
+    num_nodes = adj_float.shape[0]
+    if num_nodes == 0:
+      return np.zeros((0,), dtype=np.float32)
+
+    remaining = np.ones(num_nodes, dtype=bool)
+    working_degree = adj_float.sum(axis=-1).astype(np.float32, copy=True)
+    local_core = np.zeros((num_nodes,), dtype=np.float32)
+    running_core = 0.0
+
+    for _ in range(num_nodes):
+      masked_degree = np.where(remaining, working_degree, np.inf)
+      node_idx = int(np.argmin(masked_degree))
+      running_core = max(running_core, float(masked_degree[node_idx]))
+      local_core[node_idx] = running_core
+      remaining[node_idx] = False
+      working_degree = np.maximum(working_degree - adj_float[:, node_idx], 0.0)
+
+    return local_core / max_degree
 
   def __len__(self):
     return len(self.processed_graph_list)
