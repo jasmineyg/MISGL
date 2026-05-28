@@ -11,14 +11,18 @@ gpu_lock_dir: '/tmp/misgl_gpu_locks'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['ogbn_arxiv','reddit']
-timestamp: gat_b_stru
+data_name_set: ['ogbn_products']
+timestamp: gat_b_stru7
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
 epoch: 200
 learning_rate: 0.001
 dropout: 0.5
+weight_decay: 0.0
+label_smoothing: 0.0
+early_stop_min_delta: 0.0
+early_stop_loss_delta: 0.0001
 patience: 30
 grad_clip: 2
 
@@ -34,6 +38,18 @@ branch_b:
   gate_hidden: 64
   use_structural_features: true
   structural_undirected: true
+
+dataset_overrides:
+  reddit:
+    dropout: 0.6
+    gat_attn_dropout: 0.6
+    gat_feat_dropout: 0.6
+    weight_decay: 0.0003
+    label_smoothing: 0.03
+    patience: 20
+    branch_b:
+      attn_hidden: 96
+      gate_hidden: 64
 
 use_coarse_graph: false
 coarse_graph_topk: 16

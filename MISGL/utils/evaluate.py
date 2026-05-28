@@ -3,13 +3,16 @@
 import torch
 import numpy as np
 import sklearn.metrics as metrics
+import torch.nn.functional as F
 
 from MISGL.utils.global_variables import *
 
 
-def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
+def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", include_loss=False, loss_epoch=0):
     model.eval()
     preds, labels = [], []
+    loss_sum = 0.0
+    loss_count = 0
     device = torch.device(hparams.device)
 
     def _needs_device_move(value):
@@ -28,7 +31,6 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
             }
             
             out = model(batch)
-            
             # 只使用分支A的分类头输出，不做融合
             if isinstance(out, dict) and 'ypred_A' in out:
                 logits_A = out['ypred_A']  # [B] 或 [B,1]
@@ -40,6 +42,13 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
             else:
                 logits_A = out  # [B] 或 [B,1]
                 p = torch.sigmoid(logits_A).view(-1)  # [B]
+
+            if include_loss and isinstance(logits_A, torch.Tensor):
+                batch_targets = batch[g_key.y].view(-1).float()
+                batch_loss = F.binary_cross_entropy_with_logits(logits_A.view(-1), batch_targets)
+                batch_size = int(batch_targets.size(0))
+                loss_sum += float(batch_loss.item()) * batch_size
+                loss_count += batch_size
 
             pred = (p > 0.5).long().cpu().numpy()
             y = batch[g_key.y].view(-1).cpu().numpy()
@@ -60,6 +69,8 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name=""):
         'acc': metrics.accuracy_score(labels, preds),
         'F1': metrics.f1_score(labels, preds, average='binary', zero_division=0)
     }
+    if include_loss:
+        result['loss'] = loss_sum / max(loss_count, 1)
     
     # 添加数据集名称标识
     prefix = f"[{dataset_name}]" if dataset_name else ""

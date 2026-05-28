@@ -63,6 +63,61 @@ def _arg_or_hparam(args, hparams, name, default=None):
   return getattr(hparams, name, default)
 
 
+def _merge_mapping(base, override):
+  merged = dict(base)
+  for key, value in override.items():
+    if isinstance(value, dict) and isinstance(merged.get(key), dict):
+      merged[key] = _merge_mapping(merged[key], value)
+    else:
+      merged[key] = value
+  return merged
+
+
+def _refresh_hparam_type(hparams, name, value):
+  if isinstance(value, (list, tuple)):
+    if not value:
+      raise ValueError('Multi-valued hyperparameters cannot be empty: %s' % name)
+    hparams._hparam_types[name] = (type(value[0]), True)
+  else:
+    hparams._hparam_types[name] = (type(value), False)
+
+
+def _set_or_add_hparam(hparams, name, value):
+  if name in hparams:
+    setattr(hparams, name, value)
+    _refresh_hparam_type(hparams, name, value)
+  else:
+    hparams.add_hparam(name, value)
+
+
+def _apply_dataset_overrides(hparams, data_name):
+  overrides = getattr(hparams, 'dataset_overrides', None)
+  if not overrides:
+    return
+  if not isinstance(overrides, dict):
+    raise ValueError('dataset_overrides must be a mapping from dataset name to hparams.')
+
+  dataset_override = overrides.get(data_name)
+  if dataset_override is None:
+    dataset_override = overrides.get(str(data_name).lower())
+  if dataset_override is None:
+    return
+  if not isinstance(dataset_override, dict):
+    raise ValueError('dataset_overrides[%r] must be a mapping.' % data_name)
+
+  applied = []
+  for name, value in dataset_override.items():
+    if name == 'dataset_overrides':
+      continue
+    current = getattr(hparams, name, None)
+    if isinstance(current, dict) and isinstance(value, dict):
+      value = _merge_mapping(current, value)
+    _set_or_add_hparam(hparams, name, value)
+    applied.append(name)
+  if applied:
+    logging.warning('Applied dataset overrides for %s: %s', data_name, ', '.join(sorted(applied)))
+
+
 def _cuda_visible_devices_requests_auto(value):
   if value is None:
     return False
@@ -134,6 +189,7 @@ def main(args):
     hparams = hparam.HParams()
     hparams.from_yaml(args.hparam_path)
     hparams.data_name = data_name
+    _apply_dataset_overrides(hparams, data_name)
     if selected_cuda_visible_devices is not None:
       hparams.cuda_visible_devices = selected_cuda_visible_devices
     if args.processed_data_dir:

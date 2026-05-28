@@ -17,9 +17,21 @@ def bce_from_probs(probs, targets):
     targets = targets.view(-1).float()
     return -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs)).mean()
 
+
+def _smooth_binary_targets(targets, hparams):
+    targets = targets.view(-1).float()
+    smoothing = float(getattr(hparams, 'label_smoothing', 0.0))
+    if smoothing < 0.0 or smoothing >= 1.0:
+        raise ValueError('label_smoothing must be in [0.0, 1.0).')
+    if smoothing == 0.0:
+        return targets
+    return targets * (1.0 - smoothing) + 0.5 * smoothing
+
+
 def fused_loss(model_output, targets, epoch, hparams):
     if isinstance(model_output, dict) and 'ypred_A' in model_output:
         logits_A = model_output['ypred_A']
     else:
         logits_A = model_output
-    return F.binary_cross_entropy_with_logits(logits_A.view(-1), targets.view(-1).float())
+    smoothed_targets = _smooth_binary_targets(targets, hparams)
+    return F.binary_cross_entropy_with_logits(logits_A.view(-1), smoothed_targets)
