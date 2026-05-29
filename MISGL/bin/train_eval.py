@@ -433,6 +433,20 @@ def fixed_cv_train_eval(hparams, data_name=None):
 train_eval = fixed_cv_train_eval
 
 
+def _is_better_val_result(val_result, best_val_result, hparams):
+    acc_delta = float(getattr(hparams, 'early_stop_min_delta', 0.0))
+    loss_delta = float(getattr(hparams, 'early_stop_loss_delta', 1e-6))
+    current_acc = float(val_result['acc'])
+    best_acc = float(best_val_result['acc'])
+    if current_acc > best_acc + acc_delta:
+        return True
+    if abs(current_acc - best_acc) <= acc_delta:
+        current_loss = float(val_result.get('loss', float('inf')))
+        best_loss = float(best_val_result.get('loss', float('inf')))
+        return current_loss < best_loss - loss_delta
+    return False
+
+
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset_raw=None):
     """
     单次 holdout 下的训练循环（按 epoch 训练 + val 早停）。
@@ -444,10 +458,14 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
     返回：
       (model, val_accs) 其中 model 会在结束前恢复到 val 最优权重。
     """
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=hparams.learning_rate)
+    optimizer = torch.optim.Adam(
+      filter(lambda p: p.requires_grad, model.parameters()),
+      lr=hparams.learning_rate,
+      weight_decay=float(getattr(hparams, 'weight_decay', 0.0)),
+    )
     device = torch.device(hparams.device)
 
-    best_val_result = {'epoch': 0, 'loss': 0, 'acc': -1e9}
+    best_val_result = {'epoch': 0, 'loss': float('inf'), 'acc': -1e9, 'train_loss': float('inf')}
     best_model_state = None
 
     val_accs = []
@@ -500,13 +518,13 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
         last_train_acc = train_result['acc']
 
       # 验证：用于早停与报告
-      val_result = evaluate(eval_dataset, model, hparams)
+      val_result = evaluate(eval_dataset, model, hparams, include_loss=True, loss_epoch=epoch)
       val_accs.append(val_result['acc'])
       if should_log_epoch:
         train_acc_msg = '{:.4f}'.format(last_train_acc) if last_train_acc is not None else 'n/a'
         logging.info(
-          'Epoch {} => loss: {:.4f}, train acc: {}, val acc: {:.4f}'.format(
-            epoch, avg_loss, train_acc_msg, val_result['acc']
+          'Epoch {} => train loss: {:.4f}, train acc: {}, val loss: {:.4f}, val acc: {:.4f}'.format(
+            epoch, avg_loss, train_acc_msg, val_result['loss'], val_result['acc']
           )
         )
         
@@ -517,14 +535,23 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
           from MISGL.utils.export_gat import export_gat1_features
           export_gat1_features(model, eval_dataset, epoch + 1, dataset_raw, split="val")
           
-      if val_result['acc'] > best_val_result['acc'] - 1e-7:
-        best_val_result.update({'acc': val_result['acc'], 'epoch': epoch, 'loss': avg_loss})
+      if _is_better_val_result(val_result, best_val_result, hparams):
+        best_val_result.update({
+          'acc': val_result['acc'],
+          'epoch': epoch,
+          'loss': val_result['loss'],
+          'train_loss': avg_loss,
+        })
         best_model_state = {
           name: value.detach().cpu().clone()
           for name, value in model.state_dict().items()
         }
         if should_log_epoch:
-          logging.warning('Best val result: {:.4f} @ epoch {}'.format(best_val_result['acc'], best_val_result['epoch']))
+          logging.warning(
+            'Best val result: acc {:.4f}, loss {:.4f} @ epoch {}'.format(
+              best_val_result['acc'], best_val_result['loss'], best_val_result['epoch']
+            )
+          )
         no_improve = 0
       else:
         no_improve += 1
@@ -540,6 +567,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       'epoch': int(best_val_result['epoch']),
       'acc': float(best_val_result['acc']),
       'loss': float(best_val_result['loss']),
+      'train_loss': float(best_val_result['train_loss']),
     }
 
 
