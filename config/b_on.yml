@@ -33,6 +33,9 @@ branch_b:
   attn_hidden: 128
   gate_hidden: 64
   use_structural_features: true
+  structural_hidden_dim: 32
+  structural_embed_dim: 32
+  structural_dropout: 0.1
   structural_undirected: true
 
 use_coarse_graph: false

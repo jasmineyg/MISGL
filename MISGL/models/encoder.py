@@ -35,6 +35,7 @@ class MISGLEncoder(nn.Module):
         gat_alpha = float(getattr(self._hparams, 'gat_alpha', 0.2))
         gat_concat = bool(getattr(self._hparams, 'gat_concat', True))
         gat_residual = bool(getattr(self._hparams, 'gat_residual', True))
+        classifier_input_dim = hidden_dim
 
         self.gat_layer = ResidualGATLayer(
             in_dim=in_dim,
@@ -48,17 +49,12 @@ class MISGLEncoder(nn.Module):
             residual=gat_residual,
         )
 
-        # 分类器 两层MLP
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, classifier_hidden_dim),
-            nn.LeakyReLU(negative_slope=negative_slope),
-            nn.Dropout(p=dropout),
-            nn.Linear(classifier_hidden_dim, classifier_out_dim),
-        )
-
         if self.use_branch_b:
             bb_attn_hidden = int(bb_cfg.get('attn_hidden', 128))
             bb_gate_hidden = int(bb_cfg.get('gate_hidden', bb_attn_hidden))
+            bb_structural_embed_dim = int(bb_cfg.get('structural_embed_dim', 32))
+            bb_structural_hidden_dim = bb_cfg.get('structural_hidden_dim', bb_structural_embed_dim)
+            bb_structural_dropout = float(bb_cfg.get('structural_dropout', dropout))
             self.branch_b_use_structural_features = bool(
                 bb_cfg.get('use_structural_features', bb_cfg.get('structural_features', False))
             )
@@ -77,12 +73,24 @@ class MISGLEncoder(nn.Module):
                 attn_hidden=bb_attn_hidden,
                 gate_hidden=bb_gate_hidden,
                 structural_dim=len(self.branch_b_structural_feature_names),
+                structural_hidden_dim=bb_structural_hidden_dim,
+                structural_embed_dim=bb_structural_embed_dim,
+                dropout=bb_structural_dropout,
             )
+            classifier_input_dim = self.branch_b_head.output_dim
         else:
             self.branch_b_use_structural_features = False
             self.branch_b_structure_undirected = True
             self.branch_b_structural_feature_names = ()
             self.branch_b_head = None
+
+        # 分类器 两层MLP
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, classifier_hidden_dim),
+            nn.LeakyReLU(negative_slope=negative_slope),
+            nn.Dropout(p=dropout),
+            nn.Linear(classifier_hidden_dim, classifier_out_dim),
+        )
 
         self.reset_parameters()
 
@@ -163,6 +171,9 @@ class MISGLEncoder(nn.Module):
         }
         if branch_b_out is not None:
             emb['z_B'] = branch_b_out['z_B']
+            emb['z_h'] = branch_b_out['z_h']
+            if 'z_g' in branch_b_out:
+                emb['z_g'] = branch_b_out['z_g']
         return model_out, emb
 
     def _compute_branch_b_structural_features(self, adj, batch_num_nodes, dtype=None):

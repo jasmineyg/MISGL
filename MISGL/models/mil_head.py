@@ -36,13 +36,32 @@ class MILBranchB(nn.Module):
         dropout=0.1,
         attn_dropout=0.0,
         structural_dim=0,
+        structural_hidden_dim=None,
+        structural_embed_dim=32,
     ):
-        del num_classes, num_layers, num_heads, mlp_ratio, dropout, attn_dropout
+        del num_classes, num_layers, num_heads, mlp_ratio, attn_dropout
         super().__init__()
         self.node_dim = int(node_dim)
         self.structural_dim = int(structural_dim)
+        self.structural_embed_dim = int(structural_embed_dim) if self.structural_dim > 0 else 0
+        if self.structural_dim > 0:
+            structural_hidden_dim = int(
+                structural_hidden_dim if structural_hidden_dim is not None else self.structural_embed_dim
+            )
+            self.structural_encoder = nn.Sequential(
+                nn.Linear(self.structural_dim, structural_hidden_dim),
+                nn.LayerNorm(structural_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=float(dropout)),
+                nn.Linear(structural_hidden_dim, self.structural_embed_dim),
+                nn.LayerNorm(self.structural_embed_dim),
+                nn.ReLU(),
+            )
+        else:
+            self.structural_encoder = None
+        self.output_dim = self.node_dim + self.structural_embed_dim
         self.scorer = _GatedAttentionScorer(
-            in_dim=self.node_dim + self.structural_dim,
+            in_dim=self.node_dim + self.structural_embed_dim,
             attn_hidden=attn_hidden,
             gate_hidden=gate_hidden,
         )
@@ -123,6 +142,7 @@ class MILBranchB(nn.Module):
 
         batch = batch.long()
         score_input = h
+        structural_embedding = None
         if self.structural_dim > 0:
             if structural_features is None:
                 raise ValueError('structural_features is required when structural_dim > 0.')
@@ -136,20 +156,33 @@ class MILBranchB(nn.Module):
                 raise ValueError(
                     f'Expected structural_features dim {self.structural_dim}, got {structural_features.size(1)}.'
                 )
-            score_input = torch.cat([h, structural_features.to(device=h.device, dtype=h.dtype)], dim=-1)
+            structural_features = structural_features.to(device=h.device, dtype=h.dtype)
+            structural_embedding = self.structural_encoder(structural_features)
+            score_input = torch.cat([h, structural_embedding], dim=-1)
 
         scores = self.scorer(score_input).clamp(min=-12.0, max=12.0)
         attention = self.graph_softmax(scores, batch, tau=1.0, eps=eps)
 
         weighted_nodes = attention.unsqueeze(-1) * h
         bag_count = int(batch.max().item()) + 1
-        z_B = h.new_zeros((bag_count, h.size(1)))
-        z_B.index_add_(0, batch, weighted_nodes)
+        z_h = h.new_zeros((bag_count, h.size(1)))
+        z_h.index_add_(0, batch, weighted_nodes)
+
+        z_B = z_h
+        z_g = None
+        if structural_embedding is not None:
+            weighted_structural = attention.unsqueeze(-1) * structural_embedding
+            z_g = h.new_zeros((bag_count, structural_embedding.size(1)))
+            z_g.index_add_(0, batch, weighted_structural)
+            z_B = torch.cat([z_h, z_g], dim=-1)
 
         output = {
             'z_B': z_B,
+            'z_h': z_h,
             'a': attention,
         }
+        if z_g is not None:
+            output['z_g'] = z_g
         if return_padded_attention:
             a_pad, mask_valid = self._pad_attention(attention, batch)
             output['a_pad'] = a_pad
