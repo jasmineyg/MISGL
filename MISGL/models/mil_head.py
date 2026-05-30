@@ -38,12 +38,16 @@ class MILBranchB(nn.Module):
         structural_dim=0,
         structural_hidden_dim=None,
         structural_embed_dim=32,
+        structural_fusion='gated_residual',
+        structural_gate_hidden_dim=None,
+        structural_residual_init=0.1,
     ):
         del num_classes, num_layers, num_heads, mlp_ratio, attn_dropout
         super().__init__()
         self.node_dim = int(node_dim)
         self.structural_dim = int(structural_dim)
         self.structural_embed_dim = int(structural_embed_dim) if self.structural_dim > 0 else 0
+        self.structural_fusion = str(structural_fusion).strip().lower() if self.structural_dim > 0 else 'none'
         if self.structural_dim > 0:
             structural_hidden_dim = int(
                 structural_hidden_dim if structural_hidden_dim is not None else self.structural_embed_dim
@@ -59,7 +63,35 @@ class MILBranchB(nn.Module):
             )
         else:
             self.structural_encoder = None
-        self.output_dim = self.node_dim + self.structural_embed_dim
+
+        if self.structural_fusion == 'concat':
+            self.structural_proj = None
+            self.structural_gate = None
+            self.structural_residual_scale = None
+            self.output_dim = self.node_dim + self.structural_embed_dim
+        elif self.structural_fusion in ('none', ''):
+            self.structural_proj = None
+            self.structural_gate = None
+            self.structural_residual_scale = None
+            self.output_dim = self.node_dim
+        elif self.structural_fusion == 'gated_residual':
+            structural_gate_hidden_dim = int(
+                structural_gate_hidden_dim if structural_gate_hidden_dim is not None else self.node_dim
+            )
+            self.structural_proj = nn.Linear(self.structural_embed_dim, self.node_dim)
+            self.structural_gate = nn.Sequential(
+                nn.Linear(self.node_dim * 2, structural_gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(structural_gate_hidden_dim, self.node_dim),
+                nn.Sigmoid(),
+            )
+            self.structural_residual_scale = nn.Parameter(
+                torch.tensor(float(structural_residual_init), dtype=torch.float32)
+            )
+            self.output_dim = self.node_dim
+        else:
+            raise ValueError(f'Unsupported structural_fusion: {structural_fusion!r}')
+
         self.scorer = _GatedAttentionScorer(
             in_dim=self.node_dim + self.structural_embed_dim,
             attn_hidden=attn_hidden,
@@ -170,19 +202,31 @@ class MILBranchB(nn.Module):
 
         z_B = z_h
         z_g = None
+        z_g_proj = None
+        structural_gate = None
         if structural_embedding is not None:
             weighted_structural = attention.unsqueeze(-1) * structural_embedding
             z_g = h.new_zeros((bag_count, structural_embedding.size(1)))
             z_g.index_add_(0, batch, weighted_structural)
-            z_B = torch.cat([z_h, z_g], dim=-1)
+            if self.structural_fusion == 'concat':
+                z_B = torch.cat([z_h, z_g], dim=-1)
+            elif self.structural_fusion == 'gated_residual':
+                z_g_proj = self.structural_proj(z_g)
+                structural_gate = self.structural_gate(torch.cat([z_h, z_g_proj], dim=-1))
+                z_B = z_h + self.structural_residual_scale * structural_gate * z_g_proj
 
         output = {
             'z_B': z_B,
             'z_h': z_h,
             'a': attention,
+            'batch': batch,
         }
         if z_g is not None:
             output['z_g'] = z_g
+        if z_g_proj is not None:
+            output['z_g_proj'] = z_g_proj
+        if structural_gate is not None:
+            output['structural_gate'] = structural_gate
         if return_padded_attention:
             a_pad, mask_valid = self._pad_attention(attention, batch)
             output['a_pad'] = a_pad

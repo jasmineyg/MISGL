@@ -55,6 +55,9 @@ class MISGLEncoder(nn.Module):
             bb_structural_embed_dim = int(bb_cfg.get('structural_embed_dim', 32))
             bb_structural_hidden_dim = bb_cfg.get('structural_hidden_dim', bb_structural_embed_dim)
             bb_structural_dropout = float(bb_cfg.get('structural_dropout', dropout))
+            bb_structural_fusion = bb_cfg.get('structural_fusion', 'gated_residual')
+            bb_structural_gate_hidden_dim = bb_cfg.get('structural_gate_hidden_dim', hidden_dim)
+            bb_structural_residual_init = float(bb_cfg.get('structural_residual_init', 0.1))
             self.branch_b_use_structural_features = bool(
                 bb_cfg.get('use_structural_features', bb_cfg.get('structural_features', False))
             )
@@ -75,6 +78,9 @@ class MISGLEncoder(nn.Module):
                 structural_dim=len(self.branch_b_structural_feature_names),
                 structural_hidden_dim=bb_structural_hidden_dim,
                 structural_embed_dim=bb_structural_embed_dim,
+                structural_fusion=bb_structural_fusion,
+                structural_gate_hidden_dim=bb_structural_gate_hidden_dim,
+                structural_residual_init=bb_structural_residual_init,
                 dropout=bb_structural_dropout,
             )
             classifier_input_dim = self.branch_b_head.output_dim
@@ -174,6 +180,10 @@ class MISGLEncoder(nn.Module):
             emb['z_h'] = branch_b_out['z_h']
             if 'z_g' in branch_b_out:
                 emb['z_g'] = branch_b_out['z_g']
+            if 'z_g_proj' in branch_b_out:
+                emb['z_g_proj'] = branch_b_out['z_g_proj']
+            if 'structural_gate' in branch_b_out:
+                emb['structural_gate'] = branch_b_out['structural_gate']
         return model_out, emb
 
     def _compute_branch_b_structural_features(self, adj, batch_num_nodes, dtype=None):

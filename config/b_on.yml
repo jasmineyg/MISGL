@@ -12,7 +12,7 @@ gpu_lock_dir: '/tmp/misgl_gpu_locks'
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['ogbn_products']
-timestamp: gat_b_stru7
+timestamp: b_stru7_MLPgate
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
@@ -40,7 +40,13 @@ branch_b:
   structural_hidden_dim: 32
   structural_embed_dim: 32
   structural_dropout: 0.1
+  structural_fusion: 'gated_residual'
+  structural_gate_hidden_dim: 64
+  structural_residual_init: 0.1
   structural_undirected: true
+  attention_shape_loss_enabled: true
+  attention_shape_loss_weight: 0.05
+  attention_shape_loss_eps: 0.00000001
 
 dataset_overrides:
   reddit:
