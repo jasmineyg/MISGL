@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from MISGL.models.encoder import MISGLEncoder
 from MISGL.utils.global_variables import g_key
 from MISGL.utils.hparam import HParams
+from MISGL.utils import hparams_lib
 from MISGL.utils.load_data import GraphDataLoaderWrapper
 
 
@@ -490,6 +491,7 @@ def main():
 
     hparams = HParams()
     hparams.from_yaml(args.hparam_path)
+    hparams_lib.apply_defaults(hparams)
 
     data_name = getattr(hparams, 'data_name', None)
     if data_name is None or str(data_name).strip() == '':
@@ -512,7 +514,8 @@ def main():
     else:
         hparams.model_save_path = os.path.join('results', data_name)
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = hparams.cuda_visible_devices
+    if getattr(hparams, 'cuda_visible_devices', None) is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(hparams.cuda_visible_devices)
 
     if args.output is None:
         out_dir = getattr(hparams, 'model_save_path', '.')

@@ -1,18 +1,4 @@
-device: 'cuda'
-cuda_visible_devices: '0'
-auto_select_gpu: false
-gpu_candidate_devices: null
-gpu_memory_used_max_mb: 1024
-gpu_utilization_max_pct: 10
-gpu_select_wait_seconds: 0
-gpu_select_poll_interval: 30
-gpu_lock_idle_card: true
-gpu_lock_dir: '/tmp/misgl_gpu_locks'
-preload_data_to_gpu: false
-
-model_save_path: 'results'
-processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['flickr'] #'cs', 'eng', 'phy', 'chem', 'med', 'ogbn_arxiv', 'ogbn_products_light','flickr'
+data_name_set: ['flickr']
 timestamp: gat
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -23,26 +9,5 @@ dropout: 0.5
 patience: 30
 grad_clip: 2
 
-cv_split_dir: '/data/yg/Subgraph-MIL/diffpool2/splits'
-cv_seed: 1024
-cv_num_folds: 10
-cv_val_policy: 'adjacent'
-cv_use_all_samples: true
-
 branch_b:
   use: false
-  attn_hidden: 128
-  gate_hidden: 64
-
-use_coarse_graph: false
-coarse_graph_topk: 16
-
-enable_gat_export: false
-enable_tensorboard: false
-train_eval_interval: 10
-final_eval_splits: ['train', 'val', 'test']
-export_attention: false
-analyze_attention: false
-attention_sample_frac: 0.1
-attention_top_k: 20
-attention_export_train: false

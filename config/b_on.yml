@@ -1,16 +1,3 @@
-device: 'cuda'
-cuda_visible_devices: '2'
-auto_select_gpu: false
-gpu_candidate_devices: null
-gpu_memory_used_max_mb: 1024
-gpu_utilization_max_pct: 10
-gpu_select_wait_seconds: 0
-gpu_select_poll_interval: 30
-gpu_lock_idle_card: true
-gpu_lock_dir: '/tmp/misgl_gpu_locks'
-
-model_save_path: 'results'
-processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['ogbn_arxiv']
 timestamp: loss
 channel_list: [6805, 256, 128, 64, 1]
@@ -19,56 +6,15 @@ batch_size: 64
 epoch: 200
 learning_rate: 0.001
 dropout: 0.5
-weight_decay: 0.0
-label_smoothing: 0.0
-early_stop_min_delta: 0.0
-early_stop_loss_delta: 0.0001
 patience: 30
 grad_clip: 2
-
-cv_split_dir: '/data/yg/Subgraph-MIL/diffpool2/splits'
-cv_seed: 1024
-cv_num_folds: 10
-cv_val_policy: 'adjacent'
-cv_use_all_samples: true
 
 branch_b:
   use: true
   attn_hidden: 128
   gate_hidden: 64
   use_structural_features: true
-  structural_hidden_dim: 32
-  structural_embed_dim: 32
-  structural_dropout: 0.1
   structural_fusion: 'gated_residual'
-  structural_gate_hidden_dim: 64
-  structural_residual_init: 0.1
-  structural_undirected: true
-  attention_shape_loss_enabled: true
   attention_shape_loss_weight: 0.05
-  attention_shape_loss_eps: 0.00000001
 
-dataset_overrides:
-  reddit:
-    dropout: 0.6
-    gat_attn_dropout: 0.6
-    gat_feat_dropout: 0.6
-    weight_decay: 0.0003
-    label_smoothing: 0.03
-    patience: 20
-    branch_b:
-      attn_hidden: 96
-      gate_hidden: 64
-
-use_coarse_graph: false
-coarse_graph_topk: 16
-
-enable_gat_export: false
-enable_tensorboard: false
-train_eval_interval: 10
-final_eval_splits: ['train', 'val', 'test']
 export_attention: true
-analyze_attention: true
-attention_sample_frac: 0.1
-attention_top_k: 20
-attention_export_train: true

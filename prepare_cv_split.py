@@ -5,6 +5,7 @@ import logging
 import os
 
 from MISGL.utils import hparam
+from MISGL.utils import hparams_lib
 from MISGL.utils.load_data import GraphDataLoaderWrapper
 
 
@@ -55,6 +56,7 @@ def _log_manifest_summary(manifest, split_path):
 def main(args):
   base_hparams = hparam.HParams()
   base_hparams.from_yaml(args.hparam_path)
+  hparams_lib.apply_defaults(base_hparams)
   if args.processed_data_dir:
     base_hparams.processed_data_dir = args.processed_data_dir
 
@@ -67,6 +69,7 @@ def main(args):
   for data_name in dataset_names:
     dataset_hparams = hparam.HParams()
     dataset_hparams.from_yaml(args.hparam_path)
+    hparams_lib.apply_defaults(dataset_hparams)
     dataset_hparams.data_name = data_name
     if args.processed_data_dir:
       dataset_hparams.processed_data_dir = args.processed_data_dir
