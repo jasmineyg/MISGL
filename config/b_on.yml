@@ -1,5 +1,5 @@
 data_name_set: ['ogbn_arxiv']
-timestamp: loss
+timestamp: pos
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
@@ -16,5 +16,17 @@ branch_b:
   use_structural_features: true
   structural_fusion: 'gated_residual'
   attention_shape_loss_weight: 0.05
+
+position_head:
+  use: true
+  top_k: 16
+  normalize: true
+  include_self: false
+  symmetrize: true
+  type: residual_gcn
+  num_layers: 1
+  dropout: 0.1
+  row_normalize: true
+  residual_init: 0.1
 
 export_attention: true

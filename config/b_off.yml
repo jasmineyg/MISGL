@@ -11,3 +11,15 @@ grad_clip: 2
 
 branch_b:
   use: false
+
+position_head:
+  use: false
+  top_k: 16
+  normalize: true
+  include_self: false
+  symmetrize: true
+  type: residual_gcn
+  num_layers: 1
+  dropout: 0.1
+  row_normalize: true
+  residual_init: 0.1

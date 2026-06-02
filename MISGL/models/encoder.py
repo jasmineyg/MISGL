@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from MISGL.layers.gat_layer import ResidualGATLayer
 from MISGL.models.mil_head import MILBranchB
+from MISGL.models.position_head import ResidualGCNPositionHead
 from MISGL.utils.global_variables import g_key
 from MISGL.utils import hparams_lib
 
@@ -21,7 +22,9 @@ class MISGLEncoder(nn.Module):
 
         bb_cfg = getattr(self._hparams, 'branch_b', None)
         self.use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
-        self.use_coarse_graph = bool(getattr(self._hparams, 'use_coarse_graph', False))
+        pos_cfg = getattr(self._hparams, 'position_head', None)
+        self.position_head_cfg = pos_cfg if isinstance(pos_cfg, dict) else {}
+        self.use_position_head = bool(self.position_head_cfg.get('use', False))
 
         in_dim = int(self._hparams.channel_list[0])
         hidden_dim = int(self._hparams.channel_list[1])
@@ -36,6 +39,7 @@ class MISGLEncoder(nn.Module):
         gat_concat = bool(getattr(self._hparams, 'gat_concat', True))
         gat_residual = bool(getattr(self._hparams, 'gat_residual', True))
         classifier_input_dim = hidden_dim
+        mil_output_dim = hidden_dim
 
         self.gat_layer = ResidualGATLayer(
             in_dim=in_dim,
@@ -83,12 +87,28 @@ class MISGLEncoder(nn.Module):
                 structural_residual_init=bb_structural_residual_init,
                 dropout=bb_structural_dropout,
             )
-            classifier_input_dim = self.branch_b_head.output_dim
+            mil_output_dim = self.branch_b_head.output_dim
+            classifier_input_dim = mil_output_dim
         else:
             self.branch_b_use_structural_features = False
             self.branch_b_structure_undirected = True
             self.branch_b_structural_feature_names = ()
             self.branch_b_head = None
+
+        if self.use_position_head:
+            position_head_type = str(self.position_head_cfg.get('type', 'residual_gcn')).strip().lower()
+            if position_head_type != 'residual_gcn':
+                raise ValueError(f'Unsupported position_head.type: {position_head_type!r}')
+            self.position_head = ResidualGCNPositionHead(
+                node_dim=hidden_dim,
+                num_layers=int(self.position_head_cfg.get('num_layers', 1)),
+                dropout=float(self.position_head_cfg.get('dropout', dropout)),
+                row_normalize=bool(self.position_head_cfg.get('row_normalize', True)),
+                residual_init=float(self.position_head_cfg.get('residual_init', 0.1)),
+            )
+            classifier_input_dim = mil_output_dim + hidden_dim
+        else:
+            self.position_head = None
 
         # 分类器 两层MLP
         self.classifier = nn.Sequential(
@@ -102,6 +122,8 @@ class MISGLEncoder(nn.Module):
 
     def reset_parameters(self):
         self.gat_layer.reset_parameters()
+        if self.position_head is not None:
+            self.position_head.reset_parameters()
         gain = torch.nn.init.calculate_gain('leaky_relu', float(getattr(self._hparams, 'leaky_relu_alpha', 0.2)))
         for module in self.classifier.modules():
             if isinstance(module, nn.Linear):
@@ -116,6 +138,36 @@ class MISGLEncoder(nn.Module):
     def forward_with_embeddings(self, graph_input):
         return self._encode(graph_input, return_embeddings=True)
 
+    def snapshot_position_memory(self):
+        if self.position_head is None:
+            return None
+        return self.position_head.snapshot_memory()
+
+    def restore_position_memory(self, snapshot):
+        if self.position_head is not None:
+            self.position_head.restore_memory(snapshot)
+
+    def reset_position_memory(self):
+        if self.position_head is not None:
+            self.position_head.reset_memory()
+
+    def update_position_memory_from_batch(self, graph_input):
+        if self.position_head is None or g_key.coarse_node_id not in graph_input:
+            return
+
+        x = graph_input[g_key.x]
+        adj = graph_input[g_key.adj_mat]
+        batch_num_nodes = graph_input[g_key.node_num]
+        max_nodes = x.size(1)
+        mask = self.construct_mask(max_nodes, batch_num_nodes, x.device)
+        h = self.gat_layer(x, adj, mask)
+        h1 = self._masked_mean_pool(h, batch_num_nodes)
+        self.position_head.update_memory(
+            graph_input[g_key.coarse_node_id],
+            h1,
+            coarse_node_num=graph_input.get(g_key.coarse_node_num, None),
+        )
+
     def _encode(self, graph_input, return_embeddings=False):
         x = graph_input[g_key.x]
         adj = graph_input[g_key.adj_mat]
@@ -126,6 +178,10 @@ class MISGLEncoder(nn.Module):
         h = self.gat_layer(x, adj, mask)
         h1 = self._masked_mean_pool(h, batch_num_nodes)
         classifier_input = h1
+        z_mil = h1
+        z_pos = None
+        H = None
+        position_head_out = None
         branch_b_out = None
 
         if self.use_branch_b:
@@ -151,7 +207,39 @@ class MISGLEncoder(nn.Module):
                 if h_flat.size(0) > 0 else None
             )
             if branch_b_out is not None:
-                classifier_input = branch_b_out['z_B']
+                z_mil = branch_b_out['z_B']
+                classifier_input = z_mil
+
+        if self.use_position_head:
+            missing_keys = [
+                key for key in (
+                    g_key.coarse_node_id,
+                    g_key.coarse_neighbor_index,
+                    g_key.coarse_neighbor_weight,
+                )
+                if key not in graph_input
+            ]
+            if missing_keys:
+                raise KeyError(
+                    'position_head.use is true, but graph_input is missing coarse graph fields: '
+                    + ', '.join(missing_keys)
+                )
+            z_pos = self.position_head(
+                h1,
+                graph_input[g_key.coarse_node_id],
+                graph_input[g_key.coarse_neighbor_index],
+                graph_input[g_key.coarse_neighbor_weight],
+                coarse_node_num=graph_input.get(g_key.coarse_node_num, None),
+            )
+            H = torch.cat([z_mil, z_pos], dim=-1)
+            classifier_input = H
+            position_head_out = {
+                'z_pos': z_pos,
+                'H': H,
+                'coarse_node_id': graph_input[g_key.coarse_node_id],
+                'coarse_neighbor_index': graph_input[g_key.coarse_neighbor_index],
+                'coarse_neighbor_weight': graph_input[g_key.coarse_neighbor_weight],
+            }
 
         ypred = self.classifier(classifier_input)
 
@@ -159,9 +247,18 @@ class MISGLEncoder(nn.Module):
         self.current_x2 = h
         self.current_h1 = h1
         self.current_graph_emb_classifier = classifier_input
+        self.current_z_pos = z_pos
+        if self.use_position_head:
+            self.current_coarse_node_id = graph_input.get(g_key.coarse_node_id, None)
+            self.current_coarse_neighbor_index = graph_input.get(g_key.coarse_neighbor_index, None)
+            self.current_coarse_neighbor_weight = graph_input.get(g_key.coarse_neighbor_weight, None)
 
-        if self.use_branch_b:
-            model_out = {'ypred_A': ypred, 'branch_b': branch_b_out}
+        if self.use_branch_b or self.use_position_head:
+            model_out = {'ypred_A': ypred}
+            if self.use_branch_b:
+                model_out['branch_b'] = branch_b_out
+            if self.use_position_head:
+                model_out['position_head'] = position_head_out
         else:
             model_out = ypred
 
@@ -174,6 +271,7 @@ class MISGLEncoder(nn.Module):
             'graph_emb_H1': h1,
             'graph_emb_classifier': classifier_input,
             'graph_emb': classifier_input,
+            'z_mil': z_mil,
         }
         if branch_b_out is not None:
             emb['z_B'] = branch_b_out['z_B']
@@ -184,6 +282,17 @@ class MISGLEncoder(nn.Module):
                 emb['z_g_proj'] = branch_b_out['z_g_proj']
             if 'structural_gate' in branch_b_out:
                 emb['structural_gate'] = branch_b_out['structural_gate']
+        if self.use_position_head:
+            emb['z_pos'] = z_pos
+            emb['H'] = H
+            for key in (
+                g_key.coarse_node_id,
+                g_key.coarse_node_num,
+                g_key.coarse_neighbor_index,
+                g_key.coarse_neighbor_weight,
+            ):
+                if key in graph_input:
+                    emb[key] = graph_input[key]
         return model_out, emb
 
     def _compute_branch_b_structural_features(self, adj, batch_num_nodes, dtype=None):

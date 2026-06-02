@@ -14,6 +14,20 @@ from torch.utils.data import Dataset, DataLoader
 from MISGL.utils import hparams_lib
 from MISGL.utils.global_variables import *
 from MISGL.utils import reproducibility
+from MISGL.utils import coarse_graph as coarse_graph_utils
+
+
+def _position_head_config(hparams):
+  cfg = getattr(hparams, 'position_head', None)
+  if not isinstance(cfg, dict):
+    cfg = {}
+  return {
+    'use': bool(cfg.get('use', False)),
+    'top_k': int(cfg.get('top_k', 16)),
+    'normalize': bool(cfg.get('normalize', True)),
+    'include_self': bool(cfg.get('include_self', False)),
+    'symmetrize': bool(cfg.get('symmetrize', True)),
+  }
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
@@ -31,6 +45,9 @@ class GraphDataset(Dataset):
     )
     self._structure_undirected = bool(bb_cfg.get('structural_undirected', True)) if bb_cfg else True
     self._structural_feature_dim = 7
+    self._position_head_cfg = _position_head_config(self._hparams)
+    self._use_position_head = bool(self._position_head_cfg['use'])
+    self._position_head_top_k = int(self._position_head_cfg['top_k'])
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -71,6 +88,33 @@ class GraphDataset(Dataset):
       except (TypeError, ValueError):
         subgraph_id = -1
       graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
+      if self._use_position_head:
+        coarse_node_id = graph.graph.get('coarse_node_id', subgraph_id)
+        coarse_node_num = graph.graph.get('coarse_node_num', 0)
+        neighbor_index = graph.graph.get('coarse_neighbor_indices', [])
+        neighbor_weight = graph.graph.get('coarse_neighbor_weights', [])
+        try:
+          coarse_node_id = int(coarse_node_id)
+        except (TypeError, ValueError):
+          coarse_node_id = -1
+        try:
+          coarse_node_num = int(coarse_node_num)
+        except (TypeError, ValueError):
+          coarse_node_num = 0
+
+        padded_index = np.full((self._position_head_top_k,), -1, dtype=np.int64)
+        padded_weight = np.zeros((self._position_head_top_k,), dtype=np.float32)
+        neighbor_index = np.asarray(neighbor_index, dtype=np.int64).reshape(-1)
+        neighbor_weight = np.asarray(neighbor_weight, dtype=np.float32).reshape(-1)
+        keep_count = min(self._position_head_top_k, neighbor_index.size, neighbor_weight.size)
+        if keep_count > 0:
+          padded_index[:keep_count] = neighbor_index[:keep_count]
+          padded_weight[:keep_count] = neighbor_weight[:keep_count]
+
+        graph_tmp_dict[g_key.coarse_node_id] = torch.tensor(coarse_node_id, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_node_num] = torch.tensor(coarse_node_num, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_neighbor_index] = torch.tensor(padded_index, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_neighbor_weight] = torch.tensor(padded_weight, dtype=torch.float32).to(self._device)
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
 
@@ -188,6 +232,9 @@ class GraphDataLoaderWrapper(object):
     self._hparams.channel_list[0] = feature_dim
     max_num_nodes = int(dataset['dataset_metadata'].get('max_num_nodes', max(len(g.nodes()) for g in subgraphs)))
     self._set_or_add_hparam('max_num_nodes', max_num_nodes)
+    self.coarse_adj = None
+    self.coarse_graph_metadata = None
+    self._maybe_attach_coarse_graph(dataset, subgraphs)
 
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
@@ -229,6 +276,55 @@ class GraphDataLoaderWrapper(object):
     self._cv_index_by_orig_idx = {int(orig_idx): idx for idx, orig_idx in enumerate(self.cv_orig_indices)}
     self.cv_folds = None
     self.cv_build_info = None
+
+  def _maybe_attach_coarse_graph(self, dataset, subgraphs):
+    cfg = _position_head_config(self._hparams)
+    if not cfg['use']:
+      return
+
+    original_graph = dataset.get('original_graph', None)
+    assignment_matrix = dataset.get('assignment_matrix', None)
+    if original_graph is None:
+      raise ValueError('position_head.use is true, but dataset does not contain original_graph.')
+    if assignment_matrix is None:
+      raise ValueError('position_head.use is true, but dataset does not contain assignment_matrix.')
+
+    active_subgraph_ids = []
+    for pos, graph in enumerate(subgraphs):
+      subgraph_id = graph.graph.get('subgraph_id', pos)
+      try:
+        subgraph_id = int(subgraph_id)
+      except (TypeError, ValueError):
+        subgraph_id = int(pos)
+      if subgraph_id < 0:
+        subgraph_id = int(pos)
+      active_subgraph_ids.append(subgraph_id)
+
+    self.coarse_adj, self.coarse_graph_metadata = coarse_graph_utils.build_coarse_adjacency(
+      original_graph=original_graph,
+      assignment_matrix=assignment_matrix,
+      active_subgraph_ids=active_subgraph_ids,
+      top_k=cfg['top_k'],
+      normalize=cfg['normalize'],
+      include_self=cfg['include_self'],
+      symmetrize=cfg['symmetrize'],
+    )
+    coarse_node_num = int(self.coarse_adj.shape[0])
+    for coarse_node_id, graph in enumerate(subgraphs):
+      row = self.coarse_adj.getrow(coarse_node_id)
+      graph.graph['coarse_node_id'] = int(coarse_node_id)
+      graph.graph['coarse_node_num'] = coarse_node_num
+      graph.graph['coarse_neighbor_indices'] = row.indices.astype(np.int64, copy=False)
+      graph.graph['coarse_neighbor_weights'] = row.data.astype(np.float32, copy=False)
+
+    logging.info(
+      'Built coarse graph: nodes=%d, edges=%d, top_k=%s, normalize=%s, include_self=%s',
+      coarse_node_num,
+      int(self.coarse_adj.nnz),
+      cfg['top_k'],
+      cfg['normalize'],
+      cfg['include_self'],
+    )
 
   def _set_or_add_hparam(self, name, value):
     if name in self._hparams:
