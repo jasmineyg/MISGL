@@ -27,7 +27,6 @@ class ResidualGATLayer(Module):
     need_out = (per_head if not concat else heads * per_head) != out_dim
     self.out_proj = torch.nn.Linear((per_head if not concat else heads * per_head), out_dim) if need_out else None
     self.last_attention_summary = None
-    self.last_attention_scores = None
     self.reset_parameters()
 
   def reset_parameters(self):
@@ -56,15 +55,12 @@ class ResidualGATLayer(Module):
     eye = torch.eye(N, device=device, dtype=adj.dtype).unsqueeze(0).expand(B, N, N)
     adj_eff = adj + eye
     attn_mask = adj_eff != 0
-    score_summary = (e * attn_mask.unsqueeze(1).to(dtype=e.dtype)).sum(dim=(1, 2))
-    score_summary = score_summary / (attn_mask.sum(dim=1).clamp_min(1).to(dtype=e.dtype) * self.heads)
     e = e.masked_fill(attn_mask.unsqueeze(1) == 0, float('-inf'))
     alpha = torch.softmax(e, dim=3)
     alpha_summary = alpha.mean(dim=(1, 2))
     if mask is not None:
       alpha_summary = alpha_summary * mask.squeeze(-1)
     self.last_attention_summary = alpha_summary.detach()
-    self.last_attention_scores = score_summary.detach()
     alpha = self.attn_drop(alpha)
     z = torch.einsum('bhij,bhjo->bhio', alpha, Wh)
     if self.concat:

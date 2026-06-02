@@ -81,25 +81,15 @@ def _get_lightweight_attention_exporter():
     return _LIGHTWEIGHT_ATTENTION_EXPORTER
 
   try:
-    from attention_analyzer_impl import export_lightweight_attention_from_model
-  except ImportError as impl_error:
-    try:
-      from attention_analyzer import export_lightweight_attention_from_model
-    except ImportError as wrapper_error:
-      raise ImportError(
-        'Cannot import export_lightweight_attention_from_model from '
-        'attention_analyzer_impl or attention_analyzer.'
-      ) from wrapper_error
-    except AttributeError as wrapper_error:
-      raise ImportError(
-        'attention_analyzer does not define export_lightweight_attention_from_model.'
-      ) from wrapper_error
-    else:
-      logging.warning(
-        'Using export_lightweight_attention_from_model from attention_analyzer '
-        'because attention_analyzer_impl import failed: %s',
-        impl_error,
-      )
+    from attention_analyzer import export_lightweight_attention_from_model
+  except ImportError as exc:
+    raise ImportError(
+      'Cannot import export_lightweight_attention_from_model from attention_analyzer.'
+    ) from exc
+  except AttributeError as exc:
+    raise ImportError(
+      'attention_analyzer does not define export_lightweight_attention_from_model.'
+    ) from exc
 
   _LIGHTWEIGHT_ATTENTION_EXPORTER = export_lightweight_attention_from_model
   return _LIGHTWEIGHT_ATTENTION_EXPORTER

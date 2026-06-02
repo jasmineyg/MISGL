@@ -4,20 +4,6 @@ import torch
 import torch.nn.functional as F
 
 
-def cross_entropy(prediction, reference):
-    return F.cross_entropy(prediction, reference, reduction='mean')
-
-
-def get_gamma(epoch, gamma_start=0.3, gamma_end=0.6, warmup_epochs=20):
-    return gamma_start if epoch < warmup_epochs else gamma_end
-
-
-def bce_from_probs(probs, targets):
-    probs = torch.clamp(probs.view(-1), min=1e-8, max=1 - 1e-8)
-    targets = targets.view(-1).float()
-    return -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs)).mean()
-
-
 def _smooth_binary_targets(targets, hparams):
     targets = targets.view(-1).float()
     smoothing = float(getattr(hparams, 'label_smoothing', 0.0))

@@ -11,7 +11,7 @@ gpu_lock_dir: '/tmp/misgl_gpu_locks'
 
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
-data_name_set: ['ogbn_products']
+data_name_set: ['ogbn_arxiv']
 timestamp: loss
 channel_list: [6805, 256, 128, 64, 1]
 
