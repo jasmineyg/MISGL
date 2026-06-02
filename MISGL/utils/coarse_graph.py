@@ -2,6 +2,7 @@
 
 import numpy as np
 import scipy.sparse as sp
+import json
 
 
 def _as_csr_matrix(value, dtype=np.float32):
@@ -161,3 +162,54 @@ def build_coarse_adjacency(
         'symmetrize': bool(symmetrize),
     }
     return coarse, metadata
+
+
+def save_coarse_adjacency_cache(path, coarse_adj, metadata):
+    coarse_adj = coarse_adj.tocsr()
+    metadata = dict(metadata or {})
+    np.savez(
+        path,
+        indptr=coarse_adj.indptr.astype(np.int64, copy=False),
+        indices=coarse_adj.indices.astype(np.int64, copy=False),
+        data=coarse_adj.data.astype(np.float32, copy=False),
+        shape=np.asarray(coarse_adj.shape, dtype=np.int64),
+        active_subgraph_ids=np.asarray(metadata.get('active_subgraph_ids', []), dtype=np.int64),
+        subgraph_sizes=np.asarray(metadata.get('subgraph_sizes', []), dtype=np.float32),
+        metadata_json=np.asarray(json.dumps(_json_safe_metadata(metadata), sort_keys=True)),
+    )
+
+
+def load_coarse_adjacency_cache(path):
+    with np.load(path, allow_pickle=False) as cached:
+        shape = tuple(int(v) for v in cached['shape'].tolist())
+        coarse_adj = sp.csr_matrix(
+            (
+                cached['data'].astype(np.float32, copy=False),
+                cached['indices'].astype(np.int64, copy=False),
+                cached['indptr'].astype(np.int64, copy=False),
+            ),
+            shape=shape,
+        )
+        metadata_json = str(cached['metadata_json'].item())
+        metadata = json.loads(metadata_json)
+        metadata['active_subgraph_ids'] = cached['active_subgraph_ids'].astype(np.int64, copy=False)
+        metadata['subgraph_sizes'] = cached['subgraph_sizes'].astype(np.float32, copy=False)
+    return coarse_adj, metadata
+
+
+def _json_safe_metadata(metadata):
+    out = {}
+    for key, value in metadata.items():
+        if isinstance(value, np.ndarray):
+            if value.size <= 32:
+                out[key] = value.tolist()
+            else:
+                out[key] = {
+                    'shape': list(value.shape),
+                    'dtype': str(value.dtype),
+                }
+        elif isinstance(value, np.generic):
+            out[key] = value.item()
+        else:
+            out[key] = value
+    return out

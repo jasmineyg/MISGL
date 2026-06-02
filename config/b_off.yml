@@ -23,3 +23,5 @@ position_head:
   dropout: 0.1
   row_normalize: true
   residual_init: 0.1
+  cache: true
+  cache_dir: '.cache/position_head'

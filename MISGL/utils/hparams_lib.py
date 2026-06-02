@@ -45,6 +45,8 @@ DEFAULT_HPARAMS = {
     'dropout': 0.1,
     'row_normalize': True,
     'residual_init': 0.1,
+    'cache': True,
+    'cache_dir': '.cache/position_head',
   },
   'enable_gat_export': False,
   'enable_tensorboard': False,

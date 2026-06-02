@@ -1,4 +1,4 @@
-data_name_set: ['ogbn_arxiv']
+data_name_set: ['ogbn_products']
 timestamp: pos
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -28,5 +28,7 @@ position_head:
   dropout: 0.1
   row_normalize: true
   residual_init: 0.1
+  cache: true
+  cache_dir: '.cache/position_head'
 
 export_attention: true

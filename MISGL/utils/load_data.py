@@ -6,6 +6,7 @@ import os
 import logging
 import pickle
 import json
+import hashlib
 from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
 
 import torch
@@ -27,7 +28,14 @@ def _position_head_config(hparams):
     'normalize': bool(cfg.get('normalize', True)),
     'include_self': bool(cfg.get('include_self', False)),
     'symmetrize': bool(cfg.get('symmetrize', True)),
+    'cache': bool(cfg.get('cache', True)),
+    'cache_dir': cfg.get('cache_dir', os.path.join('.cache', 'position_head')),
   }
+
+
+def _safe_cache_name(value):
+  value = str(value or 'dataset')
+  return ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in value)
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
@@ -234,7 +242,7 @@ class GraphDataLoaderWrapper(object):
     self._set_or_add_hparam('max_num_nodes', max_num_nodes)
     self.coarse_adj = None
     self.coarse_graph_metadata = None
-    self._maybe_attach_coarse_graph(dataset, subgraphs)
+    self._maybe_attach_coarse_graph(dataset, subgraphs, dataset_path)
 
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
@@ -277,7 +285,78 @@ class GraphDataLoaderWrapper(object):
     self.cv_folds = None
     self.cv_build_info = None
 
-  def _maybe_attach_coarse_graph(self, dataset, subgraphs):
+  def _position_head_cache_path(self, dataset, dataset_path, assignment_matrix, original_graph, active_subgraph_ids, cfg):
+    active_subgraph_ids = np.asarray(active_subgraph_ids, dtype=np.int64)
+    stat = os.stat(dataset_path)
+    assignment_shape = tuple(int(v) for v in assignment_matrix.shape)
+    if hasattr(original_graph, 'nodes') and hasattr(original_graph, 'edges'):
+      original_nodes = len(original_graph.nodes())
+      original_edges = len(original_graph.edges())
+    else:
+      original_nodes = int(getattr(original_graph, 'shape', (0, 0))[0])
+      original_edges = int(getattr(original_graph, 'nnz', 0))
+
+    active_hash = hashlib.sha256(active_subgraph_ids.tobytes()).hexdigest()
+    payload = {
+      'cache_version': 1,
+      'data_name': self.data_name,
+      'dataset_path': os.path.abspath(dataset_path),
+      'dataset_size': int(stat.st_size),
+      'dataset_mtime_ns': int(stat.st_mtime_ns),
+      'assignment_shape': assignment_shape,
+      'original_nodes': int(original_nodes),
+      'original_edges': int(original_edges),
+      'num_subgraphs': int(len(active_subgraph_ids)),
+      'active_subgraph_ids_sha256': active_hash,
+      'top_k': int(cfg['top_k']),
+      'normalize': bool(cfg['normalize']),
+      'include_self': bool(cfg['include_self']),
+      'symmetrize': bool(cfg['symmetrize']),
+    }
+    cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    metadata = dataset.get('dataset_metadata', {}) if isinstance(dataset, dict) else {}
+    dataset_name = metadata.get('dataset_name', self.data_name)
+    cache_dir = cfg.get('cache_dir') or os.path.join('.cache', 'position_head')
+    cache_path = os.path.join(
+      str(cache_dir),
+      '{}_poshead_{}.npz'.format(_safe_cache_name(dataset_name), cache_key[:16]),
+    )
+    return cache_path, cache_key
+
+  def _load_position_head_cache(self, cache_path, cache_key, expected_num_nodes):
+    if not os.path.exists(cache_path):
+      return None, None
+    try:
+      coarse_adj, metadata = coarse_graph_utils.load_coarse_adjacency_cache(cache_path)
+      if metadata.get('cache_key') != cache_key:
+        logging.warning('Ignoring stale position-head cache with mismatched key: %s', cache_path)
+        return None, None
+      if int(coarse_adj.shape[0]) != int(expected_num_nodes):
+        logging.warning(
+          'Ignoring position-head cache with wrong node count: %s (got=%s, expected=%s)',
+          cache_path,
+          coarse_adj.shape[0],
+          expected_num_nodes,
+        )
+        return None, None
+      logging.info('Loaded position-head coarse graph cache: %s', cache_path)
+      return coarse_adj, metadata
+    except Exception as exc:
+      logging.warning('Failed to load position-head cache %s: %s', cache_path, exc)
+      return None, None
+
+  def _save_position_head_cache(self, cache_path, cache_key, coarse_adj, metadata):
+    try:
+      os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+      metadata = dict(metadata or {})
+      metadata['cache_key'] = cache_key
+      metadata['cache_path'] = cache_path
+      coarse_graph_utils.save_coarse_adjacency_cache(cache_path, coarse_adj, metadata)
+      logging.info('Saved position-head coarse graph cache: %s', cache_path)
+    except Exception as exc:
+      logging.warning('Failed to save position-head cache %s: %s', cache_path, exc)
+
+  def _maybe_attach_coarse_graph(self, dataset, subgraphs, dataset_path):
     cfg = _position_head_config(self._hparams)
     if not cfg['use']:
       return
@@ -300,15 +379,36 @@ class GraphDataLoaderWrapper(object):
         subgraph_id = int(pos)
       active_subgraph_ids.append(subgraph_id)
 
-    self.coarse_adj, self.coarse_graph_metadata = coarse_graph_utils.build_coarse_adjacency(
-      original_graph=original_graph,
-      assignment_matrix=assignment_matrix,
-      active_subgraph_ids=active_subgraph_ids,
-      top_k=cfg['top_k'],
-      normalize=cfg['normalize'],
-      include_self=cfg['include_self'],
-      symmetrize=cfg['symmetrize'],
-    )
+    cache_path = None
+    cache_key = None
+    if cfg['cache']:
+      cache_path, cache_key = self._position_head_cache_path(
+        dataset,
+        dataset_path,
+        assignment_matrix,
+        original_graph,
+        active_subgraph_ids,
+        cfg,
+      )
+      self.coarse_adj, self.coarse_graph_metadata = self._load_position_head_cache(
+        cache_path,
+        cache_key,
+        expected_num_nodes=len(active_subgraph_ids),
+      )
+
+    if self.coarse_adj is None:
+      self.coarse_adj, self.coarse_graph_metadata = coarse_graph_utils.build_coarse_adjacency(
+        original_graph=original_graph,
+        assignment_matrix=assignment_matrix,
+        active_subgraph_ids=active_subgraph_ids,
+        top_k=cfg['top_k'],
+        normalize=cfg['normalize'],
+        include_self=cfg['include_self'],
+        symmetrize=cfg['symmetrize'],
+      )
+      if cfg['cache'] and cache_path is not None:
+        self._save_position_head_cache(cache_path, cache_key, self.coarse_adj, self.coarse_graph_metadata)
+
     coarse_node_num = int(self.coarse_adj.shape[0])
     for coarse_node_id, graph in enumerate(subgraphs):
       row = self.coarse_adj.getrow(coarse_node_id)
