@@ -12,7 +12,7 @@ gpu_lock_dir: '/tmp/misgl_gpu_locks'
 model_save_path: 'results'
 processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
 data_name_set: ['ogbn_products']
-timestamp: b_stru7_MLPgate
+timestamp: loss
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
