@@ -28,3 +28,17 @@ initialized. When automatic selection is enabled, use `gpu_candidate_devices`
 to restrict which physical cards may be selected. Manual
 `cuda_visible_devices: '0'` style settings still work when automatic selection
 is disabled.
+
+## Experiment result Excel
+
+After each fixed 10-fold CV run, the final train/val/test metrics are appended
+to one workbook:
+
+```yaml
+enable_experiment_result_excel: true
+experiment_result_excel_path: '/data/yg/Subgraph-MIL/diffpool2/experiment_results.xlsx'
+```
+
+`CV Results` keeps one appended row per experiment. `Leaderboard` is refreshed in
+the same workbook and sorts runs by `test_acc_mean`, with the test accuracy
+column highlighted for quick comparison.
