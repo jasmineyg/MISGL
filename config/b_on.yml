@@ -32,3 +32,80 @@ position_head:
   cache_dir: '.cache/position_head'
 
 export_attention: true
+
+# 二阶段粗图关系实验配置，只被 coarse_relation_experiment.py 使用，不影响原来的 train.py。
+coarse_relation_experiment:
+  # 使用哪个数据集。这里默认只分析 ogbn_arxiv。
+  data_name: reddit
+  # 预处理 pkl 所在目录，脚本会读取 /data/yg/Subgraph-MIL/Data/processed_data/ogbn_arxiv_processed.pkl。
+  processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
+  # 运行设备。服务器有 GPU 时用 cuda；本地调试可临时命令行加 --device cpu。
+  device: cuda
+  # 随机种子，影响 stage-1 训练、二阶段模型初始化、dataset split。
+  seed: 1024
+  # 实验输出根目录；每一折会写到 result/coarse_relation/ogbn_arxiv/fold_x。
+  out_dir: result/coarse_relation
+
+  # 划分方式。fixed_cv 表示沿用/创建 10 折 CV；dataset 表示用数据自带 train/test 再切 val。
+  split_source: fixed_cv
+  # 10 折划分文件路径。没有文件且 create_split_if_missing=true 时会自动创建。
+  split_path: splits/{data_name}_cv10_seed1024_adjacent.json
+  # 默认留空：命令行不写 --fold_idx 时跑完整 10 折；命令行写 --fold_idx 3 时只跑第 3 折。
+  fold_idx:
+  # fixed_cv 的 split 文件不存在时是否自动生成。
+  create_split_if_missing: true
+  # 只有 split_source=dataset 时才用：从原 train pool 中切多少比例做 val。
+  dataset_val_frac: 0.2
+
+  # 每折导出的固定子图表示 z_mil 路径。{data_name} 和 {fold_idx} 会自动替换。
+  embeddings_path: result/coarse_relation/{data_name}_zmil_fold{fold_idx}.pt
+  # true 表示即使已有 embeddings 文件也重新导出；false 表示能复用就复用。
+  force_export_embeddings: false
+  # 从 MISGL forward_with_embeddings 里取哪个表示做二阶段节点特征；默认用 Branch-B 的 z_mil。
+  embedding_key: z_mil
+  # 导出 embedding 时的 batch size，通常与 batch_size 保持一致即可。
+  export_batch_size: 64
+
+  # true 表示先训练 stage-1 MISGL/Branch-B，再导出 z_mil；false 表示只读取已有 embeddings。
+  train_stage1: true
+  # stage-1 是否带 position head。这里建议 false，因为二阶段就是专门单独建模粗图关系。
+  stage1_use_position_head: false
+  # stage-1 最多训练 epoch 数。
+  stage1_epochs: 80
+  # stage-1 验证集长期不提升时提前停止。
+  stage1_patience: 20
+  # stage-1 学习率。
+  stage1_lr: 0.001
+  # stage-1 weight decay。
+  stage1_weight_decay: 0.0
+  # 保存每折 stage-1 最优模型，方便之后复用或检查。
+  save_stage1_checkpoint: result/coarse_relation/{data_name}_stage1_fold{fold_idx}.pt
+  # 调试用：true 时允许用随机未训练 stage-1 导出 embedding；正式实验必须 false。
+  allow_random_stage1: false
+  # 加载 checkpoint 时是否允许参数名不完全匹配；默认严格匹配。
+  non_strict_checkpoint: false
+
+  # 二阶段对照模型：mlp 不用粗图；gcn/sage/appnp 使用粗图关系。
+  models: mlp,gcn,appnp,sage
+  # z_mil 特征归一化方式。standard 表示只用 train split 估计均值方差。
+  feature_norm: standard
+  # 二阶段模型最多训练 epoch 数。
+  relation_epochs: 500
+  # 二阶段学习率。
+  relation_lr: 0.001
+  # 二阶段 weight decay。
+  relation_weight_decay: 0.0005
+  # 二阶段 MLP/GCN/SAGE 的隐藏层维度。
+  relation_hidden_dim: 256
+  # 二阶段 dropout。
+  relation_dropout: 0.5
+  # 二阶段 early stopping patience。
+  relation_patience: 80
+  # 用哪个验证指标选最优模型：val_roc_auc / val_acc / val_loss。
+  selection_metric: val_roc_auc
+  # APPNP 的传播步数，越大看得越远，但也可能过平滑。
+  appnp_k: 10
+  # APPNP 的初始预测保留比例，越大越信任自身 z_mil。
+  appnp_alpha: 0.1
+  # 日志打印间隔。
+  log_interval: 20
