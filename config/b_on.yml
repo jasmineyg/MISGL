@@ -1,4 +1,4 @@
-data_name_set: ['ogbn_products']
+data_name_set: ['ogbn_arxiv']
 timestamp: pos
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -36,7 +36,7 @@ export_attention: true
 # 二阶段粗图关系实验配置，只被 coarse_relation_experiment.py 使用，不影响原来的 train.py。
 coarse_relation_experiment:
   # 使用哪个数据集。这里默认只分析 ogbn_arxiv。
-  data_name: reddit
+  data_name: ogbn_arxiv
   # 预处理 pkl 所在目录，脚本会读取 /data/yg/Subgraph-MIL/Data/processed_data/ogbn_arxiv_processed.pkl。
   processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
   # 运行设备。服务器有 GPU 时用 cuda；本地调试可临时命令行加 --device cpu。
@@ -85,8 +85,25 @@ coarse_relation_experiment:
   # 加载 checkpoint 时是否允许参数名不完全匹配；默认严格匹配。
   non_strict_checkpoint: false
 
-  # 二阶段对照模型：mlp 不用粗图；gcn/sage/appnp 使用粗图关系。
-  models: mlp,gcn,appnp,sage
+  # 二阶段对照模型：mlp 不用粗图；gcn/appnp/sage/gated_sage 使用粗图关系。
+  # gated_sage 会学习每个子图应该听多少邻居信息，用来检验“选择性关系建模”是否更稳。
+  models: mlp,gcn,appnp,sage,gated_sage
+  # 二阶段关系图来源：
+  #   coarse   = 使用原始粗图；
+  #   zmil_knn = 使用每折固定 z_mil 在表示空间里构建 kNN 图。
+  relation_graph: zmil_knn
+  # z_mil kNN 图每个节点保留多少个近邻。诊断结果里 k=16 在两个数据集上都比较干净。
+  knn_k: 16
+  # kNN 相似度，目前只支持 cosine。
+  knn_metric: cosine
+  # kNN 边权：positive_cosine 表示 max(cosine, 0)，避免负边权参与传播。
+  knn_weight_mode: positive_cosine
+  # 可选相似度阈值；留空表示只按 top-k 保留。
+  knn_min_similarity:
+  # 构建 kNN 图时的 batch size，太大可能占显存/内存，太小会慢。
+  knn_batch_size: 512
+  # 是否把有向 kNN 图对称化。true 表示 i 选 j 或 j 选 i 都会连边。
+  knn_symmetrize: true
   # z_mil 特征归一化方式。standard 表示只用 train split 估计均值方差。
   feature_norm: standard
   # 二阶段模型最多训练 epoch 数。
@@ -107,5 +124,58 @@ coarse_relation_experiment:
   appnp_k: 10
   # APPNP 的初始预测保留比例，越大越信任自身 z_mil。
   appnp_alpha: 0.1
+  # gated_sage 里 gate MLP 的隐藏层维度，控制“是否信任邻居”的判别能力。
+  gated_sage_gate_hidden_dim: 128
   # 日志打印间隔。
   log_interval: 20
+
+# 二阶段结果诊断配置，只被 coarse_relation_diagnostics.py 使用，不会重新训练模型。
+coarse_relation_diagnostics:
+  # 默认诊断的数据集；跑 reddit 时命令行加 --data_name reddit 即可覆盖。
+  data_name: ogbn_arxiv
+  # 预处理 pkl 所在目录，需要能找到 {data_name}_processed.pkl。
+  processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
+  # 诊断只做读取和统计，CPU 就够；如果 kNN 很大也可以改成 cuda 但当前脚本主要用 numpy。
+  device: cpu
+  # 随机种子，用于边采样和 kNN source node 采样。
+  seed: 1024
+
+  # 默认留空：不写 --fold_idx 时诊断完整 10 折；写 --fold_idx 3 时只诊断第 3 折。
+  fold_idx:
+  # 划分方式要和二阶段实验保持一致。
+  split_source: fixed_cv
+  # 10 折划分文件。
+  split_path: splits/{data_name}_cv10_seed1024_adjacent.json
+  # split 文件不存在时是否自动创建。
+  create_split_if_missing: true
+  # 只有 split_source=dataset 时才用。
+  dataset_val_frac: 0.2
+
+  # 二阶段实验输出根目录，用来定位每折 relation_predictions.csv。
+  relation_out_dir: result/coarse_relation
+  # 诊断结果输出目录。默认会按 relation_graph 分开，避免 coarse 和 z_mil kNN 诊断互相覆盖。
+  diagnostics_out_dir: result/coarse_relation_diagnostics/{data_name}/{relation_graph}
+  # 每折 z_mil embedding 路径。
+  embeddings_path: result/coarse_relation/{data_name}_zmil_fold{fold_idx}.pt
+  # 每折预测 CSV 路径。当前分支默认读取 z_mil kNN 图实验结果。
+  predictions_path: '{relation_out_dir}/{data_name}/{relation_graph}/fold_{fold_idx}/relation_predictions.csv'
+
+  # 留空表示自动从 prediction CSV 里识别模型；也可以手动写 mlp,sage,gated_sage。
+  models:
+  # 用哪个模型作为“只看自身 z_mil”的基线来分析改对/改错。
+  baseline_model: mlp
+  # edge feature 分桶数，用于观察不同权重/相似度区间的同标签比例。
+  bin_count: 10
+  # 每折最多导出多少条边样本到 edge_reliability_sample.csv，避免大数据集文件过大。
+  edge_sample_max_per_fold: 200000
+  # node_error_cases.csv 只导出哪些 split 的节点，默认只看 val/test。
+  node_case_splits: val,test
+
+  # 是否比较 z_mil kNN 图和 coarse graph 的同标签比例。
+  run_knn_diagnostics: true
+  # kNN 图观察哪些 k。
+  knn_k_list: 8,16,32,64
+  # kNN 计算时每个 batch 的 source node 数。
+  knn_batch_size: 512
+  # kNN 诊断最多采样多少个 source node；大图上避免全量 NxN 过慢。
+  knn_max_source_nodes: 5000

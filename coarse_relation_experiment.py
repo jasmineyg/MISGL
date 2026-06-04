@@ -75,6 +75,13 @@ def parse_args():
     add_bool_arg(parser, 'non_strict_checkpoint')
 
     parser.add_argument('--models', default='mlp,gcn,appnp')
+    parser.add_argument('--relation_graph', choices=['coarse', 'zmil_knn'], default='coarse')
+    parser.add_argument('--knn_k', type=int, default=16)
+    parser.add_argument('--knn_metric', choices=['cosine'], default='cosine')
+    parser.add_argument('--knn_weight_mode', choices=['positive_cosine', 'cosine_shift', 'binary'], default='positive_cosine')
+    parser.add_argument('--knn_min_similarity', type=float, default=None)
+    parser.add_argument('--knn_batch_size', type=int, default=512)
+    add_bool_arg(parser, 'knn_symmetrize')
     parser.add_argument('--feature_norm', choices=['none', 'standard', 'l2'], default='standard')
     parser.add_argument('--relation_epochs', type=int, default=500)
     parser.add_argument('--relation_lr', type=float, default=0.001)
@@ -85,6 +92,7 @@ def parse_args():
     parser.add_argument('--selection_metric', choices=['val_roc_auc', 'val_acc', 'val_loss'], default='val_roc_auc')
     parser.add_argument('--appnp_k', type=int, default=10)
     parser.add_argument('--appnp_alpha', type=float, default=0.1)
+    parser.add_argument('--gated_sage_gate_hidden_dim', type=int, default=128)
     parser.add_argument('--log_interval', type=int, default=20)
 
     add_bool_arg(parser, 'synthetic_smoke')
@@ -140,10 +148,11 @@ def apply_missing_bool_defaults(args):
         'stage1_use_position_head',
         'allow_random_stage1',
         'non_strict_checkpoint',
+        'knn_symmetrize',
         'synthetic_smoke',
     ):
         if getattr(args, key) is None:
-            setattr(args, key, False)
+            setattr(args, key, key == 'knn_symmetrize')
 
 
 def apply_path_templates(args, fold_idx=None):
@@ -521,6 +530,133 @@ def normalize_adjacency(coarse_adj, mode='symmetric', add_self_loop=True):
     return d_inv @ adj @ d_inv
 
 
+def build_zmil_knn_adjacency(features, args):
+    if isinstance(features, torch.Tensor):
+        features_cpu = features.detach().cpu().float()
+    else:
+        features_cpu = torch.as_tensor(features, dtype=torch.float32)
+    num_nodes = int(features_cpu.size(0))
+    if num_nodes <= 1:
+        return sp.csr_matrix((num_nodes, num_nodes), dtype=np.float32), {
+            'type': 'zmil_knn',
+            'num_nodes': num_nodes,
+            'knn_k': 0,
+        }
+
+    knn_k = min(int(args.knn_k), num_nodes - 1)
+    if knn_k <= 0:
+        raise ValueError(f'knn_k must be positive, got {args.knn_k}')
+    batch_size = max(int(args.knn_batch_size), 1)
+    min_similarity = args.knn_min_similarity
+    min_similarity = None if min_similarity is None else float(min_similarity)
+
+    x = F.normalize(features_cpu, p=2, dim=-1)
+    rows = []
+    cols = []
+    data = []
+    for start in range(0, num_nodes, batch_size):
+        end = min(start + batch_size, num_nodes)
+        sims = x[start:end] @ x.t()
+        local_rows = torch.arange(end - start, dtype=torch.long)
+        sims[local_rows, torch.arange(start, end, dtype=torch.long)] = -float('inf')
+        values, indices = torch.topk(sims, k=knn_k, dim=1, largest=True, sorted=False)
+        values_np = values.numpy()
+        indices_np = indices.numpy()
+        for local_idx in range(end - start):
+            src = start + local_idx
+            for rank in range(knn_k):
+                sim = float(values_np[local_idx, rank])
+                if not np.isfinite(sim):
+                    continue
+                if min_similarity is not None and sim < min_similarity:
+                    continue
+                if args.knn_weight_mode == 'binary':
+                    weight = 1.0
+                elif args.knn_weight_mode == 'cosine_shift':
+                    weight = 0.5 * (sim + 1.0)
+                else:
+                    weight = max(sim, 0.0)
+                if weight <= 0.0:
+                    continue
+                rows.append(src)
+                cols.append(int(indices_np[local_idx, rank]))
+                data.append(weight)
+
+    adj = sp.csr_matrix(
+        (
+            np.asarray(data, dtype=np.float32),
+            (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)),
+        ),
+        shape=(num_nodes, num_nodes),
+        dtype=np.float32,
+    )
+    adj.eliminate_zeros()
+    if bool(args.knn_symmetrize):
+        adj = adj.maximum(adj.T).tocsr()
+    metadata = {
+        'type': 'zmil_knn',
+        'num_nodes': int(num_nodes),
+        'num_edges_directed': int(adj.nnz),
+        'knn_k': int(knn_k),
+        'knn_metric': str(args.knn_metric),
+        'knn_weight_mode': str(args.knn_weight_mode),
+        'knn_min_similarity': min_similarity,
+        'knn_batch_size': int(batch_size),
+        'knn_symmetrize': bool(args.knn_symmetrize),
+    }
+    logging.info(
+        'Built z_mil kNN graph: nodes=%d, directed_edges=%d, k=%d, symmetrize=%s',
+        num_nodes,
+        int(adj.nnz),
+        int(knn_k),
+        bool(args.knn_symmetrize),
+    )
+    return adj, metadata
+
+
+def build_relation_adjacency(base_coarse_adj, features, args):
+    relation_graph = str(args.relation_graph).strip().lower()
+    if relation_graph == 'coarse':
+        metadata = {
+            'type': 'coarse',
+            'num_nodes': int(base_coarse_adj.shape[0]),
+            'num_edges_directed': int(base_coarse_adj.nnz),
+        }
+        return base_coarse_adj, metadata
+    if relation_graph == 'zmil_knn':
+        return build_zmil_knn_adjacency(features, args)
+    raise ValueError(f'Unsupported relation_graph: {args.relation_graph!r}')
+
+
+def align_payload_to_coarse_nodes(payload, num_nodes):
+    features = payload['features'].detach().cpu().float()
+    labels = payload['labels'].detach().cpu().long()
+    orig_indices = payload.get('orig_indices')
+    if orig_indices is None:
+        return features, labels, None
+    if isinstance(orig_indices, torch.Tensor):
+        orig_indices = orig_indices.detach().cpu().long()
+    else:
+        orig_indices = torch.as_tensor(orig_indices, dtype=torch.long)
+    expected = torch.arange(num_nodes, dtype=torch.long)
+    if orig_indices.numel() == num_nodes and torch.equal(orig_indices, expected):
+        return features, labels, orig_indices
+
+    if orig_indices.numel() != features.size(0):
+        raise ValueError(
+            f'orig_indices length ({orig_indices.numel()}) does not match feature rows ({features.size(0)}).'
+        )
+    aligned_features = features.new_zeros((num_nodes, features.size(1)))
+    aligned_labels = labels.new_full((num_nodes,), -1)
+    valid = (orig_indices >= 0) & (orig_indices < num_nodes)
+    if int(valid.sum().item()) != num_nodes:
+        missing_count = num_nodes - int(valid.sum().item())
+        raise ValueError(f'Embedding payload does not cover all coarse nodes, missing_count={missing_count}.')
+    aligned_features[orig_indices[valid]] = features[valid]
+    aligned_labels[orig_indices[valid]] = labels[valid]
+    return aligned_features, aligned_labels, expected
+
+
 class RelationMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout):
         super().__init__()
@@ -566,6 +702,57 @@ class SAGERelation(nn.Module):
         return self.fc2(torch.cat([h, neigh_h], dim=-1)).view(-1)
 
 
+class GatedSAGERelation(nn.Module):
+    def __init__(self, input_dim, hidden_dim, dropout, gate_hidden_dim):
+        super().__init__()
+        self.gate1 = nn.Sequential(
+            nn.Linear(input_dim * 3, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+        self.fc1 = nn.Linear(input_dim * 2 + 1, hidden_dim)
+        self.gate2 = nn.Sequential(
+            nn.Linear(hidden_dim * 3, gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+        self.fc2 = nn.Linear(hidden_dim * 2 + 1, 1)
+        self.dropout = nn.Dropout(dropout)
+        self._latest_diagnostics = {}
+
+    @staticmethod
+    def _gate_input(self_features, neighbor_features):
+        return torch.cat(
+            [
+                self_features,
+                neighbor_features,
+                torch.abs(self_features - neighbor_features),
+            ],
+            dim=-1,
+        )
+
+    def forward(self, features, adj_norm):
+        neigh = torch.sparse.mm(adj_norm, features)
+        gate1 = torch.sigmoid(self.gate1(self._gate_input(features, neigh)))
+        h = F.relu(self.fc1(torch.cat([features, gate1 * neigh, gate1], dim=-1)))
+        h = self.dropout(h)
+
+        neigh_h = torch.sparse.mm(adj_norm, h)
+        gate2 = torch.sigmoid(self.gate2(self._gate_input(h, neigh_h)))
+        logits = self.fc2(torch.cat([h, gate2 * neigh_h, gate2], dim=-1)).view(-1)
+
+        self._latest_diagnostics = {
+            'gate1': gate1.detach().view(-1).cpu(),
+            'gate2': gate2.detach().view(-1).cpu(),
+        }
+        return logits
+
+    def diagnostics(self):
+        return dict(self._latest_diagnostics)
+
+
 class APPNPRelation(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout, k_steps, alpha):
         super().__init__()
@@ -589,6 +776,13 @@ def build_relation_model(model_name, input_dim, args):
         return GCNRelation(input_dim, args.relation_hidden_dim, args.relation_dropout)
     if name == 'sage':
         return SAGERelation(input_dim, args.relation_hidden_dim, args.relation_dropout)
+    if name in ('gated_sage', 'position_sage'):
+        return GatedSAGERelation(
+            input_dim,
+            args.relation_hidden_dim,
+            args.relation_dropout,
+            int(args.gated_sage_gate_hidden_dim),
+        )
     if name == 'appnp':
         return APPNPRelation(
             input_dim,
@@ -633,11 +827,12 @@ def evaluate_relation_model(model, features, labels, masks, adj_for_model):
     model.eval()
     with torch.inference_mode():
         logits = model(features, adj_for_model)
+    diagnostics = model.diagnostics() if hasattr(model, 'diagnostics') else {}
     result = {}
     for split_name, mask in masks.items():
         metric = binary_metrics_from_logits(logits, labels, mask)
         result[split_name] = metric
-    return result, logits.detach().cpu()
+    return result, logits.detach().cpu(), diagnostics
 
 
 def is_better(current_metrics, best_metrics, selection_metric):
@@ -665,7 +860,8 @@ def train_one_relation_model(model_name, features, labels, masks, adj_tensors, a
     )
     train_mask = masks['train'].to(device=device, dtype=torch.bool)
     labels = labels.to(device=device, dtype=torch.float32)
-    adj_for_model = adj_tensors['row'] if model_name == 'sage' else adj_tensors['symmetric']
+    row_models = {'sage', 'gated_sage', 'position_sage'}
+    adj_for_model = adj_tensors['row'] if model_name in row_models else adj_tensors['symmetric']
 
     best_state = None
     best_metrics = None
@@ -679,7 +875,7 @@ def train_one_relation_model(model_name, features, labels, masks, adj_tensors, a
         loss.backward()
         optimizer.step()
 
-        current_metrics, _ = evaluate_relation_model(model, features, labels, masks, adj_for_model)
+        current_metrics, _, _ = evaluate_relation_model(model, features, labels, masks, adj_for_model)
         if is_better(current_metrics, best_metrics, args.selection_metric):
             best_metrics = current_metrics
             best_epoch = epoch
@@ -707,13 +903,20 @@ def train_one_relation_model(model_name, features, labels, masks, adj_tensors, a
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_metrics, final_logits = evaluate_relation_model(model, features, labels, masks, adj_for_model)
+    final_metrics, final_logits, final_diagnostics = evaluate_relation_model(
+        model,
+        features,
+        labels,
+        masks,
+        adj_for_model,
+    )
     return {
         'model_name': model_name,
         'best_epoch': int(best_epoch),
         'best_metrics': best_metrics,
         'final_metrics': final_metrics,
         'logits': final_logits,
+        'diagnostics': final_diagnostics,
         'state_dict': model.state_dict(),
     }
 
@@ -729,6 +932,9 @@ def save_predictions_csv(path, orig_indices, labels, split_names, model_outputs)
     for model_name in model_outputs:
         fieldnames.append(f'{model_name}_prob')
         fieldnames.append(f'{model_name}_pred')
+        diagnostics = model_outputs[model_name].get('diagnostics', {})
+        for diag_name in sorted(diagnostics):
+            fieldnames.append(f'{model_name}_{diag_name}')
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -742,6 +948,9 @@ def save_predictions_csv(path, orig_indices, labels, split_names, model_outputs)
                 prob = float(torch.sigmoid(output['logits'][row_idx]).item())
                 row[f'{model_name}_prob'] = prob
                 row[f'{model_name}_pred'] = int(prob > 0.5)
+                diagnostics = output.get('diagnostics', {})
+                for diag_name, diag_values in diagnostics.items():
+                    row[f'{model_name}_{diag_name}'] = float(diag_values[row_idx].item())
             writer.writerow(row)
 
 
@@ -779,6 +988,28 @@ def json_safe(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
     return value
+
+
+def summarize_diagnostics_by_split(diagnostics, masks):
+    summary = {}
+    for diag_name, values in diagnostics.items():
+        if not isinstance(values, torch.Tensor):
+            values = torch.as_tensor(values)
+        values = values.detach().cpu().float().view(-1)
+        diag_summary = {}
+        for split_name, mask in masks.items():
+            local_mask = mask.detach().cpu().bool().view(-1)
+            if local_mask.numel() != values.numel() or int(local_mask.sum().item()) == 0:
+                continue
+            local_values = values[local_mask]
+            diag_summary[split_name] = {
+                'mean': float(local_values.mean().item()),
+                'std': float(local_values.std(unbiased=False).item()),
+                'min': float(local_values.min().item()),
+                'max': float(local_values.max().item()),
+            }
+        summary[diag_name] = diag_summary
+    return summary
 
 
 def run_relation_experiment(
@@ -819,7 +1050,8 @@ def run_relation_experiment(
         'metadata': metadata or {},
         'split': split,
         'feature_shape': list(features.shape),
-        'coarse_graph': {
+        'relation_graph': {
+            'type': str(getattr(args, 'relation_graph', 'coarse')),
             'num_nodes': int(coarse_adj.shape[0]),
             'num_edges_directed': int(coarse_adj.nnz),
             'avg_degree_directed': float(coarse_adj.nnz / max(coarse_adj.shape[0], 1)),
@@ -841,6 +1073,7 @@ def run_relation_experiment(
             'best_epoch': output['best_epoch'],
             'best_metrics': output['best_metrics'],
             'final_metrics': output['final_metrics'],
+            'diagnostics': summarize_diagnostics_by_split(output.get('diagnostics', {}), masks),
         }
         torch.save(
             {
@@ -884,6 +1117,7 @@ def synthetic_smoke(args):
         cols.extend(neigh.tolist())
     data = np.ones(len(rows), dtype=np.float32)
     coarse_adj = sp.csr_matrix((data, (rows, cols)), shape=(num_nodes, num_nodes))
+    relation_adj, relation_graph_metadata = build_relation_adjacency(coarse_adj, features, args)
     train_end = int(num_nodes * 0.6)
     val_end = int(num_nodes * 0.8)
     split = {
@@ -897,11 +1131,11 @@ def synthetic_smoke(args):
     return run_relation_experiment(
         features,
         labels,
-        coarse_adj,
+        relation_adj,
         split,
         args,
         args.out_dir,
-        metadata={'synthetic_smoke': True},
+        metadata={'synthetic_smoke': True, 'relation_graph': relation_graph_metadata},
         orig_indices=None,
     )
 
@@ -926,9 +1160,14 @@ def make_run_args(args, fold_idx):
 
 
 def run_output_dir(args):
+    graph_name = str(getattr(args, 'relation_graph', 'coarse')).strip().lower()
     if args.split_source == 'fixed_cv':
-        return os.path.join(args.out_dir, args.data_name, f'fold_{args.fold_idx}')
-    return os.path.join(args.out_dir, args.data_name, 'dataset_split')
+        if graph_name == 'coarse':
+            return os.path.join(args.out_dir, args.data_name, f'fold_{args.fold_idx}')
+        return os.path.join(args.out_dir, args.data_name, graph_name, f'fold_{args.fold_idx}')
+    if graph_name == 'coarse':
+        return os.path.join(args.out_dir, args.data_name, 'dataset_split')
+    return os.path.join(args.out_dir, args.data_name, graph_name, 'dataset_split')
 
 
 def run_one_split(args, hparams, loader, fold_idx):
@@ -942,8 +1181,10 @@ def run_one_split(args, hparams, loader, fold_idx):
         len(split['test_indices']),
     )
     payload = load_or_export_embeddings(loader, hparams, split, run_args)
-    features = payload['features'].float()
-    labels = payload['labels'].long()
+    features, labels, aligned_orig_indices = align_payload_to_coarse_nodes(
+        payload,
+        num_nodes=int(loader.coarse_adj.shape[0]),
+    )
     if features.size(0) != loader.coarse_adj.shape[0]:
         raise ValueError(
             f'Embedding rows ({features.size(0)}) do not match coarse nodes ({loader.coarse_adj.shape[0]}).'
@@ -953,21 +1194,23 @@ def run_one_split(args, hparams, loader, fold_idx):
         ensure_parent_dir(run_args.embeddings_path)
         torch.save(payload, run_args.embeddings_path)
 
+    relation_adj, relation_graph_metadata = build_relation_adjacency(loader.coarse_adj, features, run_args)
     metadata = {
         'data_name': run_args.data_name,
         'embedding_key': payload.get('embedding_key', run_args.embedding_key),
         'embeddings_path': run_args.embeddings_path,
+        'relation_graph': relation_graph_metadata,
         'coarse_graph_metadata': loader.coarse_graph_metadata,
     }
     result = run_relation_experiment(
         features,
         labels,
-        loader.coarse_adj,
+        relation_adj,
         split,
         run_args,
         out_dir,
         metadata=metadata,
-        orig_indices=payload.get('orig_indices'),
+        orig_indices=aligned_orig_indices,
     )
     for model_name, model_result in result['models'].items():
         test = model_result['final_metrics']['test']
@@ -1020,7 +1263,11 @@ def aggregate_fold_results(fold_outputs):
 def save_all_folds_summary(args, fold_outputs):
     summary_args = copy.copy(args)
     apply_path_templates(summary_args, fold_idx='all')
-    base_out_dir = os.path.join(summary_args.out_dir, summary_args.data_name)
+    graph_name = str(getattr(summary_args, 'relation_graph', 'coarse')).strip().lower()
+    if graph_name == 'coarse':
+        base_out_dir = os.path.join(summary_args.out_dir, summary_args.data_name)
+    else:
+        base_out_dir = os.path.join(summary_args.out_dir, summary_args.data_name, graph_name)
     ensure_parent_dir(os.path.join(base_out_dir, 'dummy'))
     os.makedirs(base_out_dir, exist_ok=True)
     payload = {
