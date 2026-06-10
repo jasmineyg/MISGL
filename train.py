@@ -12,8 +12,12 @@ import time
 from MISGL.utils import hparam
 from MISGL.utils import hparams_lib
 from MISGL.utils import reproducibility
+from MISGL.utils.experiment_results import save_experiment_results
 
 _AUTO_GPU_VALUES = set(['auto', 'idle', 'free'])
+_RESULT_EXCEL_PATH = '/data/yg/Subgraph-MIL/diffpool2/experiment_results.xlsx'
+_RESULT_DATASETS = ('ogbn_arxiv', 'ogbn_products', 'reddit')
+_RESULT_SPLITS = ('train', 'val', 'test')
 
 
 def _parse_data_name_set(raw):
@@ -108,11 +112,46 @@ def _resolve_cuda_visible_devices(args, hparams):
   return selected_gpu
 
 
+def _resolve_experiment_name(hparams):
+  base_name = getattr(hparams, 'timestamp', None)
+  base_name = str(base_name).strip() if base_name is not None else ''
+  return base_name or 'run'
+
+
+def _format_metric_entry(metric_summary):
+  if not isinstance(metric_summary, dict):
+    return ''
+  mean = metric_summary.get('mean', None)
+  std = metric_summary.get('std', None)
+  if mean is None or std is None:
+    return ''
+  return '{:.4f} ± {:.4f}'.format(float(mean), float(std))
+
+
+def _build_excel_results(dataset_summaries):
+  results = {}
+  summary_by_dataset = {
+    item['data_name']: item.get('split_summary', {}) or {}
+    for item in dataset_summaries
+  }
+  for dataset_name in _RESULT_DATASETS:
+    split_summary = summary_by_dataset.get(dataset_name, {}) or {}
+    results[dataset_name] = {}
+    for split_name in _RESULT_SPLITS:
+      metrics = split_summary.get(split_name, {}) or {}
+      results[dataset_name][split_name] = {
+        'acc': _format_metric_entry(metrics.get('acc', {})),
+        'f1': _format_metric_entry(metrics.get('F1', {})),
+      }
+  return results
+
+
 def main(args):
 
   base_hparams = hparam.HParams()
   base_hparams.from_yaml(args.hparam_path)
   hparams_lib.apply_defaults(base_hparams)
+  experiment_name = _resolve_experiment_name(base_hparams)
   if args.processed_data_dir:
     base_hparams.processed_data_dir = args.processed_data_dir
 
@@ -178,10 +217,27 @@ def main(args):
       if torch.cuda.is_available():
         torch.cuda.empty_cache()
       summary = ret.get('summary', {}) if isinstance(ret, dict) else {}
-      all_dataset_summaries.append({'data_name': data_name, 'summary': summary})
+      split_summary = ret.get('split_summary', {}) if isinstance(ret, dict) else {}
+      all_dataset_summaries.append({
+        'data_name': data_name,
+        'summary': summary,
+        'split_summary': split_summary,
+      })
     except Exception as e:
       logging.exception('Dataset {} failed: {}'.format(data_name, str(e)))
       failed_datasets.append(data_name)
+
+  if all_dataset_summaries:
+    excel_results = _build_excel_results(all_dataset_summaries)
+    try:
+      saved_name = save_experiment_results(
+        _RESULT_EXCEL_PATH,
+        experiment_name,
+        excel_results,
+      )
+      logging.warning('Saved experiment summary to {} [{}]'.format(_RESULT_EXCEL_PATH, saved_name))
+    except Exception as exc:
+      logging.exception('Failed to save experiment summary to Excel: {}'.format(str(exc)))
 
   if len(all_dataset_summaries) > 0 or failed_datasets:
     logging.warning('\n' + '='*60)
