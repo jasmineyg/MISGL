@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from MISGL.utils import hparams_lib
 from MISGL.utils.global_variables import *
 from MISGL.utils import reproducibility
+from MISGL.utils import lappe
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
@@ -31,6 +32,12 @@ class GraphDataset(Dataset):
     )
     self._structure_undirected = bool(bb_cfg.get('structural_undirected', True)) if bb_cfg else True
     self._structural_feature_dim = 7
+    self._use_lappe = bool(getattr(self._hparams, 'use_lappe', False))
+    self._lap_pe_tensor = getattr(self._hparams, 'lap_pe_tensor', None)
+    if self._use_lappe:
+      if not isinstance(self._lap_pe_tensor, torch.Tensor):
+        raise ValueError('use_lappe=True requires hparams.lap_pe_tensor.')
+      self._lap_pe_tensor = self._lap_pe_tensor.to(device=self._device, dtype=torch.float32)
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -71,6 +78,10 @@ class GraphDataset(Dataset):
       except (TypeError, ValueError):
         subgraph_id = -1
       graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
+      if self._use_lappe:
+        if subgraph_id < 0 or subgraph_id >= int(self._lap_pe_tensor.size(0)):
+          raise ValueError('Invalid subgraph_id {} for LapPE rows {}'.format(subgraph_id, int(self._lap_pe_tensor.size(0))))
+        graph_tmp_dict[g_key.lap_pe] = self._lap_pe_tensor[subgraph_id].clone()
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
 
@@ -196,6 +207,10 @@ class GraphDataLoaderWrapper(object):
     self._dataset_raw = dataset
     self.original_graph = dataset.get('original_graph', None)
     self.assignment_matrix = dataset.get('assignment_matrix', None)
+    self.lappe_payload = None
+    if bool(getattr(self._hparams, 'use_lappe', False)):
+      self.lappe_payload = lappe.get_or_build_lappe(dataset, self._hparams, data_name)
+      self._set_or_add_hparam('lap_pe_tensor', self.lappe_payload['lap_pe'])
     self.all_indices = list(train_indices) + list(test_indices)
     self.all_graphs = []
     subgraph_labels = dataset.get('subgraph_labels', None)

@@ -9,6 +9,23 @@ from MISGL.utils.global_variables import g_key
 from MISGL.utils import hparams_lib
 
 
+class PositionMLP(nn.Module):
+    """Encodes precomputed Laplacian positional encodings for each bag."""
+
+    def __init__(self, lap_pe_dim, pos_dim, hidden_dim=64, dropout=0.0):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(int(lap_pe_dim), int(hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(p=float(dropout)),
+            nn.Linear(int(hidden_dim), int(pos_dim)),
+            nn.ReLU(),
+        )
+
+    def forward(self, lap_pe):
+        return self.layers(lap_pe)
+
+
 class MISGLEncoder(nn.Module):
     """Simple encoder: raw node features -> 1-layer GAT -> pooled graph embedding -> classifier."""
 
@@ -22,6 +39,10 @@ class MISGLEncoder(nn.Module):
         bb_cfg = getattr(self._hparams, 'branch_b', None)
         self.use_branch_b = bool(bb_cfg and bb_cfg.get('use', False))
         self.use_coarse_graph = bool(getattr(self._hparams, 'use_coarse_graph', False))
+        self.use_lappe = bool(getattr(self._hparams, 'use_lappe', False))
+        self.classifier_input_mode = self._resolve_classifier_input_mode(
+            getattr(self._hparams, 'classifier_input_mode', 'auto')
+        )
 
         in_dim = int(self._hparams.channel_list[0])
         hidden_dim = int(self._hparams.channel_list[1])
@@ -36,6 +57,8 @@ class MISGLEncoder(nn.Module):
         gat_concat = bool(getattr(self._hparams, 'gat_concat', True))
         gat_residual = bool(getattr(self._hparams, 'gat_residual', True))
         classifier_input_dim = hidden_dim
+        self.lap_pe_dim = int(getattr(self._hparams, 'lap_pe_dim', 16))
+        self.pos_dim = int(getattr(self._hparams, 'pos_dim', 64))
 
         self.gat_layer = ResidualGATLayer(
             in_dim=in_dim,
@@ -91,6 +114,24 @@ class MISGLEncoder(nn.Module):
             self.branch_b_head = None
 
         # 分类器 两层MLP
+        self.classifier_input_mode = self._expand_auto_classifier_input_mode(self.classifier_input_mode)
+        self._validate_classifier_input_mode()
+        classifier_input_dim = self._classifier_input_dim(hidden_dim)
+
+        if self._mode_uses_position():
+            if self.lap_pe_dim <= 0:
+                raise ValueError('lap_pe_dim must be positive when use_lappe=True.')
+            if self.pos_dim <= 0:
+                raise ValueError('pos_dim must be positive when use_lappe=True.')
+            self.position_mlp = PositionMLP(
+                lap_pe_dim=self.lap_pe_dim,
+                pos_dim=self.pos_dim,
+                hidden_dim=64,
+                dropout=dropout,
+            )
+        else:
+            self.position_mlp = None
+
         self.classifier = nn.Sequential(
             nn.Linear(classifier_input_dim, classifier_hidden_dim),
             nn.LeakyReLU(negative_slope=negative_slope),
@@ -100,9 +141,98 @@ class MISGLEncoder(nn.Module):
 
         self.reset_parameters()
 
+    def _resolve_classifier_input_mode(self, mode):
+        mode = str(mode).strip().lower()
+        aliases = {
+            '': 'auto',
+            'default': 'auto',
+            'gat': 'mean',
+            'gat_mean': 'mean',
+            'meanpool': 'mean',
+            'mean_pool': 'mean',
+            'mil_head': 'mil',
+            'position_head': 'position',
+            'position_only': 'position',
+            'pos': 'position',
+            'pos_only': 'position',
+            'mean_pos': 'mean_position',
+            'mean_position': 'mean_position',
+            'mil_pos': 'mil_position',
+            'mil_position': 'mil_position',
+        }
+        mode = aliases.get(mode, mode)
+        valid = {'auto', 'mean', 'mil', 'position', 'mean_position', 'mil_position'}
+        if mode not in valid:
+            raise ValueError('Unsupported classifier_input_mode: {!r}'.format(mode))
+        return mode
+
+    def _expand_auto_classifier_input_mode(self, mode):
+        if mode != 'auto':
+            return mode
+        if self.use_branch_b and self.use_lappe:
+            return 'mil_position'
+        if self.use_branch_b:
+            return 'mil'
+        if self.use_lappe:
+            return 'mean_position'
+        return 'mean'
+
+    def _mode_uses_mil(self):
+        return self.classifier_input_mode in ('mil', 'mil_position')
+
+    def _mode_uses_mean(self):
+        return self.classifier_input_mode in ('mean', 'mean_position')
+
+    def _mode_uses_position(self):
+        return self.classifier_input_mode in ('position', 'mean_position', 'mil_position')
+
+    def _validate_classifier_input_mode(self):
+        if self._mode_uses_mil() and not self.use_branch_b:
+            raise ValueError('classifier_input_mode={} requires branch_b.use=true.'.format(self.classifier_input_mode))
+        if self._mode_uses_position() and not self.use_lappe:
+            raise ValueError('classifier_input_mode={} requires use_lappe=true.'.format(self.classifier_input_mode))
+
+    def _classifier_input_dim(self, hidden_dim):
+        input_dim = 0
+        if self._mode_uses_mean():
+            input_dim += int(hidden_dim)
+        if self._mode_uses_mil():
+            input_dim += int(self.branch_b_head.output_dim)
+        if self._mode_uses_position():
+            input_dim += int(self.pos_dim)
+        if input_dim <= 0:
+            raise ValueError('classifier_input_mode produced an empty classifier input.')
+        return input_dim
+
+    def _build_classifier_input(self, mean_input, branch_b_out, pos_emb):
+        parts = []
+        if self._mode_uses_mean():
+            parts.append(mean_input)
+        if self._mode_uses_mil():
+            if branch_b_out is None or 'z_B' not in branch_b_out:
+                raise ValueError('classifier_input_mode={} requires a valid MIL output.'.format(self.classifier_input_mode))
+            parts.append(branch_b_out['z_B'])
+        if self._mode_uses_position():
+            if pos_emb is None:
+                raise ValueError('classifier_input_mode={} requires a valid position embedding.'.format(self.classifier_input_mode))
+            parts.append(pos_emb)
+        batch_size = int(parts[0].size(0))
+        for part in parts[1:]:
+            if int(part.size(0)) != batch_size:
+                raise ValueError('Classifier input parts have mismatched batch sizes.')
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=-1)
+
     def reset_parameters(self):
         self.gat_layer.reset_parameters()
         gain = torch.nn.init.calculate_gain('leaky_relu', float(getattr(self._hparams, 'leaky_relu_alpha', 0.2)))
+        if self.position_mlp is not None:
+            for module in self.position_mlp.modules():
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_uniform_(module.weight, gain=gain)
+                    if module.bias is not None:
+                        torch.nn.init.constant_(module.bias, 0.0)
         for module in self.classifier.modules():
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight, gain=gain)
@@ -125,8 +255,9 @@ class MISGLEncoder(nn.Module):
         mask = self.construct_mask(max_nodes, batch_num_nodes, x.device)
         h = self.gat_layer(x, adj, mask)
         h1 = self._masked_mean_pool(h, batch_num_nodes)
-        classifier_input = h1
         branch_b_out = None
+        lap_pe = None
+        pos_emb = None
 
         if self.use_branch_b:
             h_flat, batch_index = self._flatten_valid_nodes(h, batch_num_nodes)
@@ -150,8 +281,22 @@ class MISGLEncoder(nn.Module):
                 )
                 if h_flat.size(0) > 0 else None
             )
-            if branch_b_out is not None:
-                classifier_input = branch_b_out['z_B']
+
+        if self._mode_uses_position():
+            if g_key.lap_pe not in graph_input:
+                raise ValueError('use_lappe=True but graph_input does not contain LapPE.')
+            lap_pe = graph_input[g_key.lap_pe].to(device=h.device, dtype=h.dtype)
+            if lap_pe.dim() != 2 or lap_pe.size(1) != self.lap_pe_dim:
+                raise ValueError('Expected LapPE shape [B, {}], got {}'.format(self.lap_pe_dim, tuple(lap_pe.shape)))
+            if lap_pe.size(0) != h1.size(0):
+                raise ValueError(
+                    'LapPE batch size {} does not match graph batch size {}.'.format(
+                        int(lap_pe.size(0)), int(h1.size(0))
+                    )
+                )
+            pos_emb = self.position_mlp(lap_pe)
+
+        classifier_input = self._build_classifier_input(h1, branch_b_out, pos_emb)
 
         ypred = self.classifier(classifier_input)
 
@@ -175,6 +320,10 @@ class MISGLEncoder(nn.Module):
             'graph_emb_classifier': classifier_input,
             'graph_emb': classifier_input,
         }
+        if lap_pe is not None:
+            emb['lap_pe'] = lap_pe
+        if pos_emb is not None:
+            emb['pos_emb'] = pos_emb
         if branch_b_out is not None:
             emb['z_B'] = branch_b_out['z_B']
             emb['z_h'] = branch_b_out['z_h']

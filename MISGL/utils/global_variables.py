@@ -11,6 +11,7 @@ class GKey(object):
     self.orig_graph_idx = 'orig_graph_idx'
     self.subgraph_id = 'subgraph_id'
     self.structural_features = 'structural_features'
+    self.lap_pe = 'lap_pe'
 
 
 g_key = GKey()

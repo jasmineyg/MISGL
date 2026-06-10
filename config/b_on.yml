@@ -1,5 +1,5 @@
-data_name_set: ['ogbn_arxiv']
-timestamp: loss
+data_name_set: ['ogbn_arxiv','reddit']
+timestamp: MIL-Head-stru7
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
@@ -18,3 +18,8 @@ branch_b:
   attention_shape_loss_weight: 0.05
 
 export_attention: true
+
+use_lappe: false
+lap_pe_dim: 16
+pos_dim: 64
+coarse_topk: 20
