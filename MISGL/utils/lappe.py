@@ -10,6 +10,9 @@ import scipy.sparse.linalg as spla
 import torch
 
 
+LAPPE_CACHE_VERSION = 2
+
+
 def default_lappe_cache_path(processed_data_dir, data_name, lap_pe_dim, coarse_topk):
   return os.path.join(
     processed_data_dir,
@@ -30,7 +33,12 @@ def resolve_lappe_cache_path(hparams, data_name):
   )
 
 
-def load_lappe_cache(cache_path, expected_dim=None, expected_num_subgraphs=None):
+def load_lappe_cache(
+    cache_path,
+    expected_dim=None,
+    expected_num_subgraphs=None,
+    expected_cache_version=None,
+):
   payload = torch.load(cache_path, map_location='cpu')
   if isinstance(payload, torch.Tensor):
     lap_pe = payload.to(dtype=torch.float32)
@@ -42,6 +50,14 @@ def load_lappe_cache(cache_path, expected_dim=None, expected_num_subgraphs=None)
     raise ValueError('Invalid LapPE cache format: {}'.format(cache_path))
 
   lap_pe = payload['lap_pe']
+  if expected_cache_version is not None:
+    cache_version = payload.get('cache_version')
+    if cache_version != expected_cache_version:
+      raise ValueError(
+        'LapPE cache version mismatch at {}: expected {}, got {}'.format(
+          cache_path, expected_cache_version, cache_version
+        )
+      )
   if lap_pe.dim() != 2:
     raise ValueError('LapPE cache must have shape [num_subgraphs, lap_pe_dim], got {}'.format(tuple(lap_pe.shape)))
   if expected_dim is not None and int(lap_pe.size(1)) != int(expected_dim):
@@ -66,14 +82,23 @@ def get_or_build_lappe(dataset, hparams, data_name):
   cache_path = resolve_lappe_cache_path(hparams, data_name)
 
   if os.path.exists(cache_path):
-    logging.warning('Loading LapPE cache from {}'.format(cache_path))
-    return load_lappe_cache(cache_path, expected_dim=lap_pe_dim, expected_num_subgraphs=num_subgraphs)
+    try:
+      logging.warning('Loading LapPE cache from {}'.format(cache_path))
+      return load_lappe_cache(
+        cache_path,
+        expected_dim=lap_pe_dim,
+        expected_num_subgraphs=num_subgraphs,
+        expected_cache_version=LAPPE_CACHE_VERSION,
+      )
+    except ValueError as exc:
+      logging.warning('Rebuilding incompatible LapPE cache: {}'.format(exc))
 
   logging.warning('Building LapPE cache at {}'.format(cache_path))
   payload = build_lappe_payload(
     original_graph=dataset.get('original_graph', None),
     assignment_matrix=dataset.get('assignment_matrix', None),
     num_subgraphs=num_subgraphs,
+    subgraph_structures=dataset.get('subgraph_structures', None),
     lap_pe_dim=lap_pe_dim,
     coarse_topk=coarse_topk,
   )
@@ -82,7 +107,14 @@ def get_or_build_lappe(dataset, hparams, data_name):
   return payload
 
 
-def build_lappe_payload(original_graph, assignment_matrix, num_subgraphs, lap_pe_dim=16, coarse_topk=20):
+def build_lappe_payload(
+    original_graph,
+    assignment_matrix,
+    num_subgraphs,
+    subgraph_structures=None,
+    lap_pe_dim=16,
+    coarse_topk=20,
+):
   if original_graph is None:
     raise ValueError('original_graph is required to build LapPE.')
   if assignment_matrix is None:
@@ -90,7 +122,18 @@ def build_lappe_payload(original_graph, assignment_matrix, num_subgraphs, lap_pe
   if num_subgraphs <= 0:
     raise ValueError('num_subgraphs must be positive.')
 
-  node_to_subgraph, node_counts = _assignment_to_node_map(assignment_matrix, num_subgraphs)
+  source_cluster_ids = np.arange(num_subgraphs, dtype=np.int64)
+  alignment_diagnostics = {}
+  if subgraph_structures is not None:
+    node_to_subgraph, node_counts, source_cluster_ids, alignment_diagnostics = (
+      align_assignment_to_subgraphs(
+        original_graph,
+        assignment_matrix,
+        subgraph_structures,
+      )
+    )
+  else:
+    node_to_subgraph, node_counts = _assignment_to_node_map(assignment_matrix, num_subgraphs)
   coarse_adj = build_coarse_adjacency(original_graph, node_to_subgraph, node_counts)
   coarse_adj = coarse_adj.tolil()
   coarse_adj.setdiag(0.0)
@@ -112,12 +155,126 @@ def build_lappe_payload(original_graph, assignment_matrix, num_subgraphs, lap_pe
     'coarse_edges_after_topk': int(pruned_adj.nnz),
     'coarse_edges_after_sym': int(sym_adj.nnz),
   }
+  diagnostics.update(alignment_diagnostics)
   return {
+    'cache_version': LAPPE_CACHE_VERSION,
     'lap_pe': torch.tensor(lap_pe, dtype=torch.float32),
     'eigenvalues': torch.tensor(eigenvalues, dtype=torch.float32),
     'kept_eigenvalues': torch.tensor(kept_eigenvalues, dtype=torch.float32),
+    'source_cluster_ids': torch.tensor(source_cluster_ids, dtype=torch.long),
     'diagnostics': diagnostics,
   }
+
+
+def align_assignment_to_subgraphs(original_graph, assignment_matrix, subgraph_structures):
+  if not subgraph_structures:
+    raise ValueError('subgraph_structures must not be empty.')
+
+  source_assignment, source_cluster_count = _assignment_to_source_map(assignment_matrix)
+  graph_nodes = list(original_graph.nodes())
+  use_direct_node_ids = all(_is_valid_node_index(node, len(source_assignment)) for node in graph_nodes)
+  node_to_row = None if use_direct_node_ids else {node: idx for idx, node in enumerate(graph_nodes)}
+
+  source_cluster_ids = []
+  alignment_mismatch_count = 0
+  aligned_node_count = 0
+  for subgraph_idx, subgraph in enumerate(subgraph_structures):
+    rows = []
+    for node in subgraph.nodes():
+      row_idx = (
+        int(node)
+        if use_direct_node_ids and _is_valid_node_index(node, len(source_assignment))
+        else node_to_row.get(node, -1)
+      )
+      if row_idx < 0 or row_idx >= len(source_assignment):
+        raise ValueError(
+          'Subgraph {} contains node {!r} that cannot be mapped to assignment_matrix.'.format(
+            subgraph_idx, node
+          )
+        )
+      rows.append(row_idx)
+
+    assigned = source_assignment[np.asarray(rows, dtype=np.int64)]
+    assigned = assigned[assigned >= 0]
+    if assigned.size == 0:
+      raise ValueError('Subgraph {} has no valid assignment rows.'.format(subgraph_idx))
+
+    values, counts = np.unique(assigned, return_counts=True)
+    source_cluster = int(values[int(np.argmax(counts))])
+    source_cluster_ids.append(source_cluster)
+    alignment_mismatch_count += int(np.count_nonzero(assigned != source_cluster))
+    aligned_node_count += int(assigned.size)
+
+  if len(set(source_cluster_ids)) != len(source_cluster_ids):
+    raise ValueError('Multiple subgraphs map to the same assignment cluster.')
+
+  source_to_subgraph = np.full((source_cluster_count,), -1, dtype=np.int64)
+  for subgraph_idx, source_cluster in enumerate(source_cluster_ids):
+    if source_cluster < 0 or source_cluster >= source_cluster_count:
+      raise ValueError(
+        'Subgraph {} maps to invalid assignment cluster {}.'.format(
+          subgraph_idx, source_cluster
+        )
+      )
+    source_to_subgraph[source_cluster] = subgraph_idx
+
+  node_to_subgraph = np.full(source_assignment.shape, -1, dtype=np.int64)
+  valid = (source_assignment >= 0) & (source_assignment < source_cluster_count)
+  node_to_subgraph[valid] = source_to_subgraph[source_assignment[valid]]
+  mapped = node_to_subgraph >= 0
+  node_counts = np.bincount(
+    node_to_subgraph[mapped],
+    minlength=len(subgraph_structures),
+  ).astype(np.float64, copy=False)
+
+  active_source_clusters = np.unique(source_assignment[source_assignment >= 0])
+  diagnostics = {
+    'assignment_cluster_count': int(source_cluster_count),
+    'active_assignment_clusters': int(active_source_clusters.size),
+    'mapped_assignment_clusters': int(len(source_cluster_ids)),
+    'unmapped_assignment_clusters': int(
+      np.count_nonzero(~np.isin(active_source_clusters, source_cluster_ids))
+    ),
+    'alignment_mismatch_nodes': int(alignment_mismatch_count),
+    'alignment_checked_nodes': int(aligned_node_count),
+  }
+  return (
+    node_to_subgraph,
+    node_counts,
+    np.asarray(source_cluster_ids, dtype=np.int64),
+    diagnostics,
+  )
+
+
+def _assignment_to_source_map(assignment_matrix):
+  assignment = assignment_matrix
+  if sp.issparse(assignment):
+    assignment = assignment.tocsr()
+    if assignment.ndim != 2:
+      raise ValueError('Sparse assignment_matrix must be 2D.')
+    source_assignment = np.full((assignment.shape[0],), -1, dtype=np.int64)
+    for row_idx in range(assignment.shape[0]):
+      start, end = assignment.indptr[row_idx], assignment.indptr[row_idx + 1]
+      if start == end:
+        continue
+      local_data = assignment.data[start:end]
+      local_cols = assignment.indices[start:end]
+      source_assignment[row_idx] = int(local_cols[int(np.argmax(local_data))])
+    return source_assignment, int(assignment.shape[1])
+
+  assignment = np.asarray(assignment)
+  if assignment.ndim == 1:
+    source_assignment = assignment.astype(np.int64, copy=True)
+    valid = source_assignment >= 0
+    source_cluster_count = int(source_assignment[valid].max()) + 1 if np.any(valid) else 0
+    return source_assignment, source_cluster_count
+  if assignment.ndim == 2:
+    row_sum = assignment.sum(axis=1)
+    source_assignment = assignment.argmax(axis=1).astype(np.int64, copy=False)
+    source_assignment = np.asarray(source_assignment, dtype=np.int64)
+    source_assignment[row_sum <= 0] = -1
+    return source_assignment, int(assignment.shape[1])
+  raise ValueError('assignment_matrix must be 1D or 2D.')
 
 
 def _assignment_to_node_map(assignment_matrix, num_subgraphs):

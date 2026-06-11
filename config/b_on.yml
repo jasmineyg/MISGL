@@ -1,25 +1,25 @@
-data_name_set: ['ogbn_arxiv','reddit']
-timestamp: MIL-Head-stru7
-channel_list: [6805, 256, 128, 64, 1]
+data_name_set: ['ogbn_arxiv','reddit']  # 使用的数据集列表
+timestamp: pos-LapPE-128d  # 实验名称或时间戳标识
+channel_list: [6805, 256, 128, 64, 1]  # 各层的通道数
 
-batch_size: 64
-epoch: 200
-learning_rate: 0.001
-dropout: 0.5
-patience: 30
-grad_clip: 2
+batch_size: 64  # 批次大小
+epoch: 200  # 最大训练轮数
+learning_rate: 0.001  # 学习率
+dropout: 0.5  # Dropout 比例
+patience: 30  # 早停等待轮数
+grad_clip: 2  # 梯度裁剪阈值
 
-branch_b:
-  use: true
-  attn_hidden: 128
-  gate_hidden: 64
-  use_structural_features: true
-  structural_fusion: 'gated_residual'
-  attention_shape_loss_weight: 0.05
+branch_b:  # B 分支配置
+  use: false  # 是否启用 B 分支
+  attn_hidden: 128  # 注意力隐藏层维度
+  gate_hidden: 64  # 门控隐藏层维度
+  use_structural_features: true  # 是否使用结构特征
+  structural_fusion: 'gated_residual'  # 结构特征融合方式
+  attention_shape_loss_weight: 0.05  # 注意力形状损失权重
 
-export_attention: true
+export_attention: true  # 是否导出注意力结果
 
-use_lappe: false
-lap_pe_dim: 16
-pos_dim: 64
-coarse_topk: 20
+use_lappe: true  # 是否使用拉普拉斯位置编码
+lap_pe_dim: 16  # 拉普拉斯位置编码维度
+pos_dim: 128  # 位置特征维度
+coarse_topk: 20  # 粗筛选保留的候选数量

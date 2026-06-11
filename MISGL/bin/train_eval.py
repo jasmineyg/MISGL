@@ -410,6 +410,24 @@ def fixed_cv_train_eval(hparams, data_name=None):
     }, f, indent=2, ensure_ascii=False)
   logging.warning('Saved CV result summary to {}'.format(result_path))
 
+  if bool(getattr(hparams, 'enable_experiment_result_excel', True)):
+    try:
+      from MISGL.utils.experiment_recorder import append_cv_result
+
+      excel_path = append_cv_result(
+        hparams,
+        data_name=data_name,
+        split_summary=split_summary,
+        split_path=split_path,
+        result_path=result_path,
+      )
+      if excel_path:
+        logging.warning('Appended CV result row to {}'.format(excel_path))
+    except Exception as exc:
+      if bool(getattr(hparams, 'experiment_result_excel_strict', False)):
+        raise
+      logging.warning('Failed to append CV result row: {}'.format(exc), exc_info=True)
+
   return {
     'results': all_results,
     'summary': summary,
