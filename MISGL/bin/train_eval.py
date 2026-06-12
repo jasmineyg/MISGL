@@ -32,6 +32,42 @@ def _basic_metrics(result):
   return {key: float(result[key]) for key in _METRIC_KEYS}
 
 
+def _fold_checkpoint_path(hparams, fold_idx):
+  checkpoint_dir = getattr(hparams, 'fold_checkpoint_dir', None)
+  if not checkpoint_dir:
+    checkpoint_dir = os.path.join(hparams.model_save_path, 'checkpoints')
+  filename = '{}_fold_{}.pt'.format(hparams.timestamp, int(fold_idx))
+  return os.path.join(str(checkpoint_dir), filename)
+
+
+def _checkpoint_hparams(hparams):
+  values = dict(hparams.values())
+  values.pop('lap_pe_tensor', None)
+  return values
+
+
+def _save_fold_checkpoint(model, hparams, data_name, fold_idx, seed, split_meta, best_val_result):
+  checkpoint_path = _fold_checkpoint_path(hparams, fold_idx)
+  os.makedirs(os.path.dirname(checkpoint_path) or '.', exist_ok=True)
+  torch.save(
+    {
+      'model_state_dict': {
+        name: value.detach().cpu()
+        for name, value in model.state_dict().items()
+      },
+      'hparams': _checkpoint_hparams(hparams),
+      'data_name': data_name,
+      'fold_idx': int(fold_idx),
+      'seed': int(seed),
+      'split': split_meta,
+      'best_val': best_val_result,
+    },
+    checkpoint_path,
+  )
+  logging.warning('Saved best fold checkpoint: {}'.format(checkpoint_path))
+  return checkpoint_path
+
+
 def _format_metrics(result):
   return ', '.join(f'{key}: {result[key]:.4f}' for key in _METRIC_KEYS)
 
@@ -162,6 +198,17 @@ def train_eval(hparams, data_name=None):
     model, _, best_val_result = train_eval_iter(
       model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw
     )
+    checkpoint_path = None
+    if bool(getattr(hparams, 'save_fold_checkpoints', False)):
+      checkpoint_path = _save_fold_checkpoint(
+        model,
+        hparams,
+        data_name,
+        fold_idx,
+        seed,
+        split_meta,
+        best_val_result,
+      )
 
     loaders_by_split = {
       'train': training_loader,
@@ -321,6 +368,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
       'seed': int(seed),
       'split': split_meta,
       'best_val': best_val_result,
+      'checkpoint_path': checkpoint_path,
       'metrics': dict(metrics_by_split['test']),
       'split_metrics': metrics_by_split,
     })

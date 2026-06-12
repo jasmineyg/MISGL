@@ -1,0 +1,24 @@
+data_name_set: ['ogbn_arxiv', 'reddit']
+timestamp: pos-LapPE-128d
+channel_list: [6805, 256, 128, 64, 1]
+
+device: cuda
+batch_size: 64
+epoch: 200
+learning_rate: 0.001
+dropout: 0.5
+patience: 30
+grad_clip: 2
+
+branch_b:
+  use: false
+
+use_lappe: true
+lap_pe_dim: 16
+pos_dim: 128
+coarse_topk: 20
+classifier_input_mode: mean_position
+
+export_attention: false
+save_fold_checkpoints: true
+fold_checkpoint_dir: result/lappe_checkpoints

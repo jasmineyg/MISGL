@@ -15,7 +15,12 @@ from torch.utils.data import Dataset, DataLoader
 from MISGL.utils import hparams_lib
 from MISGL.utils.global_variables import *
 from MISGL.utils import reproducibility
-from MISGL.utils import coarse_graph as coarse_graph_utils
+from MISGL.utils import lappe
+
+try:
+  from MISGL.utils import coarse_graph as coarse_graph_utils
+except ImportError:
+  coarse_graph_utils = None
 
 
 def _position_head_config(hparams):
@@ -56,6 +61,12 @@ class GraphDataset(Dataset):
     self._position_head_cfg = _position_head_config(self._hparams)
     self._use_position_head = bool(self._position_head_cfg['use'])
     self._position_head_top_k = int(self._position_head_cfg['top_k'])
+    self._use_lappe = bool(getattr(self._hparams, 'use_lappe', False))
+    self._lap_pe_tensor = getattr(self._hparams, 'lap_pe_tensor', None)
+    if self._use_lappe:
+      if not isinstance(self._lap_pe_tensor, torch.Tensor):
+        raise ValueError('use_lappe=True requires hparams.lap_pe_tensor.')
+      self._lap_pe_tensor = self._lap_pe_tensor.to(device=self._device, dtype=torch.float32)
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -96,6 +107,15 @@ class GraphDataset(Dataset):
       except (TypeError, ValueError):
         subgraph_id = -1
       graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
+      if self._use_lappe:
+        if subgraph_id < 0 or subgraph_id >= int(self._lap_pe_tensor.size(0)):
+          raise ValueError(
+            'Invalid subgraph_id {} for LapPE rows {}'.format(
+              subgraph_id,
+              int(self._lap_pe_tensor.size(0)),
+            )
+          )
+        graph_tmp_dict[g_key.lap_pe] = self._lap_pe_tensor[subgraph_id].clone()
       if self._use_position_head:
         coarse_node_id = graph.graph.get('coarse_node_id', subgraph_id)
         coarse_node_num = graph.graph.get('coarse_node_num', 0)
@@ -251,6 +271,10 @@ class GraphDataLoaderWrapper(object):
     self._dataset_raw = dataset
     self.original_graph = dataset.get('original_graph', None)
     self.assignment_matrix = dataset.get('assignment_matrix', None)
+    self.lappe_payload = None
+    if bool(getattr(self._hparams, 'use_lappe', False)):
+      self.lappe_payload = lappe.get_or_build_lappe(dataset, self._hparams, data_name)
+      self._set_or_add_hparam('lap_pe_tensor', self.lappe_payload['lap_pe'])
     self.all_indices = list(train_indices) + list(test_indices)
     self.all_graphs = []
     subgraph_labels = dataset.get('subgraph_labels', None)
@@ -360,6 +384,8 @@ class GraphDataLoaderWrapper(object):
     cfg = _position_head_config(self._hparams)
     if not cfg['use']:
       return
+    if coarse_graph_utils is None:
+      raise ImportError('position_head.use=true requires MISGL.utils.coarse_graph.')
 
     original_graph = dataset.get('original_graph', None)
     assignment_matrix = dataset.get('assignment_matrix', None)

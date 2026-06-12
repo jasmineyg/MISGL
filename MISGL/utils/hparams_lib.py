@@ -24,6 +24,8 @@ DEFAULT_HPARAMS = {
   'gpu_lock_dir': '/tmp/misgl_gpu_locks',
   'preload_data_to_gpu': True,
   'model_save_path': 'results',
+  'save_fold_checkpoints': False,
+  'fold_checkpoint_dir': None,
   'processed_data_dir': '/data/yg/Subgraph-MIL/Data/processed_data',
   'weight_decay': 0.0,
   'label_smoothing': 0.0,
