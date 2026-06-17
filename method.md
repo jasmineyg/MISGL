@@ -517,17 +517,124 @@ logit_i = W2 concat(h_i, gate2_i * neigh_h_i, gate2_i)
 
 该模型记录 `gate1` 和 `gate2`，供诊断脚本分析。但它是 node-level gate，不是 edge-level gate；也就是说它先平均邻居，再决定整体听多少邻居，不能逐边筛掉坏邻居。
 
+#### EdgeSelfOnly 与新的 EdgeGate 消融
+
+当前下一步实验使用四个严格对照：
+
+```text
+mlp
+edge_self_only
+edge_gate_scaled
+edge_gate_node_residual
+```
+
+`edge_self_only` 使用与两个 edge 模型完全相同的：
+
+```text
+self_fc -> ReLU -> dropout -> classifier
+```
+
+但不读取任何边。每折训练前会给所有二阶段模型重置相同随机种子，因此
+`mlp` 与 `edge_self_only` 的同结构分支具有相同初始化，可用于隔离分类器结构差异。
+
+两个 edge 模型先对每条候选边独立评分：
+
+```text
+edge_feature_ij = [
+  z_i, z_j, |z_i-z_j|, z_i*z_j,
+  cosine(z_i,z_j), candidate_weight_ij, coarse_weight_ij
+]
+
+q_ij = sigmoid(EdgeMLP(edge_feature_ij))
+effective_weight_ij = q_ij * candidate_weight_ij
+neighbor_i =
+  sum_j effective_weight_ij * z_j
+  / sum_j candidate_weight_ij
+```
+
+分母使用原始候选边权和，而不是有效边权和。因此当所有 `q_ij` 都低时，
+`neighbor_i` 的幅度会同步减小，模型可以真正拒绝整组低可靠性邻居。
+
+`edge_gate_scaled` 直接做全局小残差：
+
+```text
+h_i = self_i + sigmoid(residual_logit) * message_i
+```
+
+`edge_gate_node_residual` 额外计算节点级 correction gate：
+
+```text
+node_gate_input_i = [
+  self_margin_i,
+  mean(q_ij),
+  max(q_ij),
+  sum(q_ij*w_ij) / sum(w_ij),
+  self/neighbor prediction agreement,
+  has_candidate_i
+]
+
+node_gate_i = sigmoid(NodeGateMLP(node_gate_input_i))
+```
+
+最终只对适合关系修正的节点注入消息：
+
+```text
+self_i = ReLU(W_self z_i)
+message_i = tanh(W_msg [
+  z_i, neighbor_i, |z_i-neighbor_i|, z_i*neighbor_i,
+  candidate_weight_sum_i, effective_weight_ratio_i
+])
+h_i = self_i + sigmoid(residual_logit) * node_gate_i * message_i
+logit_i = Linear(h_i)
+```
+
+残差系数默认从 `0.1` 开始学习。边打分器还有一个辅助目标：只在两端都属于
+train split 的边上，用“是否同标签”监督 `q_ij`。val/test 标签不参与该损失，
+因此不会把验证或测试标签泄漏进训练。默认还会平衡同标签边和异标签边的损失贡献，
+避免高同质 kNN 图让边打分器退化成“所有边都可信”的常数输出。
+
 ### 6.5 二阶段训练
 
 每个关系模型的训练步骤：
 
 1. 按 train/val/test mask 划分节点。
 2. 用 AdamW 优化。
-3. 只在 train mask 上计算 BCEWithLogits loss。
-4. 每个 epoch 在 train/val/test 上全图评估。
-5. 根据 `selection_metric` 选择最优模型，默认是 `val_roc_auc`。
-6. 连续 `relation_patience` 个 epoch 无提升则 early stop。
-7. 保存每个模型的 checkpoint、`relation_results.json`、`relation_predictions.csv`。
+3. 节点分类只在 train mask 上计算 BCEWithLogits loss。
+4. 两个 edge 模型额外在 train-train 边上计算边可靠性 BCE。
+5. 每个 epoch 在 train/val/test 上全图评估。
+6. 根据 `selection_metric` 选择最优模型，默认是 `val_roc_auc`。
+7. 连续 `relation_patience` 个 epoch 无提升则 early stop。
+8. 保存 checkpoint、预测、训练曲线、边分数和相对 MLP 的改对/改错结果。
+
+每折会直接生成：
+
+```text
+relation_results.json
+relation_predictions.csv
+relation_training_history.csv
+threshold_metrics.csv
+model_comparison_vs_mlp.csv
+model_comparison_val_tuned_vs_mlp.csv
+model_comparison_vs_edge_self_only.csv
+model_comparison_val_tuned_vs_edge_self_only.csv
+node_cases_vs_mlp.csv
+node_cases_val_tuned_vs_mlp.csv
+node_cases_vs_edge_self_only.csv
+node_cases_val_tuned_vs_edge_self_only.csv
+edge_gate_scaled_edge_scores.csv
+edge_gate_scaled_edge_reliability_summary.json
+edge_gate_node_residual_edge_scores.csv
+edge_gate_node_residual_edge_reliability_summary.json
+edge_self_only_relation_model.pt
+edge_gate_scaled_relation_model.pt
+edge_gate_node_residual_relation_model.pt
+mlp_relation_model.pt
+```
+
+完整多折运行还会生成 `relation_results_all_folds.json`，其中汇总各模型指标、
+改对/改错比例和边可靠性 AUC/AP。
+
+`val_tuned` 阈值只使用验证集标签选择，默认优化验证集 F1；测试集标签不参与阈值选择。
 
 二阶段指标包括：
 
@@ -613,11 +720,31 @@ python train.py --hparam_path ./config/b_off.yml
 python coarse_relation_experiment.py --hparam_path ./config/b_on.yml
 ```
 
+当前 `config/b_on.yml` 默认运行：
+
+```text
+relation_graph = zmil_knn
+models = mlp,edge_self_only,edge_gate_scaled,edge_gate_node_residual
+out_dir = /data/yg/Subgraph-MIL/diffpool2/result/{data_name}
+```
+
 如果只想跑某一折：
 
 ```bash
 python coarse_relation_experiment.py --hparam_path ./config/b_on.yml --fold_idx 0
 ```
+
+切换数据集时：
+
+```bash
+python coarse_relation_experiment.py --hparam_path ./config/b_on.yml --data_name reddit
+```
+
+完成后，优先保留并回传每个数据集目录下的
+`relation_results_all_folds.json`，以及各折的 `relation_results.json`、
+`threshold_metrics.csv`、相对 `edge_self_only` 的两组 comparison/node cases 文件、
+两个 edge 模型的 `edge_reliability_summary.json` 和
+`relation_training_history.csv`。
 
 ### 9.4 运行诊断
 

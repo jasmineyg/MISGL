@@ -93,6 +93,14 @@ def parse_args():
     parser.add_argument('--appnp_k', type=int, default=10)
     parser.add_argument('--appnp_alpha', type=float, default=0.1)
     parser.add_argument('--gated_sage_gate_hidden_dim', type=int, default=128)
+    parser.add_argument('--edge_gate_hidden_dim', type=int, default=128)
+    parser.add_argument('--edge_node_gate_hidden_dim', type=int, default=32)
+    parser.add_argument('--edge_aux_loss_weight', type=float, default=0.2)
+    add_bool_arg(parser, 'edge_aux_balance')
+    parser.add_argument('--edge_residual_init', type=float, default=0.1)
+    parser.add_argument('--edge_diagnostic_bins', type=int, default=10)
+    parser.add_argument('--comparison_baselines', default='mlp,edge_self_only')
+    parser.add_argument('--threshold_metric', choices=['f1', 'acc'], default='f1')
     parser.add_argument('--log_interval', type=int, default=20)
 
     add_bool_arg(parser, 'synthetic_smoke')
@@ -149,10 +157,11 @@ def apply_missing_bool_defaults(args):
         'allow_random_stage1',
         'non_strict_checkpoint',
         'knn_symmetrize',
+        'edge_aux_balance',
         'synthetic_smoke',
     ):
         if getattr(args, key) is None:
-            setattr(args, key, key == 'knn_symmetrize')
+            setattr(args, key, key in ('knn_symmetrize', 'edge_aux_balance'))
 
 
 def apply_path_templates(args, fold_idx=None):
@@ -530,6 +539,55 @@ def normalize_adjacency(coarse_adj, mode='symmetric', add_self_loop=True):
     return d_inv @ adj @ d_inv
 
 
+def bounded_weight_feature(values):
+    values = torch.as_tensor(values, dtype=torch.float32).clamp_min(0.0)
+    transformed = torch.log1p(values)
+    if transformed.numel() == 0:
+        return transformed
+    return transformed / transformed.max().clamp_min(1e-12)
+
+
+def build_edge_graph_tensors(relation_adj, coarse_reference_adj, raw_features, device):
+    relation_coo = relation_adj.tocoo().astype(np.float32, copy=False)
+    valid = relation_coo.row != relation_coo.col
+    src_np = relation_coo.row[valid].astype(np.int64, copy=False)
+    dst_np = relation_coo.col[valid].astype(np.int64, copy=False)
+    candidate_weight_np = relation_coo.data[valid].astype(np.float32, copy=False)
+
+    coarse_reference = coarse_reference_adj.tocsr().astype(np.float32, copy=False)
+    if src_np.size:
+        coarse_weight_np = coarse_reference[src_np, dst_np].A1.astype(np.float32, copy=False)
+    else:
+        coarse_weight_np = np.empty((0,), dtype=np.float32)
+
+    raw_features_cpu = torch.as_tensor(raw_features, dtype=torch.float32).detach().cpu()
+    raw_features_norm = F.normalize(raw_features_cpu, p=2, dim=-1)
+    src_cpu = torch.from_numpy(src_np)
+    dst_cpu = torch.from_numpy(dst_np)
+    cosine_cpu = (
+        (raw_features_norm[src_cpu] * raw_features_norm[dst_cpu]).sum(dim=-1)
+        if src_np.size
+        else torch.empty((0,), dtype=torch.float32)
+    )
+    candidate_weight_cpu = torch.from_numpy(candidate_weight_np)
+    coarse_weight_cpu = torch.from_numpy(coarse_weight_np)
+    edge_graph = {
+        'src': src_cpu.to(device),
+        'dst': dst_cpu.to(device),
+        'cosine': cosine_cpu.to(device),
+        'candidate_weight': candidate_weight_cpu.to(device),
+        'candidate_weight_feature': bounded_weight_feature(candidate_weight_cpu).to(device),
+        'coarse_weight': coarse_weight_cpu.to(device),
+        'coarse_weight_feature': bounded_weight_feature(coarse_weight_cpu).to(device),
+    }
+    logging.info(
+        'Prepared edge-level graph tensors: directed_edges=%d, coarse_overlap=%d',
+        int(src_np.size),
+        int(np.count_nonzero(coarse_weight_np)),
+    )
+    return edge_graph
+
+
 def build_zmil_knn_adjacency(features, args):
     if isinstance(features, torch.Tensor):
         features_cpu = features.detach().cpu().float()
@@ -753,6 +811,255 @@ class GatedSAGERelation(nn.Module):
         return dict(self._latest_diagnostics)
 
 
+class EdgeSelfOnlyRelation(nn.Module):
+    """Self-only ablation with the same self branch as the edge relation models."""
+
+    def __init__(self, input_dim, hidden_dim, dropout):
+        super().__init__()
+        self.self_fc = nn.Linear(input_dim, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        self._latest_diagnostics = {}
+
+    def forward(self, features, edge_graph=None):
+        del edge_graph
+        self_hidden = F.relu(self.self_fc(features))
+        logits = self.classifier(self.dropout(self_hidden)).view(-1)
+        self_prob = torch.sigmoid(self.classifier(self_hidden).view(-1))
+        self._latest_diagnostics = {
+            'self_probability': self_prob.detach().cpu(),
+            'self_margin': (2.0 * torch.abs(self_prob - 0.5)).detach().cpu(),
+        }
+        return logits
+
+    def diagnostics(self):
+        return dict(self._latest_diagnostics)
+
+
+class EdgeGateResidualRelation(nn.Module):
+    """Filter edges, preserve message magnitude, then conditionally correct nodes."""
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        dropout,
+        edge_gate_hidden_dim,
+        residual_init,
+        balance_auxiliary=True,
+        node_gate_hidden_dim=32,
+        use_node_gate=True,
+    ):
+        super().__init__()
+        self.self_fc = nn.Linear(input_dim, hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 1)
+        edge_feature_dim = input_dim * 4 + 3
+        self.edge_gate = nn.Sequential(
+            nn.Linear(edge_feature_dim, edge_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(edge_gate_hidden_dim, 1),
+        )
+        self.message_fc = nn.Linear(input_dim * 4 + 2, hidden_dim)
+        self.node_gate = nn.Sequential(
+            nn.Linear(6, node_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_gate_hidden_dim, 1),
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.balance_auxiliary = bool(balance_auxiliary)
+        self.use_node_gate = bool(use_node_gate)
+        residual_init = min(max(float(residual_init), 1e-4), 1.0 - 1e-4)
+        self.residual_logit = nn.Parameter(
+            torch.tensor(np.log(residual_init / (1.0 - residual_init)), dtype=torch.float32)
+        )
+        self._latest_diagnostics = {}
+        self._latest_edge_diagnostics = {}
+        self._latest_edge_reliability = None
+        self._latest_edge_graph = None
+
+    @staticmethod
+    def _edge_features(features, edge_graph):
+        src = edge_graph['src']
+        dst = edge_graph['dst']
+        src_features = features[src]
+        dst_features = features[dst]
+        return torch.cat(
+            [
+                src_features,
+                dst_features,
+                torch.abs(src_features - dst_features),
+                src_features * dst_features,
+                edge_graph['cosine'].view(-1, 1),
+                edge_graph['candidate_weight_feature'].view(-1, 1),
+                edge_graph['coarse_weight_feature'].view(-1, 1),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _node_edge_mean(values, src, num_nodes):
+        sums = values.new_zeros(num_nodes)
+        counts = values.new_zeros(num_nodes)
+        sums.index_add_(0, src, values)
+        counts.index_add_(0, src, torch.ones_like(values))
+        return sums / counts.clamp_min(1.0)
+
+    @staticmethod
+    def _node_edge_max(values, src, num_nodes):
+        maximum = values.new_zeros(num_nodes)
+        if values.numel():
+            maximum.scatter_reduce_(0, src, values, reduce='amax', include_self=True)
+        return maximum
+
+    @staticmethod
+    def _aggregate_neighbors(features, edge_graph, reliability):
+        src = edge_graph['src']
+        dst = edge_graph['dst']
+        candidate_weight = edge_graph['candidate_weight'].clamp_min(0.0)
+        effective_weight = reliability * candidate_weight
+
+        weighted_neighbor_sum = features.new_zeros(features.shape)
+        weighted_neighbor_sum.index_add_(0, src, effective_weight.view(-1, 1) * features[dst])
+        candidate_weight_sum = features.new_zeros(features.size(0))
+        candidate_weight_sum.index_add_(0, src, candidate_weight)
+        effective_weight_sum = features.new_zeros(features.size(0))
+        effective_weight_sum.index_add_(0, src, effective_weight)
+
+        # Divide by the original candidate mass so low reliability shrinks the message.
+        neighbor = weighted_neighbor_sum / candidate_weight_sum.clamp_min(1e-12).view(-1, 1)
+        effective_weight_ratio = (
+            effective_weight_sum / candidate_weight_sum.clamp_min(1e-12)
+        )
+        return (
+            neighbor,
+            candidate_weight_sum,
+            effective_weight_sum,
+            effective_weight_ratio,
+            effective_weight,
+        )
+
+    def forward(self, features, edge_graph):
+        src = edge_graph['src']
+        reliability = torch.sigmoid(self.edge_gate(self._edge_features(features, edge_graph))).view(-1)
+        (
+            neighbor,
+            candidate_weight_sum,
+            effective_weight_sum,
+            effective_weight_ratio,
+            effective_weight,
+        ) = self._aggregate_neighbors(features, edge_graph, reliability)
+        reliability_mean = self._node_edge_mean(reliability, src, features.size(0))
+        reliability_max = self._node_edge_max(reliability, src, features.size(0))
+
+        message_input = torch.cat(
+            [
+                features,
+                neighbor,
+                torch.abs(features - neighbor),
+                features * neighbor,
+                candidate_weight_sum.view(-1, 1),
+                effective_weight_ratio.view(-1, 1),
+            ],
+            dim=-1,
+        )
+        self_hidden = F.relu(self.self_fc(features))
+        neighbor_hidden = F.relu(self.self_fc(neighbor))
+        self_logits = self.classifier(self_hidden).view(-1)
+        neighbor_logits = self.classifier(neighbor_hidden).view(-1)
+        self_prob = torch.sigmoid(self_logits)
+        neighbor_prob = torch.sigmoid(neighbor_logits)
+        self_margin = 2.0 * torch.abs(self_prob - 0.5)
+        prediction_agreement = 1.0 - torch.abs(self_prob - neighbor_prob)
+        has_candidate = (candidate_weight_sum > 0).float()
+
+        message = torch.tanh(self.message_fc(message_input))
+        node_gate_input = torch.stack(
+            [
+                self_margin,
+                reliability_mean,
+                reliability_max,
+                effective_weight_ratio,
+                prediction_agreement,
+                has_candidate,
+            ],
+            dim=-1,
+        )
+        if self.use_node_gate:
+            correction_gate = torch.sigmoid(self.node_gate(node_gate_input)).view(-1)
+        else:
+            correction_gate = features.new_ones(features.size(0))
+        residual_scale = torch.sigmoid(self.residual_logit)
+        applied_correction = residual_scale * correction_gate.view(-1, 1) * message
+        hidden = self_hidden + applied_correction
+        logits = self.classifier(self.dropout(hidden)).view(-1)
+
+        reliability_detached = reliability.detach()
+        effective_weight_detached = effective_weight.detach()
+        self._latest_diagnostics = {
+            'self_probability': self_prob.detach().cpu(),
+            'self_margin': self_margin.detach().cpu(),
+            'neighbor_probability': neighbor_prob.detach().cpu(),
+            'self_neighbor_probability_gap': torch.abs(
+                self_prob - neighbor_prob
+            ).detach().cpu(),
+            'edge_reliability_mean': reliability_mean.detach().cpu(),
+            'edge_reliability_max': reliability_max.detach().cpu(),
+            'candidate_edge_weight_sum': candidate_weight_sum.detach().cpu(),
+            'effective_edge_weight_sum': effective_weight_sum.detach().cpu(),
+            'effective_edge_weight_ratio': effective_weight_ratio.detach().cpu(),
+            'neighbor_message_norm': neighbor.detach().norm(dim=-1).cpu(),
+            'residual_message_norm': message.detach().norm(dim=-1).cpu(),
+            'correction_gate': correction_gate.detach().cpu(),
+            'applied_correction_norm': applied_correction.detach().norm(dim=-1).cpu(),
+            'residual_scale': residual_scale.detach().expand(features.size(0)).cpu(),
+        }
+        self._latest_edge_diagnostics = {
+            key: value.detach().cpu()
+            for key, value in edge_graph.items()
+            if isinstance(value, torch.Tensor)
+        }
+        self._latest_edge_diagnostics['reliability'] = reliability_detached.cpu()
+        self._latest_edge_diagnostics['effective_weight'] = effective_weight_detached.cpu()
+        self._latest_edge_reliability = reliability
+        self._latest_edge_graph = edge_graph
+        return logits
+
+    def auxiliary_loss(self, labels, train_mask):
+        if self._latest_edge_reliability is None or self._latest_edge_graph is None:
+            return labels.new_zeros((), dtype=torch.float32)
+        src = self._latest_edge_graph['src']
+        dst = self._latest_edge_graph['dst']
+        supervised = train_mask[src] & train_mask[dst]
+        if int(supervised.sum().item()) == 0:
+            return self._latest_edge_reliability.sum() * 0.0
+        edge_targets = (labels[src] == labels[dst]).float()
+        local_targets = edge_targets[supervised]
+        sample_weight = None
+        if self.balance_auxiliary:
+            positive_rate = local_targets.mean()
+            if 0.0 < float(positive_rate.item()) < 1.0:
+                positive_weight = 0.5 / positive_rate
+                negative_weight = 0.5 / (1.0 - positive_rate)
+                sample_weight = torch.where(
+                    local_targets > 0.5,
+                    positive_weight,
+                    negative_weight,
+                )
+        return F.binary_cross_entropy(
+            self._latest_edge_reliability[supervised],
+            local_targets,
+            weight=sample_weight,
+        )
+
+    def diagnostics(self):
+        return dict(self._latest_diagnostics)
+
+    def edge_diagnostics(self):
+        return dict(self._latest_edge_diagnostics)
+
+
 class APPNPRelation(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout, k_steps, alpha):
         super().__init__()
@@ -783,6 +1090,28 @@ def build_relation_model(model_name, input_dim, args):
             args.relation_dropout,
             int(args.gated_sage_gate_hidden_dim),
         )
+    if name == 'edge_self_only':
+        return EdgeSelfOnlyRelation(
+            input_dim,
+            args.relation_hidden_dim,
+            args.relation_dropout,
+        )
+    if name in (
+        'edge_gate_residual',
+        'edge_gate',
+        'edge_gate_scaled',
+        'edge_gate_node_residual',
+    ):
+        return EdgeGateResidualRelation(
+            input_dim,
+            args.relation_hidden_dim,
+            args.relation_dropout,
+            int(args.edge_gate_hidden_dim),
+            float(args.edge_residual_init),
+            bool(args.edge_aux_balance),
+            int(args.edge_node_gate_hidden_dim),
+            name not in ('edge_gate_scaled',),
+        )
     if name == 'appnp':
         return APPNPRelation(
             input_dim,
@@ -794,7 +1123,7 @@ def build_relation_model(model_name, input_dim, args):
     raise ValueError(f'Unsupported relation model: {model_name}')
 
 
-def binary_metrics_from_logits(logits, labels, mask):
+def binary_metrics_from_logits(logits, labels, mask, threshold=0.5):
     mask = mask.to(device=logits.device, dtype=torch.bool)
     if int(mask.sum().item()) == 0:
         return {}
@@ -803,8 +1132,10 @@ def binary_metrics_from_logits(logits, labels, mask):
     loss = F.binary_cross_entropy_with_logits(local_logits, local_labels).item()
     probs = torch.sigmoid(local_logits).detach().cpu().numpy()
     y_true = local_labels.detach().cpu().numpy().astype(np.int64)
-    y_pred = (probs > 0.5).astype(np.int64)
+    threshold = float(threshold)
+    y_pred = (probs > threshold).astype(np.int64)
     out = {
+        'threshold': threshold,
         'loss': float(loss),
         'acc': float(metrics.accuracy_score(y_true, y_pred)),
         'prec': float(metrics.precision_score(y_true, y_pred, zero_division=0)),
@@ -823,16 +1154,73 @@ def binary_metrics_from_logits(logits, labels, mask):
     return out
 
 
+def choose_validation_threshold(logits, labels, val_mask, metric_name='f1'):
+    val_mask = val_mask.to(device=logits.device, dtype=torch.bool)
+    probs = torch.sigmoid(logits[val_mask]).detach().cpu().numpy()
+    y_true = labels[val_mask].detach().cpu().numpy().astype(np.int64)
+    if probs.size == 0:
+        return 0.5
+    unique = np.unique(probs)
+    if unique.size == 1:
+        candidates = np.asarray([0.5], dtype=np.float64)
+    else:
+        candidates = np.concatenate([
+            np.asarray([0.0], dtype=np.float64),
+            0.5 * (unique[:-1] + unique[1:]),
+            np.asarray([1.0], dtype=np.float64),
+        ])
+
+    best_threshold = 0.5
+    best_score = -float('inf')
+    for threshold in candidates:
+        pred = (probs > threshold).astype(np.int64)
+        if metric_name == 'acc':
+            score = metrics.accuracy_score(y_true, pred)
+        else:
+            score = metrics.f1_score(y_true, pred, zero_division=0)
+        if score > best_score + 1e-12:
+            best_score = float(score)
+            best_threshold = float(threshold)
+        elif abs(float(score) - best_score) <= 1e-12:
+            if abs(float(threshold) - 0.5) < abs(best_threshold - 0.5):
+                best_threshold = float(threshold)
+    return best_threshold
+
+
+def evaluate_with_validation_threshold(logits, labels, masks, metric_name):
+    threshold = choose_validation_threshold(
+        logits,
+        labels,
+        masks['val'],
+        metric_name=metric_name,
+    )
+    return {
+        'selection_split': 'val',
+        'selection_metric': str(metric_name),
+        'threshold': float(threshold),
+        'metrics': {
+            split_name: binary_metrics_from_logits(
+                logits,
+                labels,
+                mask,
+                threshold=threshold,
+            )
+            for split_name, mask in masks.items()
+        },
+    }
+
+
 def evaluate_relation_model(model, features, labels, masks, adj_for_model):
     model.eval()
     with torch.inference_mode():
         logits = model(features, adj_for_model)
     diagnostics = model.diagnostics() if hasattr(model, 'diagnostics') else {}
+    edge_diagnostics = model.edge_diagnostics() if hasattr(model, 'edge_diagnostics') else {}
     result = {}
     for split_name, mask in masks.items():
         metric = binary_metrics_from_logits(logits, labels, mask)
         result[split_name] = metric
-    return result, logits.detach().cpu(), diagnostics
+    return result, logits.detach().cpu(), diagnostics, edge_diagnostics
 
 
 def is_better(current_metrics, best_metrics, selection_metric):
@@ -852,6 +1240,10 @@ def is_better(current_metrics, best_metrics, selection_metric):
 
 def train_one_relation_model(model_name, features, labels, masks, adj_tensors, args):
     device = features.device
+    model_seed = int(args.seed) + 1009 * int(getattr(args, 'fold_idx', 0) or 0)
+    torch.manual_seed(model_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(model_seed)
     model = build_relation_model(model_name, features.size(1), args).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -861,21 +1253,52 @@ def train_one_relation_model(model_name, features, labels, masks, adj_tensors, a
     train_mask = masks['train'].to(device=device, dtype=torch.bool)
     labels = labels.to(device=device, dtype=torch.float32)
     row_models = {'sage', 'gated_sage', 'position_sage'}
-    adj_for_model = adj_tensors['row'] if model_name in row_models else adj_tensors['symmetric']
+    edge_models = {
+        'edge_self_only',
+        'edge_gate_residual',
+        'edge_gate',
+        'edge_gate_scaled',
+        'edge_gate_node_residual',
+    }
+    if model_name in edge_models:
+        adj_for_model = adj_tensors['edge_graph']
+    elif model_name in row_models:
+        adj_for_model = adj_tensors['row']
+    else:
+        adj_for_model = adj_tensors['symmetric']
 
     best_state = None
     best_metrics = None
     best_epoch = -1
     no_improve = 0
+    training_history = []
     for epoch in range(int(args.relation_epochs)):
         model.train()
         optimizer.zero_grad()
         logits = model(features, adj_for_model)
-        loss = F.binary_cross_entropy_with_logits(logits[train_mask], labels[train_mask])
+        node_loss = F.binary_cross_entropy_with_logits(logits[train_mask], labels[train_mask])
+        edge_aux_loss = (
+            model.auxiliary_loss(labels, train_mask)
+            if hasattr(model, 'auxiliary_loss')
+            else node_loss.new_zeros(())
+        )
+        loss = node_loss + float(args.edge_aux_loss_weight) * edge_aux_loss
         loss.backward()
         optimizer.step()
 
-        current_metrics, _, _ = evaluate_relation_model(model, features, labels, masks, adj_for_model)
+        current_metrics, _, _, _ = evaluate_relation_model(
+            model, features, labels, masks, adj_for_model
+        )
+        training_history.append({
+            'epoch': int(epoch),
+            'total_loss': float(loss.item()),
+            'node_loss': float(node_loss.item()),
+            'edge_aux_loss': float(edge_aux_loss.item()),
+            'val_loss': current_metrics['val'].get('loss'),
+            'val_acc': current_metrics['val'].get('acc'),
+            'val_roc_auc': current_metrics['val'].get('roc_auc'),
+            'val_f1': current_metrics['val'].get('f1'),
+        })
         if is_better(current_metrics, best_metrics, args.selection_metric):
             best_metrics = current_metrics
             best_epoch = epoch
@@ -903,20 +1326,30 @@ def train_one_relation_model(model_name, features, labels, masks, adj_tensors, a
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_metrics, final_logits, final_diagnostics = evaluate_relation_model(
+    final_metrics, final_logits, final_diagnostics, final_edge_diagnostics = evaluate_relation_model(
         model,
         features,
         labels,
         masks,
         adj_for_model,
     )
+    threshold_evaluation = evaluate_with_validation_threshold(
+        final_logits.to(labels.device),
+        labels,
+        masks,
+        args.threshold_metric,
+    )
     return {
         'model_name': model_name,
+        'model_seed': model_seed,
         'best_epoch': int(best_epoch),
         'best_metrics': best_metrics,
         'final_metrics': final_metrics,
         'logits': final_logits,
         'diagnostics': final_diagnostics,
+        'edge_diagnostics': final_edge_diagnostics,
+        'threshold_evaluation': threshold_evaluation,
+        'training_history': training_history,
         'state_dict': model.state_dict(),
     }
 
@@ -932,6 +1365,8 @@ def save_predictions_csv(path, orig_indices, labels, split_names, model_outputs)
     for model_name in model_outputs:
         fieldnames.append(f'{model_name}_prob')
         fieldnames.append(f'{model_name}_pred')
+        fieldnames.append(f'{model_name}_val_threshold')
+        fieldnames.append(f'{model_name}_val_threshold_pred')
         diagnostics = model_outputs[model_name].get('diagnostics', {})
         for diag_name in sorted(diagnostics):
             fieldnames.append(f'{model_name}_{diag_name}')
@@ -946,12 +1381,269 @@ def save_predictions_csv(path, orig_indices, labels, split_names, model_outputs)
             }
             for model_name, output in model_outputs.items():
                 prob = float(torch.sigmoid(output['logits'][row_idx]).item())
+                tuned_threshold = float(output['threshold_evaluation']['threshold'])
                 row[f'{model_name}_prob'] = prob
                 row[f'{model_name}_pred'] = int(prob > 0.5)
+                row[f'{model_name}_val_threshold'] = tuned_threshold
+                row[f'{model_name}_val_threshold_pred'] = int(prob > tuned_threshold)
                 diagnostics = output.get('diagnostics', {})
                 for diag_name, diag_values in diagnostics.items():
                     row[f'{model_name}_{diag_name}'] = float(diag_values[row_idx].item())
             writer.writerow(row)
+
+
+def write_rows_csv(path, rows, fieldnames=None):
+    rows = list(rows)
+    if fieldnames is None:
+        fieldnames = []
+        seen = set()
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    fieldnames.append(key)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        if not fieldnames:
+            return
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def safe_binary_auc(targets, scores):
+    targets = np.asarray(targets, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    valid = np.isfinite(scores)
+    targets = targets[valid]
+    scores = scores[valid]
+    if targets.size == 0 or np.unique(targets).size < 2:
+        return None
+    return float(metrics.roc_auc_score(targets, scores))
+
+
+def safe_average_precision(targets, scores):
+    targets = np.asarray(targets, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    valid = np.isfinite(scores)
+    targets = targets[valid]
+    scores = scores[valid]
+    if targets.size == 0 or np.unique(targets).size < 2:
+        return None
+    return float(metrics.average_precision_score(targets, scores))
+
+
+def edge_group_masks(src, dst, split_names):
+    src_split = split_names[src]
+    dst_split = split_names[dst]
+    return {
+        'all': np.ones(src.shape[0], dtype=bool),
+        'src_train': src_split == 'train',
+        'src_val': src_split == 'val',
+        'src_test': src_split == 'test',
+        'train_train': (src_split == 'train') & (dst_split == 'train'),
+        'val_val': (src_split == 'val') & (dst_split == 'val'),
+        'test_test': (src_split == 'test') & (dst_split == 'test'),
+        'cross_split': src_split != dst_split,
+    }
+
+
+def summarize_edge_reliability(edge_diagnostics, labels, split_names, bin_count):
+    if not edge_diagnostics:
+        return {}
+    arrays = {
+        key: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+        for key, value in edge_diagnostics.items()
+    }
+    src = arrays['src'].astype(np.int64, copy=False)
+    dst = arrays['dst'].astype(np.int64, copy=False)
+    reliability = arrays['reliability'].astype(np.float64, copy=False)
+    same_label = (labels[src] == labels[dst]).astype(np.int64)
+    summary = {'groups': {}, 'bins': []}
+    for group_name, group_mask in edge_group_masks(src, dst, split_names).items():
+        local_targets = same_label[group_mask]
+        local_scores = reliability[group_mask]
+        summary['groups'][group_name] = {
+            'num_edges': int(group_mask.sum()),
+            'same_label_rate': float(local_targets.mean()) if local_targets.size else None,
+            'reliability_mean': float(local_scores.mean()) if local_scores.size else None,
+            'reliability_same_label_mean': (
+                float(local_scores[local_targets == 1].mean())
+                if np.any(local_targets == 1) else None
+            ),
+            'reliability_diff_label_mean': (
+                float(local_scores[local_targets == 0].mean())
+                if np.any(local_targets == 0) else None
+            ),
+            'same_label_auc': safe_binary_auc(local_targets, local_scores),
+            'same_label_average_precision': safe_average_precision(local_targets, local_scores),
+        }
+
+    if reliability.size:
+        order = np.argsort(reliability)
+        for bin_idx, indices in enumerate(np.array_split(order, max(int(bin_count), 1))):
+            if indices.size == 0:
+                continue
+            summary['bins'].append({
+                'bin_idx': int(bin_idx),
+                'num_edges': int(indices.size),
+                'reliability_min': float(reliability[indices].min()),
+                'reliability_max': float(reliability[indices].max()),
+                'reliability_mean': float(reliability[indices].mean()),
+                'same_label_rate': float(same_label[indices].mean()),
+                'candidate_weight_mean': float(arrays['candidate_weight'][indices].mean()),
+                'coarse_weight_mean': float(arrays['coarse_weight'][indices].mean()),
+                'effective_weight_mean': float(arrays['effective_weight'][indices].mean()),
+            })
+    return summary
+
+
+def save_edge_scores_csv(
+    path,
+    edge_diagnostics,
+    orig_indices,
+    labels,
+    split_names,
+):
+    arrays = {
+        key: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+        for key, value in edge_diagnostics.items()
+    }
+    src = arrays['src'].astype(np.int64, copy=False)
+    dst = arrays['dst'].astype(np.int64, copy=False)
+    rows = []
+    for edge_idx in range(src.size):
+        src_idx = int(src[edge_idx])
+        dst_idx = int(dst[edge_idx])
+        rows.append({
+            'src_orig_idx': int(orig_indices[src_idx]),
+            'dst_orig_idx': int(orig_indices[dst_idx]),
+            'src_split': split_names[src_idx],
+            'dst_split': split_names[dst_idx],
+            'src_label': int(labels[src_idx]),
+            'dst_label': int(labels[dst_idx]),
+            'same_label': int(labels[src_idx] == labels[dst_idx]),
+            'edge_aux_supervised': int(
+                split_names[src_idx] == 'train' and split_names[dst_idx] == 'train'
+            ),
+            'cosine': float(arrays['cosine'][edge_idx]),
+            'candidate_weight': float(arrays['candidate_weight'][edge_idx]),
+            'coarse_weight': float(arrays['coarse_weight'][edge_idx]),
+            'reliability': float(arrays['reliability'][edge_idx]),
+            'effective_weight': float(arrays['effective_weight'][edge_idx]),
+        })
+    write_rows_csv(path, rows)
+
+
+def output_threshold(output, threshold_mode):
+    if threshold_mode == 'val_tuned':
+        return float(output['threshold_evaluation']['threshold'])
+    return 0.5
+
+
+def build_model_comparison_rows(
+    model_outputs,
+    labels,
+    split_names,
+    baseline_model='mlp',
+    threshold_mode='fixed_0.5',
+):
+    if baseline_model not in model_outputs:
+        return []
+    baseline_probs = torch.sigmoid(model_outputs[baseline_model]['logits']).numpy()
+    baseline_threshold = output_threshold(model_outputs[baseline_model], threshold_mode)
+    baseline_pred = baseline_probs > baseline_threshold
+    rows = []
+    for model_name, output in model_outputs.items():
+        if model_name == baseline_model:
+            continue
+        model_probs = torch.sigmoid(output['logits']).numpy()
+        model_threshold = output_threshold(output, threshold_mode)
+        model_pred = model_probs > model_threshold
+        for split_name in ('train', 'val', 'test'):
+            split_mask = split_names == split_name
+            groups = {
+                'both_correct': split_mask & (baseline_pred == labels) & (model_pred == labels),
+                'baseline_wrong_model_right': (
+                    split_mask & (baseline_pred != labels) & (model_pred == labels)
+                ),
+                'baseline_right_model_wrong': (
+                    split_mask & (baseline_pred == labels) & (model_pred != labels)
+                ),
+                'both_wrong': split_mask & (baseline_pred != labels) & (model_pred != labels),
+            }
+            split_count = int(split_mask.sum())
+            for group_name, group_mask in groups.items():
+                rows.append({
+                    'baseline_model': baseline_model,
+                    'model': model_name,
+                    'threshold_mode': threshold_mode,
+                    'baseline_threshold': baseline_threshold,
+                    'model_threshold': model_threshold,
+                    'split': split_name,
+                    'group': group_name,
+                    'count': int(group_mask.sum()),
+                    'rate_within_split': float(group_mask.sum() / max(split_count, 1)),
+                    'baseline_prob_mean': (
+                        float(baseline_probs[group_mask].mean()) if np.any(group_mask) else None
+                    ),
+                    'model_prob_mean': (
+                        float(model_probs[group_mask].mean()) if np.any(group_mask) else None
+                    ),
+                })
+    return rows
+
+
+def build_node_case_rows(
+    model_outputs,
+    orig_indices,
+    labels,
+    split_names,
+    baseline_model='mlp',
+    threshold_mode='fixed_0.5',
+):
+    if baseline_model not in model_outputs:
+        return []
+    baseline_probs = torch.sigmoid(model_outputs[baseline_model]['logits']).numpy()
+    baseline_threshold = output_threshold(model_outputs[baseline_model], threshold_mode)
+    baseline_pred = baseline_probs > baseline_threshold
+    rows = []
+    for model_name, output in model_outputs.items():
+        if model_name == baseline_model:
+            continue
+        model_probs = torch.sigmoid(output['logits']).numpy()
+        model_threshold = output_threshold(output, threshold_mode)
+        model_pred = model_probs > model_threshold
+        diagnostics = output.get('diagnostics', {})
+        for node_idx in range(labels.shape[0]):
+            baseline_correct = bool(baseline_pred[node_idx] == labels[node_idx])
+            model_correct = bool(model_pred[node_idx] == labels[node_idx])
+            if baseline_correct and model_correct:
+                group = 'both_correct'
+            elif (not baseline_correct) and model_correct:
+                group = 'baseline_wrong_model_right'
+            elif baseline_correct and (not model_correct):
+                group = 'baseline_right_model_wrong'
+            else:
+                group = 'both_wrong'
+            row = {
+                'orig_idx': int(orig_indices[node_idx]),
+                'label': int(labels[node_idx]),
+                'split': split_names[node_idx],
+                'baseline_model': baseline_model,
+                'model': model_name,
+                'threshold_mode': threshold_mode,
+                'baseline_threshold': baseline_threshold,
+                'model_threshold': model_threshold,
+                'group': group,
+                'baseline_prob': float(baseline_probs[node_idx]),
+                'baseline_pred': int(baseline_pred[node_idx]),
+                'model_prob': float(model_probs[node_idx]),
+                'model_pred': int(model_pred[node_idx]),
+            }
+            for diag_name, diag_values in diagnostics.items():
+                row[diag_name] = float(diag_values[node_idx].item())
+            rows.append(row)
+    return rows
 
 
 def split_name_array(num_nodes, split, orig_indices=None):
@@ -1021,12 +1713,22 @@ def run_relation_experiment(
     out_dir,
     metadata=None,
     orig_indices=None,
+    coarse_reference_adj=None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     labels = labels.long()
     masks = indices_to_masks(features.size(0), split, orig_indices=orig_indices)
     train_mask = masks['train']
+    raw_features = features.float()
+    if coarse_reference_adj is None:
+        coarse_reference_adj = coarse_adj
+    edge_graph = build_edge_graph_tensors(
+        coarse_adj,
+        coarse_reference_adj,
+        raw_features,
+        device,
+    )
     features = normalize_features(features.float(), train_mask, args.feature_norm).to(device)
     labels_device = labels.to(device)
     masks_device = {key: value.to(device) for key, value in masks.items()}
@@ -1042,10 +1744,19 @@ def run_relation_experiment(
     adj_tensors = {
         'symmetric': adj_symmetric,
         'row': adj_row,
+        'edge_graph': edge_graph,
     }
 
     model_names = [name.strip().lower() for name in args.models.split(',') if name.strip()]
     model_outputs = {}
+    if orig_indices is None:
+        orig_indices = np.arange(features.size(0), dtype=np.int64)
+    elif isinstance(orig_indices, torch.Tensor):
+        orig_indices = orig_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+    else:
+        orig_indices = np.asarray(orig_indices, dtype=np.int64)
+    labels_np = labels.cpu().numpy()
+    split_names = split_name_array(features.size(0), split, orig_indices=orig_indices)
     result_summary = {
         'metadata': metadata or {},
         'split': split,
@@ -1070,34 +1781,134 @@ def run_relation_experiment(
         )
         model_outputs[model_name] = output
         result_summary['models'][model_name] = {
+            'model_seed': output['model_seed'],
             'best_epoch': output['best_epoch'],
             'best_metrics': output['best_metrics'],
             'final_metrics': output['final_metrics'],
+            'threshold_evaluation': output['threshold_evaluation'],
             'diagnostics': summarize_diagnostics_by_split(output.get('diagnostics', {}), masks),
         }
+        if output.get('edge_diagnostics'):
+            edge_summary = summarize_edge_reliability(
+                output['edge_diagnostics'],
+                labels_np,
+                split_names,
+                args.edge_diagnostic_bins,
+            )
+            result_summary['models'][model_name]['edge_reliability'] = edge_summary
+            with open(
+                os.path.join(out_dir, f'{model_name}_edge_reliability_summary.json'),
+                'w',
+                encoding='utf-8',
+            ) as f:
+                json.dump(json_safe(edge_summary), f, indent=2, ensure_ascii=False)
+            edge_scores_path = os.path.join(out_dir, f'{model_name}_edge_scores.csv')
+            save_edge_scores_csv(
+                edge_scores_path,
+                output['edge_diagnostics'],
+                orig_indices,
+                labels_np,
+                split_names,
+            )
+            write_rows_csv(
+                os.path.join(out_dir, f'{model_name}_edge_reliability_bins.csv'),
+                edge_summary.get('bins', []),
+            )
         torch.save(
             {
                 'state_dict': output['state_dict'],
                 'model_name': model_name,
+                'model_seed': output['model_seed'],
                 'input_dim': int(features.size(1)),
                 'args': vars(args),
             },
             os.path.join(out_dir, f'{model_name}_relation_model.pt'),
         )
 
+    comparison_baselines = [
+        value.strip().lower()
+        for value in str(args.comparison_baselines).split(',')
+        if value.strip()
+    ]
+    result_summary['model_comparisons'] = {}
+    for baseline_model in comparison_baselines:
+        if baseline_model not in model_outputs:
+            continue
+        baseline_payload = {}
+        for threshold_mode in ('fixed_0.5', 'val_tuned'):
+            comparison_rows = build_model_comparison_rows(
+                model_outputs,
+                labels_np,
+                split_names,
+                baseline_model=baseline_model,
+                threshold_mode=threshold_mode,
+            )
+            node_case_rows = build_node_case_rows(
+                model_outputs,
+                orig_indices,
+                labels_np,
+                split_names,
+                baseline_model=baseline_model,
+                threshold_mode=threshold_mode,
+            )
+            baseline_payload[threshold_mode] = comparison_rows
+            mode_suffix = '' if threshold_mode == 'fixed_0.5' else '_val_tuned'
+            write_rows_csv(
+                os.path.join(
+                    out_dir,
+                    f'model_comparison{mode_suffix}_vs_{baseline_model}.csv',
+                ),
+                comparison_rows,
+            )
+            write_rows_csv(
+                os.path.join(
+                    out_dir,
+                    f'node_cases{mode_suffix}_vs_{baseline_model}.csv',
+                ),
+                node_case_rows,
+            )
+        result_summary['model_comparisons'][baseline_model] = baseline_payload
+
+    # Backward-compatible key used by previous all-fold summaries.
+    result_summary['model_comparison_vs_mlp'] = (
+        result_summary['model_comparisons'].get('mlp', {}).get('fixed_0.5', [])
+    )
+
+    threshold_rows = []
+    for model_name, output in model_outputs.items():
+        for threshold_mode, threshold, split_metrics in (
+            ('fixed_0.5', 0.5, output['final_metrics']),
+            (
+                'val_tuned',
+                output['threshold_evaluation']['threshold'],
+                output['threshold_evaluation']['metrics'],
+            ),
+        ):
+            for split_name, metric_values in split_metrics.items():
+                threshold_rows.append({
+                    'model': model_name,
+                    'threshold_mode': threshold_mode,
+                    'threshold': float(threshold),
+                    'selection_metric': (
+                        args.threshold_metric if threshold_mode == 'val_tuned' else ''
+                    ),
+                    'split': split_name,
+                    **metric_values,
+                })
+    write_rows_csv(os.path.join(out_dir, 'threshold_metrics.csv'), threshold_rows)
+
+    training_rows = []
+    for model_name, output in model_outputs.items():
+        for row in output.get('training_history', []):
+            training_rows.append({'model': model_name, **row})
+    write_rows_csv(os.path.join(out_dir, 'relation_training_history.csv'), training_rows)
+
     result_path = os.path.join(out_dir, 'relation_results.json')
     with open(result_path, 'w', encoding='utf-8') as f:
         json.dump(json_safe(result_summary), f, indent=2, ensure_ascii=False)
 
-    if orig_indices is None:
-        orig_indices = np.arange(features.size(0), dtype=np.int64)
-    elif isinstance(orig_indices, torch.Tensor):
-        orig_indices = orig_indices.detach().cpu().numpy().astype(np.int64, copy=False)
-    else:
-        orig_indices = np.asarray(orig_indices, dtype=np.int64)
-    split_names = split_name_array(features.size(0), split, orig_indices=orig_indices)
     predictions_path = os.path.join(out_dir, 'relation_predictions.csv')
-    save_predictions_csv(predictions_path, orig_indices, labels.cpu().numpy(), split_names, model_outputs)
+    save_predictions_csv(predictions_path, orig_indices, labels_np, split_names, model_outputs)
     logging.info('Saved relation results: %s', result_path)
     logging.info('Saved relation predictions: %s', predictions_path)
     return result_summary
@@ -1137,6 +1948,7 @@ def synthetic_smoke(args):
         args.out_dir,
         metadata={'synthetic_smoke': True, 'relation_graph': relation_graph_metadata},
         orig_indices=None,
+        coarse_reference_adj=coarse_adj,
     )
 
 
@@ -1159,15 +1971,23 @@ def make_run_args(args, fold_idx):
     return run_args
 
 
+def dataset_output_dir(args):
+    out_dir = os.path.normpath(str(args.out_dir))
+    if os.path.basename(out_dir) == str(args.data_name):
+        return out_dir
+    return os.path.join(out_dir, args.data_name)
+
+
 def run_output_dir(args):
     graph_name = str(getattr(args, 'relation_graph', 'coarse')).strip().lower()
+    base_out_dir = dataset_output_dir(args)
     if args.split_source == 'fixed_cv':
         if graph_name == 'coarse':
-            return os.path.join(args.out_dir, args.data_name, f'fold_{args.fold_idx}')
-        return os.path.join(args.out_dir, args.data_name, graph_name, f'fold_{args.fold_idx}')
+            return os.path.join(base_out_dir, f'fold_{args.fold_idx}')
+        return os.path.join(base_out_dir, graph_name, f'fold_{args.fold_idx}')
     if graph_name == 'coarse':
-        return os.path.join(args.out_dir, args.data_name, 'dataset_split')
-    return os.path.join(args.out_dir, args.data_name, graph_name, 'dataset_split')
+        return os.path.join(base_out_dir, 'dataset_split')
+    return os.path.join(base_out_dir, graph_name, 'dataset_split')
 
 
 def run_one_split(args, hparams, loader, fold_idx):
@@ -1211,6 +2031,7 @@ def run_one_split(args, hparams, loader, fold_idx):
         out_dir,
         metadata=metadata,
         orig_indices=aligned_orig_indices,
+        coarse_reference_adj=loader.coarse_adj,
     )
     for model_name, model_result in result['models'].items():
         test = model_result['final_metrics']['test']
@@ -1260,20 +2081,170 @@ def aggregate_fold_results(fold_outputs):
     return summary
 
 
+def aggregate_model_comparisons(fold_outputs):
+    grouped = {}
+    for fold_output in fold_outputs:
+        fold_idx = fold_output.get('fold_idx')
+        comparisons = fold_output['result'].get('model_comparisons', {})
+        for baseline_model, threshold_payload in comparisons.items():
+            for threshold_mode, comparison_rows in threshold_payload.items():
+                for row in comparison_rows:
+                    key = (
+                        baseline_model,
+                        threshold_mode,
+                        row['model'],
+                        row['split'],
+                        row['group'],
+                    )
+                    bucket = grouped.setdefault(key, {'counts': [], 'rates': []})
+                    bucket['counts'].append({
+                        'fold_idx': fold_idx,
+                        'value': int(row['count']),
+                    })
+                    bucket['rates'].append({
+                        'fold_idx': fold_idx,
+                        'value': float(row['rate_within_split']),
+                    })
+    rows = []
+    for key, values in sorted(grouped.items()):
+        baseline_model, threshold_mode, model_name, split_name, group_name = key
+        rates = np.asarray([entry['value'] for entry in values['rates']], dtype=np.float64)
+        rows.append({
+            'baseline_model': baseline_model,
+            'threshold_mode': threshold_mode,
+            'model': model_name,
+            'split': split_name,
+            'group': group_name,
+            'count_sum': int(sum(entry['value'] for entry in values['counts'])),
+            'rate_mean': float(rates.mean()) if rates.size else None,
+            'rate_std': float(rates.std(ddof=0)) if rates.size else None,
+            'counts_by_fold': values['counts'],
+            'rates_by_fold': values['rates'],
+        })
+    return rows
+
+
+def aggregate_threshold_results(fold_outputs):
+    grouped = {}
+    for fold_output in fold_outputs:
+        fold_idx = fold_output.get('fold_idx')
+        for model_name, model_result in fold_output['result'].get('models', {}).items():
+            fixed_metrics = model_result.get('final_metrics', {}).get('test', {})
+            tuned_payload = model_result.get('threshold_evaluation', {})
+            tuned_metrics = tuned_payload.get('metrics', {}).get('test', {})
+            for threshold_mode, threshold, metric_values in (
+                ('fixed_0.5', 0.5, fixed_metrics),
+                ('val_tuned', tuned_payload.get('threshold'), tuned_metrics),
+            ):
+                if threshold is None:
+                    continue
+                bucket = grouped.setdefault((model_name, threshold_mode), {
+                    'threshold': [],
+                    'metrics': {},
+                })
+                bucket['threshold'].append({
+                    'fold_idx': fold_idx,
+                    'value': float(threshold),
+                })
+                for metric_name in (
+                    'acc',
+                    'roc_auc',
+                    'average_precision',
+                    'f1',
+                    'prec',
+                    'rec',
+                    'loss',
+                    'pred_positive_rate',
+                ):
+                    value = metric_values.get(metric_name)
+                    if value is not None:
+                        bucket['metrics'].setdefault(metric_name, []).append({
+                            'fold_idx': fold_idx,
+                            'value': float(value),
+                        })
+
+    summary = {}
+    for (model_name, threshold_mode), payload in sorted(grouped.items()):
+        target = summary.setdefault(model_name, {}).setdefault(threshold_mode, {})
+        threshold_values = np.asarray(
+            [entry['value'] for entry in payload['threshold']],
+            dtype=np.float64,
+        )
+        target['threshold'] = {
+            'mean': float(threshold_values.mean()) if threshold_values.size else None,
+            'std': float(threshold_values.std(ddof=0)) if threshold_values.size else None,
+            'values': payload['threshold'],
+        }
+        for metric_name, entries in payload['metrics'].items():
+            values = np.asarray([entry['value'] for entry in entries], dtype=np.float64)
+            target[metric_name] = {
+                'mean': float(values.mean()) if values.size else None,
+                'std': float(values.std(ddof=0)) if values.size else None,
+                'values': entries,
+            }
+    return summary
+
+
+def aggregate_edge_reliability(fold_outputs):
+    grouped = {}
+    metric_names = (
+        'same_label_rate',
+        'reliability_mean',
+        'reliability_same_label_mean',
+        'reliability_diff_label_mean',
+        'same_label_auc',
+        'same_label_average_precision',
+    )
+    for fold_output in fold_outputs:
+        fold_idx = fold_output.get('fold_idx')
+        for model_name, model_result in fold_output['result'].get('models', {}).items():
+            groups = model_result.get('edge_reliability', {}).get('groups', {})
+            for group_name, group_result in groups.items():
+                bucket = grouped.setdefault((model_name, group_name), {})
+                for metric_name in metric_names:
+                    value = group_result.get(metric_name)
+                    if value is not None:
+                        bucket.setdefault(metric_name, []).append({
+                            'fold_idx': fold_idx,
+                            'value': float(value),
+                        })
+    summary = {}
+    for (model_name, group_name), metric_values in sorted(grouped.items()):
+        group_summary = summary.setdefault(model_name, {}).setdefault(group_name, {})
+        for metric_name, entries in metric_values.items():
+            values = np.asarray([entry['value'] for entry in entries], dtype=np.float64)
+            group_summary[metric_name] = {
+                'mean': float(values.mean()) if values.size else None,
+                'std': float(values.std(ddof=0)) if values.size else None,
+                'values': entries,
+            }
+    return summary
+
+
 def save_all_folds_summary(args, fold_outputs):
     summary_args = copy.copy(args)
     apply_path_templates(summary_args, fold_idx='all')
     graph_name = str(getattr(summary_args, 'relation_graph', 'coarse')).strip().lower()
+    dataset_dir = dataset_output_dir(summary_args)
     if graph_name == 'coarse':
-        base_out_dir = os.path.join(summary_args.out_dir, summary_args.data_name)
+        base_out_dir = dataset_dir
     else:
-        base_out_dir = os.path.join(summary_args.out_dir, summary_args.data_name, graph_name)
+        base_out_dir = os.path.join(dataset_dir, graph_name)
     ensure_parent_dir(os.path.join(base_out_dir, 'dummy'))
     os.makedirs(base_out_dir, exist_ok=True)
+    model_comparisons = aggregate_model_comparisons(fold_outputs)
     payload = {
         'data_name': summary_args.data_name,
         'fold_indices': [output.get('fold_idx') for output in fold_outputs],
         'summary': aggregate_fold_results(fold_outputs),
+        'threshold_summary': aggregate_threshold_results(fold_outputs),
+        'model_comparisons': model_comparisons,
+        'model_comparison_vs_mlp': [
+            row for row in model_comparisons
+            if row['baseline_model'] == 'mlp'
+            and row['threshold_mode'] == 'fixed_0.5'
+        ],
+        'edge_reliability': aggregate_edge_reliability(fold_outputs),
         'fold_result_paths': [
             os.path.join(output['out_dir'], 'relation_results.json')
             for output in fold_outputs

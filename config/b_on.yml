@@ -1,4 +1,4 @@
-data_name_set: ['ogbn_arxiv']
+data_name_set: ['ogbn_arxiv','reddit']
 timestamp: pos
 channel_list: [6805, 256, 128, 64, 1]
 
@@ -36,15 +36,15 @@ export_attention: true
 # 二阶段粗图关系实验配置，只被 coarse_relation_experiment.py 使用，不影响原来的 train.py。
 coarse_relation_experiment:
   # 使用哪个数据集。这里默认只分析 ogbn_arxiv。
-  data_name: ogbn_arxiv
+  data_name: reddit
   # 预处理 pkl 所在目录，脚本会读取 /data/yg/Subgraph-MIL/Data/processed_data/ogbn_arxiv_processed.pkl。
   processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
   # 运行设备。服务器有 GPU 时用 cuda；本地调试可临时命令行加 --device cpu。
   device: cuda
   # 随机种子，影响 stage-1 训练、二阶段模型初始化、dataset split。
   seed: 1024
-  # 实验输出根目录；每一折会写到 result/coarse_relation/ogbn_arxiv/fold_x。
-  out_dir: result/coarse_relation
+  # 结果统一写到服务器的 /data/yg/Subgraph-MIL/diffpool2/result/{data_name}。
+  out_dir: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}
 
   # 划分方式。fixed_cv 表示沿用/创建 10 折 CV；dataset 表示用数据自带 train/test 再切 val。
   split_source: fixed_cv
@@ -58,7 +58,7 @@ coarse_relation_experiment:
   dataset_val_frac: 0.2
 
   # 每折导出的固定子图表示 z_mil 路径。{data_name} 和 {fold_idx} 会自动替换。
-  embeddings_path: result/coarse_relation/{data_name}_zmil_fold{fold_idx}.pt
+  embeddings_path: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_zmil_fold{fold_idx}.pt
   # true 表示即使已有 embeddings 文件也重新导出；false 表示能复用就复用。
   force_export_embeddings: false
   # 从 MISGL forward_with_embeddings 里取哪个表示做二阶段节点特征；默认用 Branch-B 的 z_mil。
@@ -79,15 +79,14 @@ coarse_relation_experiment:
   # stage-1 weight decay。
   stage1_weight_decay: 0.0
   # 保存每折 stage-1 最优模型，方便之后复用或检查。
-  save_stage1_checkpoint: result/coarse_relation/{data_name}_stage1_fold{fold_idx}.pt
+  save_stage1_checkpoint: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_stage1_fold{fold_idx}.pt
   # 调试用：true 时允许用随机未训练 stage-1 导出 embedding；正式实验必须 false。
   allow_random_stage1: false
   # 加载 checkpoint 时是否允许参数名不完全匹配；默认严格匹配。
   non_strict_checkpoint: false
 
-  # 二阶段对照模型：mlp 不用粗图；gcn/appnp/sage/gated_sage 使用粗图关系。
-  # gated_sage 会学习每个子图应该听多少邻居信息，用来检验“选择性关系建模”是否更稳。
-  models: mlp,gcn,appnp,sage,gated_sage
+  # 下一步消融：普通 MLP、同结构 self-only、仅修正边缩放、边缩放+节点修正门控。
+  models: mlp,edge_self_only,edge_gate_scaled,edge_gate_node_residual
   # 二阶段关系图来源：
   #   coarse   = 使用原始粗图；
   #   zmil_knn = 使用每折固定 z_mil 在表示空间里构建 kNN 图。
@@ -126,6 +125,22 @@ coarse_relation_experiment:
   appnp_alpha: 0.1
   # gated_sage 里 gate MLP 的隐藏层维度，控制“是否信任邻居”的判别能力。
   gated_sage_gate_hidden_dim: 128
+  # edge_gate_residual 的逐边可靠性 MLP 隐藏维度。
+  edge_gate_hidden_dim: 128
+  # 节点级 correction gate 的隐藏维度。
+  edge_node_gate_hidden_dim: 32
+  # train-train 边“是否同标签”辅助损失权重；验证和测试边标签不会参与训练。
+  edge_aux_loss_weight: 0.2
+  # 平衡 train-train 同标签边/异标签边的损失，避免高同质 kNN 图学成“所有边都可信”。
+  edge_aux_balance: true
+  # 邻居消息残差系数初值。模型会学习该系数，但从保守的 0.1 开始。
+  edge_residual_init: 0.1
+  # edge reliability 从低到高分桶数量，用于输出同标签率随可靠性变化的诊断。
+  edge_diagnostic_bins: 10
+  # 同时相对普通 MLP 和同结构 self-only 统计改对/改错。
+  comparison_baselines: mlp,edge_self_only
+  # 用验证集选择分类阈值时优化 F1；同时仍保留固定 0.5 阈值结果。
+  threshold_metric: f1
   # 日志打印间隔。
   log_interval: 20
 
@@ -152,11 +167,11 @@ coarse_relation_diagnostics:
   dataset_val_frac: 0.2
 
   # 二阶段实验输出根目录，用来定位每折 relation_predictions.csv。
-  relation_out_dir: result/coarse_relation
+  relation_out_dir: /data/yg/Subgraph-MIL/diffpool2/result
   # 诊断结果输出目录。默认会按 relation_graph 分开，避免 coarse 和 z_mil kNN 诊断互相覆盖。
-  diagnostics_out_dir: result/coarse_relation_diagnostics/{data_name}/{relation_graph}
+  diagnostics_out_dir: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/diagnostics/{relation_graph}
   # 每折 z_mil embedding 路径。
-  embeddings_path: result/coarse_relation/{data_name}_zmil_fold{fold_idx}.pt
+  embeddings_path: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_zmil_fold{fold_idx}.pt
   # 每折预测 CSV 路径。当前分支默认读取 z_mil kNN 图实验结果。
   predictions_path: '{relation_out_dir}/{data_name}/{relation_graph}/fold_{fold_idx}/relation_predictions.csv'
 
