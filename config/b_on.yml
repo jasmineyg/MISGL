@@ -1,5 +1,5 @@
-data_name_set: ['ogbn_arxiv']
-timestamp: loss
+data_name_set: ['ogbn_arxiv','reddit']
+timestamp: pos
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
@@ -17,4 +17,180 @@ branch_b:
   structural_fusion: 'gated_residual'
   attention_shape_loss_weight: 0.05
 
+position_head:
+  use: true
+  top_k: 16
+  normalize: true
+  include_self: false
+  symmetrize: true
+  type: residual_gcn
+  num_layers: 1
+  dropout: 0.1
+  row_normalize: true
+  residual_init: 0.1
+  cache: true
+  cache_dir: '.cache/position_head'
+
 export_attention: true
+
+# 二阶段粗图关系实验配置，只被 coarse_relation_experiment.py 使用，不影响原来的 train.py。
+coarse_relation_experiment:
+  # 使用哪个数据集。这里默认只分析 ogbn_arxiv。
+  data_name: reddit
+  # 预处理 pkl 所在目录，脚本会读取 /data/yg/Subgraph-MIL/Data/processed_data/ogbn_arxiv_processed.pkl。
+  processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
+  # 运行设备。服务器有 GPU 时用 cuda；本地调试可临时命令行加 --device cpu。
+  device: cuda
+  # 随机种子，影响 stage-1 训练、二阶段模型初始化、dataset split。
+  seed: 1024
+  # 结果统一写到服务器的 /data/yg/Subgraph-MIL/diffpool2/result/{data_name}。
+  out_dir: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}
+
+  # 划分方式。fixed_cv 表示沿用/创建 10 折 CV；dataset 表示用数据自带 train/test 再切 val。
+  split_source: fixed_cv
+  # 10 折划分文件路径。没有文件且 create_split_if_missing=true 时会自动创建。
+  split_path: splits/{data_name}_cv10_seed1024_adjacent.json
+  # 默认留空：命令行不写 --fold_idx 时跑完整 10 折；命令行写 --fold_idx 3 时只跑第 3 折。
+  fold_idx:
+  # fixed_cv 的 split 文件不存在时是否自动生成。
+  create_split_if_missing: true
+  # 只有 split_source=dataset 时才用：从原 train pool 中切多少比例做 val。
+  dataset_val_frac: 0.2
+
+  # 每折导出的固定子图表示 z_mil 路径。{data_name} 和 {fold_idx} 会自动替换。
+  embeddings_path: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_zmil_fold{fold_idx}.pt
+  # true 表示即使已有 embeddings 文件也重新导出；false 表示能复用就复用。
+  force_export_embeddings: false
+  # 从 MISGL forward_with_embeddings 里取哪个表示做二阶段节点特征；默认用 Branch-B 的 z_mil。
+  embedding_key: z_mil
+  # 导出 embedding 时的 batch size，通常与 batch_size 保持一致即可。
+  export_batch_size: 64
+
+  # true 表示先训练 stage-1 MISGL/Branch-B，再导出 z_mil；false 表示只读取已有 embeddings。
+  train_stage1: true
+  # stage-1 是否带 position head。这里建议 false，因为二阶段就是专门单独建模粗图关系。
+  stage1_use_position_head: false
+  # stage-1 最多训练 epoch 数。
+  stage1_epochs: 80
+  # stage-1 验证集长期不提升时提前停止。
+  stage1_patience: 20
+  # stage-1 学习率。
+  stage1_lr: 0.001
+  # stage-1 weight decay。
+  stage1_weight_decay: 0.0
+  # 保存每折 stage-1 最优模型，方便之后复用或检查。
+  save_stage1_checkpoint: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_stage1_fold{fold_idx}.pt
+  # 调试用：true 时允许用随机未训练 stage-1 导出 embedding；正式实验必须 false。
+  allow_random_stage1: false
+  # 加载 checkpoint 时是否允许参数名不完全匹配；默认严格匹配。
+  non_strict_checkpoint: false
+
+  # 下一步消融：普通 MLP、同结构 self-only、仅修正边缩放、边缩放+节点修正门控。
+  models: mlp,edge_self_only,edge_gate_scaled,edge_gate_node_residual
+  # 二阶段关系图来源：
+  #   coarse   = 使用原始粗图；
+  #   zmil_knn = 使用每折固定 z_mil 在表示空间里构建 kNN 图。
+  relation_graph: zmil_knn
+  # z_mil kNN 图每个节点保留多少个近邻。诊断结果里 k=16 在两个数据集上都比较干净。
+  knn_k: 16
+  # kNN 相似度，目前只支持 cosine。
+  knn_metric: cosine
+  # kNN 边权：positive_cosine 表示 max(cosine, 0)，避免负边权参与传播。
+  knn_weight_mode: positive_cosine
+  # 可选相似度阈值；留空表示只按 top-k 保留。
+  knn_min_similarity:
+  # 构建 kNN 图时的 batch size，太大可能占显存/内存，太小会慢。
+  knn_batch_size: 512
+  # 是否把有向 kNN 图对称化。true 表示 i 选 j 或 j 选 i 都会连边。
+  knn_symmetrize: true
+  # z_mil 特征归一化方式。standard 表示只用 train split 估计均值方差。
+  feature_norm: standard
+  # 二阶段模型最多训练 epoch 数。
+  relation_epochs: 500
+  # 二阶段学习率。
+  relation_lr: 0.001
+  # 二阶段 weight decay。
+  relation_weight_decay: 0.0005
+  # 二阶段 MLP/GCN/SAGE 的隐藏层维度。
+  relation_hidden_dim: 256
+  # 二阶段 dropout。
+  relation_dropout: 0.5
+  # 二阶段 early stopping patience。
+  relation_patience: 80
+  # 用哪个验证指标选最优模型：val_roc_auc / val_acc / val_loss。
+  selection_metric: val_roc_auc
+  # APPNP 的传播步数，越大看得越远，但也可能过平滑。
+  appnp_k: 10
+  # APPNP 的初始预测保留比例，越大越信任自身 z_mil。
+  appnp_alpha: 0.1
+  # gated_sage 里 gate MLP 的隐藏层维度，控制“是否信任邻居”的判别能力。
+  gated_sage_gate_hidden_dim: 128
+  # edge_gate_residual 的逐边可靠性 MLP 隐藏维度。
+  edge_gate_hidden_dim: 128
+  # 节点级 correction gate 的隐藏维度。
+  edge_node_gate_hidden_dim: 32
+  # train-train 边“是否同标签”辅助损失权重；验证和测试边标签不会参与训练。
+  edge_aux_loss_weight: 0.2
+  # 平衡 train-train 同标签边/异标签边的损失，避免高同质 kNN 图学成“所有边都可信”。
+  edge_aux_balance: true
+  # 邻居消息残差系数初值。模型会学习该系数，但从保守的 0.1 开始。
+  edge_residual_init: 0.1
+  # edge reliability 从低到高分桶数量，用于输出同标签率随可靠性变化的诊断。
+  edge_diagnostic_bins: 10
+  # 同时相对普通 MLP 和同结构 self-only 统计改对/改错。
+  comparison_baselines: mlp,edge_self_only
+  # 用验证集选择分类阈值时优化 F1；同时仍保留固定 0.5 阈值结果。
+  threshold_metric: f1
+  # 日志打印间隔。
+  log_interval: 20
+
+# 二阶段结果诊断配置，只被 coarse_relation_diagnostics.py 使用，不会重新训练模型。
+coarse_relation_diagnostics:
+  # 默认诊断的数据集；跑 reddit 时命令行加 --data_name reddit 即可覆盖。
+  data_name: ogbn_arxiv
+  # 预处理 pkl 所在目录，需要能找到 {data_name}_processed.pkl。
+  processed_data_dir: /data/yg/Subgraph-MIL/Data/processed_data
+  # 诊断只做读取和统计，CPU 就够；如果 kNN 很大也可以改成 cuda 但当前脚本主要用 numpy。
+  device: cpu
+  # 随机种子，用于边采样和 kNN source node 采样。
+  seed: 1024
+
+  # 默认留空：不写 --fold_idx 时诊断完整 10 折；写 --fold_idx 3 时只诊断第 3 折。
+  fold_idx:
+  # 划分方式要和二阶段实验保持一致。
+  split_source: fixed_cv
+  # 10 折划分文件。
+  split_path: splits/{data_name}_cv10_seed1024_adjacent.json
+  # split 文件不存在时是否自动创建。
+  create_split_if_missing: true
+  # 只有 split_source=dataset 时才用。
+  dataset_val_frac: 0.2
+
+  # 二阶段实验输出根目录，用来定位每折 relation_predictions.csv。
+  relation_out_dir: /data/yg/Subgraph-MIL/diffpool2/result
+  # 诊断结果输出目录。默认会按 relation_graph 分开，避免 coarse 和 z_mil kNN 诊断互相覆盖。
+  diagnostics_out_dir: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/diagnostics/{relation_graph}
+  # 每折 z_mil embedding 路径。
+  embeddings_path: /data/yg/Subgraph-MIL/diffpool2/result/{data_name}/artifacts/{data_name}_zmil_fold{fold_idx}.pt
+  # 每折预测 CSV 路径。当前分支默认读取 z_mil kNN 图实验结果。
+  predictions_path: '{relation_out_dir}/{data_name}/{relation_graph}/fold_{fold_idx}/relation_predictions.csv'
+
+  # 留空表示自动从 prediction CSV 里识别模型；也可以手动写 mlp,sage,gated_sage。
+  models:
+  # 用哪个模型作为“只看自身 z_mil”的基线来分析改对/改错。
+  baseline_model: mlp
+  # edge feature 分桶数，用于观察不同权重/相似度区间的同标签比例。
+  bin_count: 10
+  # 每折最多导出多少条边样本到 edge_reliability_sample.csv，避免大数据集文件过大。
+  edge_sample_max_per_fold: 200000
+  # node_error_cases.csv 只导出哪些 split 的节点，默认只看 val/test。
+  node_case_splits: val,test
+
+  # 是否比较 z_mil kNN 图和 coarse graph 的同标签比例。
+  run_knn_diagnostics: true
+  # kNN 图观察哪些 k。
+  knn_k_list: 8,16,32,64
+  # kNN 计算时每个 batch 的 source node 数。
+  knn_batch_size: 512
+  # kNN 诊断最多采样多少个 source node；大图上避免全量 NxN 过慢。
+  knn_max_source_nodes: 5000

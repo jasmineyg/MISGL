@@ -6,6 +6,7 @@ import os
 import logging
 import pickle
 import json
+import hashlib
 from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
 
 import torch
@@ -14,6 +15,27 @@ from torch.utils.data import Dataset, DataLoader
 from MISGL.utils import hparams_lib
 from MISGL.utils.global_variables import *
 from MISGL.utils import reproducibility
+from MISGL.utils import coarse_graph as coarse_graph_utils
+
+
+def _position_head_config(hparams):
+  cfg = getattr(hparams, 'position_head', None)
+  if not isinstance(cfg, dict):
+    cfg = {}
+  return {
+    'use': bool(cfg.get('use', False)),
+    'top_k': int(cfg.get('top_k', 16)),
+    'normalize': bool(cfg.get('normalize', True)),
+    'include_self': bool(cfg.get('include_self', False)),
+    'symmetrize': bool(cfg.get('symmetrize', True)),
+    'cache': bool(cfg.get('cache', True)),
+    'cache_dir': cfg.get('cache_dir', os.path.join('.cache', 'position_head')),
+  }
+
+
+def _safe_cache_name(value):
+  value = str(value or 'dataset')
+  return ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in value)
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
@@ -31,6 +53,9 @@ class GraphDataset(Dataset):
     )
     self._structure_undirected = bool(bb_cfg.get('structural_undirected', True)) if bb_cfg else True
     self._structural_feature_dim = 7
+    self._position_head_cfg = _position_head_config(self._hparams)
+    self._use_position_head = bool(self._position_head_cfg['use'])
+    self._position_head_top_k = int(self._position_head_cfg['top_k'])
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -71,6 +96,33 @@ class GraphDataset(Dataset):
       except (TypeError, ValueError):
         subgraph_id = -1
       graph_tmp_dict[g_key.subgraph_id] = torch.tensor(subgraph_id, dtype=torch.long).to(self._device)
+      if self._use_position_head:
+        coarse_node_id = graph.graph.get('coarse_node_id', subgraph_id)
+        coarse_node_num = graph.graph.get('coarse_node_num', 0)
+        neighbor_index = graph.graph.get('coarse_neighbor_indices', [])
+        neighbor_weight = graph.graph.get('coarse_neighbor_weights', [])
+        try:
+          coarse_node_id = int(coarse_node_id)
+        except (TypeError, ValueError):
+          coarse_node_id = -1
+        try:
+          coarse_node_num = int(coarse_node_num)
+        except (TypeError, ValueError):
+          coarse_node_num = 0
+
+        padded_index = np.full((self._position_head_top_k,), -1, dtype=np.int64)
+        padded_weight = np.zeros((self._position_head_top_k,), dtype=np.float32)
+        neighbor_index = np.asarray(neighbor_index, dtype=np.int64).reshape(-1)
+        neighbor_weight = np.asarray(neighbor_weight, dtype=np.float32).reshape(-1)
+        keep_count = min(self._position_head_top_k, neighbor_index.size, neighbor_weight.size)
+        if keep_count > 0:
+          padded_index[:keep_count] = neighbor_index[:keep_count]
+          padded_weight[:keep_count] = neighbor_weight[:keep_count]
+
+        graph_tmp_dict[g_key.coarse_node_id] = torch.tensor(coarse_node_id, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_node_num] = torch.tensor(coarse_node_num, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_neighbor_index] = torch.tensor(padded_index, dtype=torch.long).to(self._device)
+        graph_tmp_dict[g_key.coarse_neighbor_weight] = torch.tensor(padded_weight, dtype=torch.float32).to(self._device)
       processed_graph_list.append(graph_tmp_dict)
     return processed_graph_list
 
@@ -188,6 +240,9 @@ class GraphDataLoaderWrapper(object):
     self._hparams.channel_list[0] = feature_dim
     max_num_nodes = int(dataset['dataset_metadata'].get('max_num_nodes', max(len(g.nodes()) for g in subgraphs)))
     self._set_or_add_hparam('max_num_nodes', max_num_nodes)
+    self.coarse_adj = None
+    self.coarse_graph_metadata = None
+    self._maybe_attach_coarse_graph(dataset, subgraphs, dataset_path)
 
     self.train_graphs = [subgraphs[i] for i in train_indices]
     self.test_graphs = [subgraphs[i] for i in test_indices]
@@ -229,6 +284,147 @@ class GraphDataLoaderWrapper(object):
     self._cv_index_by_orig_idx = {int(orig_idx): idx for idx, orig_idx in enumerate(self.cv_orig_indices)}
     self.cv_folds = None
     self.cv_build_info = None
+
+  def _position_head_cache_path(self, dataset, dataset_path, assignment_matrix, original_graph, active_subgraph_ids, cfg):
+    active_subgraph_ids = np.asarray(active_subgraph_ids, dtype=np.int64)
+    stat = os.stat(dataset_path)
+    assignment_shape = tuple(int(v) for v in assignment_matrix.shape)
+    if hasattr(original_graph, 'nodes') and hasattr(original_graph, 'edges'):
+      original_nodes = len(original_graph.nodes())
+      original_edges = len(original_graph.edges())
+    else:
+      original_nodes = int(getattr(original_graph, 'shape', (0, 0))[0])
+      original_edges = int(getattr(original_graph, 'nnz', 0))
+
+    active_hash = hashlib.sha256(active_subgraph_ids.tobytes()).hexdigest()
+    payload = {
+      'cache_version': 1,
+      'data_name': self.data_name,
+      'dataset_path': os.path.abspath(dataset_path),
+      'dataset_size': int(stat.st_size),
+      'dataset_mtime_ns': int(stat.st_mtime_ns),
+      'assignment_shape': assignment_shape,
+      'original_nodes': int(original_nodes),
+      'original_edges': int(original_edges),
+      'num_subgraphs': int(len(active_subgraph_ids)),
+      'active_subgraph_ids_sha256': active_hash,
+      'top_k': int(cfg['top_k']),
+      'normalize': bool(cfg['normalize']),
+      'include_self': bool(cfg['include_self']),
+      'symmetrize': bool(cfg['symmetrize']),
+    }
+    cache_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    metadata = dataset.get('dataset_metadata', {}) if isinstance(dataset, dict) else {}
+    dataset_name = metadata.get('dataset_name', self.data_name)
+    cache_dir = cfg.get('cache_dir') or os.path.join('.cache', 'position_head')
+    cache_path = os.path.join(
+      str(cache_dir),
+      '{}_poshead_{}.npz'.format(_safe_cache_name(dataset_name), cache_key[:16]),
+    )
+    return cache_path, cache_key
+
+  def _load_position_head_cache(self, cache_path, cache_key, expected_num_nodes):
+    if not os.path.exists(cache_path):
+      return None, None
+    try:
+      coarse_adj, metadata = coarse_graph_utils.load_coarse_adjacency_cache(cache_path)
+      if metadata.get('cache_key') != cache_key:
+        logging.warning('Ignoring stale position-head cache with mismatched key: %s', cache_path)
+        return None, None
+      if int(coarse_adj.shape[0]) != int(expected_num_nodes):
+        logging.warning(
+          'Ignoring position-head cache with wrong node count: %s (got=%s, expected=%s)',
+          cache_path,
+          coarse_adj.shape[0],
+          expected_num_nodes,
+        )
+        return None, None
+      logging.info('Loaded position-head coarse graph cache: %s', cache_path)
+      return coarse_adj, metadata
+    except Exception as exc:
+      logging.warning('Failed to load position-head cache %s: %s', cache_path, exc)
+      return None, None
+
+  def _save_position_head_cache(self, cache_path, cache_key, coarse_adj, metadata):
+    try:
+      os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+      metadata = dict(metadata or {})
+      metadata['cache_key'] = cache_key
+      metadata['cache_path'] = cache_path
+      coarse_graph_utils.save_coarse_adjacency_cache(cache_path, coarse_adj, metadata)
+      logging.info('Saved position-head coarse graph cache: %s', cache_path)
+    except Exception as exc:
+      logging.warning('Failed to save position-head cache %s: %s', cache_path, exc)
+
+  def _maybe_attach_coarse_graph(self, dataset, subgraphs, dataset_path):
+    cfg = _position_head_config(self._hparams)
+    if not cfg['use']:
+      return
+
+    original_graph = dataset.get('original_graph', None)
+    assignment_matrix = dataset.get('assignment_matrix', None)
+    if original_graph is None:
+      raise ValueError('position_head.use is true, but dataset does not contain original_graph.')
+    if assignment_matrix is None:
+      raise ValueError('position_head.use is true, but dataset does not contain assignment_matrix.')
+
+    active_subgraph_ids = []
+    for pos, graph in enumerate(subgraphs):
+      subgraph_id = graph.graph.get('subgraph_id', pos)
+      try:
+        subgraph_id = int(subgraph_id)
+      except (TypeError, ValueError):
+        subgraph_id = int(pos)
+      if subgraph_id < 0:
+        subgraph_id = int(pos)
+      active_subgraph_ids.append(subgraph_id)
+
+    cache_path = None
+    cache_key = None
+    if cfg['cache']:
+      cache_path, cache_key = self._position_head_cache_path(
+        dataset,
+        dataset_path,
+        assignment_matrix,
+        original_graph,
+        active_subgraph_ids,
+        cfg,
+      )
+      self.coarse_adj, self.coarse_graph_metadata = self._load_position_head_cache(
+        cache_path,
+        cache_key,
+        expected_num_nodes=len(active_subgraph_ids),
+      )
+
+    if self.coarse_adj is None:
+      self.coarse_adj, self.coarse_graph_metadata = coarse_graph_utils.build_coarse_adjacency(
+        original_graph=original_graph,
+        assignment_matrix=assignment_matrix,
+        active_subgraph_ids=active_subgraph_ids,
+        top_k=cfg['top_k'],
+        normalize=cfg['normalize'],
+        include_self=cfg['include_self'],
+        symmetrize=cfg['symmetrize'],
+      )
+      if cfg['cache'] and cache_path is not None:
+        self._save_position_head_cache(cache_path, cache_key, self.coarse_adj, self.coarse_graph_metadata)
+
+    coarse_node_num = int(self.coarse_adj.shape[0])
+    for coarse_node_id, graph in enumerate(subgraphs):
+      row = self.coarse_adj.getrow(coarse_node_id)
+      graph.graph['coarse_node_id'] = int(coarse_node_id)
+      graph.graph['coarse_node_num'] = coarse_node_num
+      graph.graph['coarse_neighbor_indices'] = row.indices.astype(np.int64, copy=False)
+      graph.graph['coarse_neighbor_weights'] = row.data.astype(np.float32, copy=False)
+
+    logging.info(
+      'Built coarse graph: nodes=%d, edges=%d, top_k=%s, normalize=%s, include_self=%s',
+      coarse_node_num,
+      int(self.coarse_adj.nnz),
+      cfg['top_k'],
+      cfg['normalize'],
+      cfg['include_self'],
+    )
 
   def _set_or_add_hparam(self, name, value):
     if name in self._hparams:
