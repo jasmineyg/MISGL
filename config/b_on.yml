@@ -1,5 +1,5 @@
-data_name_set: ['ogbn_arxiv']
-timestamp: loss
+data_name_set: ['reddit']
+timestamp: bound
 channel_list: [6805, 256, 128, 64, 1]
 
 batch_size: 64
