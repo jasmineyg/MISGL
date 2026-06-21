@@ -28,3 +28,22 @@ initialized. When automatic selection is enabled, use `gpu_candidate_devices`
 to restrict which physical cards may be selected. Manual
 `cuda_visible_devices: '0'` style settings still work when automatic selection
 is disabled.
+
+## Boundary Interaction Profile
+
+Run the BIP validation with the existing fixed CV split:
+
+```bash
+python boundary_interaction_analyzer.py \
+  --hparam_path ./config/b_on.yml \
+  --data_name_set ogbn_arxiv
+```
+
+Use `--folds 0` for a one-fold smoke run. Results are written to:
+
+```text
+results/<dataset>/boundary_interaction/<timestamp>/
+```
+
+The output includes fold metrics, feature-group ablations, shuffled controls,
+fix/break analysis, BIP correlations, and per-subgraph profiles.
