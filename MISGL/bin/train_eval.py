@@ -24,16 +24,85 @@ def _attention_train_output_path(path):
   return f'{base}_train10p{ext}'
 
 
-_METRIC_KEYS = ('acc', 'prec', 'rec', 'F1')
+_METRIC_KEYS = (
+  'acc', 'prec', 'rec', 'F1', 'balanced_acc', 'roc_auc', 'pr_auc',
+  'tn', 'fp', 'fn', 'tp',
+)
 _FINAL_EVAL_SPLITS = ('train', 'val', 'test')
 
 
 def _basic_metrics(result):
-  return {key: float(result[key]) for key in _METRIC_KEYS}
+  return {
+    key: None if result.get(key) is None else float(result[key])
+    for key in _METRIC_KEYS
+  }
 
 
 def _format_metrics(result):
-  return ', '.join(f'{key}: {result[key]:.4f}' for key in _METRIC_KEYS)
+  return ', '.join(
+    '{}: {}'.format(
+      key,
+      'n/a' if result.get(key) is None else '{:.4f}'.format(float(result[key])),
+    )
+    for key in _METRIC_KEYS
+  )
+
+
+def _metric_summary(values):
+  finite_values = [
+    float(value) for value in values
+    if value is not None and np.isfinite(float(value))
+  ]
+  if not finite_values:
+    return {'mean': None, 'std': None, 'count': 0}
+  return {
+    'mean': float(np.mean(finite_values)),
+    'std': float(np.std(finite_values, ddof=1)) if len(finite_values) > 1 else 0.0,
+    'count': len(finite_values),
+  }
+
+
+def _training_label_stats(training_loader):
+  dataset = getattr(training_loader, 'dataset', None)
+  examples = getattr(dataset, 'processed_graph_list', None)
+  if examples is None:
+    raise ValueError('Training dataset does not expose processed_graph_list.')
+
+  negative_count = 0
+  positive_count = 0
+  for example in examples:
+    label = int(example[g_key.y].detach().cpu().item())
+    if label == 0:
+      negative_count += 1
+    elif label == 1:
+      positive_count += 1
+    else:
+      raise ValueError('Binary loss received unsupported training label: {}'.format(label))
+
+  if positive_count == 0:
+    raise ValueError('Training fold has no positive examples.')
+  if negative_count == 0:
+    raise ValueError('Training fold has no negative examples.')
+  return {
+    'negative_count': int(negative_count),
+    'positive_count': int(positive_count),
+    'pos_weight': float(negative_count) / float(positive_count),
+  }
+
+
+def _configure_fold_loss(hparams, training_loader):
+  loss_type = str(getattr(hparams, 'loss_type', 'bce')).strip().lower()
+  label_stats = _training_label_stats(training_loader)
+  pos_weight = label_stats['pos_weight'] if loss_type == 'weighted_bce' else None
+  hparams.loss_pos_weight = pos_weight
+  return {
+    'loss_type': loss_type,
+    'focal_gamma': float(getattr(hparams, 'focal_gamma', 2.0)),
+    'label_smoothing': float(getattr(hparams, 'label_smoothing', 0.0)),
+    'negative_count': label_stats['negative_count'],
+    'positive_count': label_stats['positive_count'],
+    'pos_weight': pos_weight,
+  }
 
 
 def _final_eval_splits(hparams):
@@ -138,7 +207,7 @@ def train_eval(hparams, data_name=None):
     seeds = [base_seed + i for i in range(holdout_runs)]
 
   final_splits = _final_eval_splits(hparams)
-  test_metrics = {'acc': [], 'prec': [], 'rec': [], 'F1': []}
+  test_metrics = {key: [] for key in _METRIC_KEYS}
   split_metrics = {
     split_name: {key: [] for key in _METRIC_KEYS}
     for split_name in final_splits
@@ -154,6 +223,7 @@ def train_eval(hparams, data_name=None):
     training_loader, validation_loader, test_loader = data_loader.get_holdout_loaders(
       seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
+    loss_config = _configure_fold_loss(hparams, training_loader)
 
     summary_writer = None
 
@@ -177,6 +247,7 @@ def train_eval(hparams, data_name=None):
       'run_idx': int(run_idx),
       'seed': int(seed),
       'best_val': best_val_result,
+      'loss_config': loss_config,
       'metrics': dict(result),
       'split_metrics': metrics_by_split,
     })
@@ -227,26 +298,24 @@ def train_eval(hparams, data_name=None):
     del model, training_loader, validation_loader, test_loader, loaders_by_split, metrics_by_split, result
     _clear_cuda_cache(hparams)
 
-  summary = {
-    key: {
-      'mean': float(np.mean(vals)),
-      'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    }
-    for key, vals in test_metrics.items()
-  }
+  summary = {key: _metric_summary(vals) for key, vals in test_metrics.items()}
   split_summary = {
     split_name: {
-      key: {
-        'mean': float(np.mean(vals)),
-        'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-      }
+      key: _metric_summary(vals)
       for key, vals in split_result.items()
     }
     for split_name, split_result in split_metrics.items()
   }
   for split_name in final_splits:
     msg_parts = [
-      f'{k}: {split_summary[split_name][k]["mean"]:.4f} +/- {split_summary[split_name][k]["std"]:.4f}'
+      '{}: {}'.format(
+        k,
+        'n/a' if split_summary[split_name][k]['mean'] is None else
+        '{:.4f} +/- {:.4f}'.format(
+          split_summary[split_name][k]['mean'],
+          split_summary[split_name][k]['std'],
+        ),
+      )
       for k in _METRIC_KEYS
     ]
     logging.warning('* Repeated Holdout (k={}) {} results => {}'.format(
@@ -274,7 +343,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
   split_manifest = data_loader.load_cv_split_manifest(split_path)
   fold_count = int(split_manifest['cv_num_folds'])
   final_splits = _final_eval_splits(hparams)
-  test_metrics = {'acc': [], 'prec': [], 'rec': [], 'F1': []}
+  test_metrics = {key: [] for key in _METRIC_KEYS}
   split_metrics = {
     split_name: {key: [] for key in _METRIC_KEYS}
     for split_name in final_splits
@@ -293,6 +362,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
     training_loader, validation_loader, test_loader, split_meta = data_loader.get_cv_loaders_from_manifest(
       split_manifest, fold_idx
     )
+    loss_config = _configure_fold_loss(hparams, training_loader)
     logging.warning(
       'CV fold {} sizes => train: {}, val: {}, test: {}'.format(
         fold_idx, split_meta['train_size'], split_meta['val_size'], split_meta['test_size']
@@ -321,6 +391,7 @@ def fixed_cv_train_eval(hparams, data_name=None):
       'seed': int(seed),
       'split': split_meta,
       'best_val': best_val_result,
+      'loss_config': loss_config,
       'metrics': dict(metrics_by_split['test']),
       'split_metrics': metrics_by_split,
     })
@@ -371,26 +442,24 @@ def fixed_cv_train_eval(hparams, data_name=None):
     del model, training_loader, validation_loader, test_loader, loaders_by_split, metrics_by_split
     _clear_cuda_cache(hparams)
 
-  summary = {
-    key: {
-      'mean': float(np.mean(vals)),
-      'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    }
-    for key, vals in test_metrics.items()
-  }
+  summary = {key: _metric_summary(vals) for key, vals in test_metrics.items()}
   split_summary = {
     split_name: {
-      key: {
-        'mean': float(np.mean(vals)),
-        'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-      }
+      key: _metric_summary(vals)
       for key, vals in split_result.items()
     }
     for split_name, split_result in split_metrics.items()
   }
   for split_name in final_splits:
     msg_parts = [
-      f'{k}: {split_summary[split_name][k]["mean"]:.4f} +/- {split_summary[split_name][k]["std"]:.4f}'
+      '{}: {}'.format(
+        k,
+        'n/a' if split_summary[split_name][k]['mean'] is None else
+        '{:.4f} +/- {:.4f}'.format(
+          split_summary[split_name][k]['mean'],
+          split_summary[split_name][k]['std'],
+        ),
+      )
       for k in _METRIC_KEYS
     ]
     logging.warning('* Fixed 10-fold CV {} results => {}'.format(split_name, '; '.join(msg_parts)))
@@ -403,6 +472,9 @@ def fixed_cv_train_eval(hparams, data_name=None):
       'cv_seed': int(split_manifest['cv_seed']),
       'cv_num_folds': int(split_manifest['cv_num_folds']),
       'cv_val_policy': split_manifest['cv_val_policy'],
+      'loss_type': str(getattr(hparams, 'loss_type', 'bce')).strip().lower(),
+      'focal_gamma': float(getattr(hparams, 'focal_gamma', 2.0)),
+      'label_smoothing': float(getattr(hparams, 'label_smoothing', 0.0)),
       'summary': summary,
       'split_summary': split_summary,
       'final_eval_splits': list(final_splits),

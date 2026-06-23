@@ -8,6 +8,7 @@ learning_rate: 0.001
 dropout: 0.5
 patience: 30
 grad_clip: 2
+loss_type: 'bce'
 
 branch_b:
   use: true

@@ -1,0 +1,42 @@
+device: 'cuda'
+auto_select_gpu: true
+gpu_select_wait_seconds: 3600
+gpu_select_poll_interval: 15
+
+model_save_path: 'results/loss_ablation/gat_mil_head_20260623/bce'
+processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
+data_name_set: ['ogbn_arxiv', 'reddit']
+timestamp: loss_ablation_bce
+channel_list: [6805, 256, 128, 64, 1]
+
+batch_size: 64
+epoch: 200
+learning_rate: 0.001
+dropout: 0.5
+patience: 30
+grad_clip: 2
+loss_type: 'bce'
+focal_gamma: 2.0
+label_smoothing: 0.0
+
+cv_split_dir: '/data/yg/Subgraph-MIL/diffpool2/splits'
+cv_seed: 1024
+cv_num_folds: 10
+cv_val_policy: 'adjacent'
+cv_use_all_samples: true
+
+branch_b:
+  use: true
+  attn_hidden: 128
+  gate_hidden: 64
+  use_structural_features: true
+  structural_fusion: 'gated_residual'
+  attention_shape_loss_weight: 0.05
+
+use_coarse_graph: false
+enable_gat_export: false
+enable_tensorboard: false
+enable_train_eval_during_training: false
+final_eval_splits: ['train', 'val', 'test']
+export_attention: false
+analyze_attention: false
