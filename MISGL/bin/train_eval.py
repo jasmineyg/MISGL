@@ -1,8 +1,9 @@
-# coding=utf-8
+﻿# coding=utf-8
 
 import os
 import logging
 import json
+import csv
 import gc
 
 import numpy as np
@@ -144,6 +145,123 @@ def _should_export_train_attention(hparams):
   return bool(getattr(hparams, 'attention_export_train', True))
 
 
+def _should_export_predictions(hparams):
+  return bool(getattr(hparams, 'export_predictions', False))
+
+
+def _extract_prediction_logits(model_output):
+  if isinstance(model_output, dict) and 'ypred_A' in model_output:
+    return model_output['ypred_A']
+  if isinstance(model_output, dict) and 'ypred' in model_output:
+    return model_output['ypred']
+  if isinstance(model_output, torch.Tensor):
+    return model_output
+  return None
+
+
+def _to_cpu_list(value, batch_size, default=None):
+  if value is None:
+    return [default] * batch_size
+  if isinstance(value, torch.Tensor):
+    return value.detach().cpu().view(-1).tolist()
+  return list(value)
+
+
+def _embedding_scalar_list(emb, key, batch_size, reducer=None):
+  if emb is None or key not in emb:
+    return [None] * batch_size
+  value = emb[key]
+  if not isinstance(value, torch.Tensor):
+    return [None] * batch_size
+  value = value.detach().cpu()
+  if reducer == 'mean' and value.dim() > 1:
+    value = value.mean(dim=-1)
+  elif reducer == 'norm' and value.dim() > 1:
+    value = value.norm(dim=-1)
+  return value.view(-1).tolist()
+
+
+def _collect_prediction_rows(loader, model, hparams, split_name, fold_idx=None, run_idx=None):
+  model.eval()
+  device = torch.device(hparams.device)
+  rows = []
+  with torch.inference_mode():
+    for graph_data in loader:
+      batch = _move_batch_to_device(graph_data, device)
+      if hasattr(model, 'forward_with_embeddings'):
+        model_output, emb = model.forward_with_embeddings(batch)
+      else:
+        model_output = model(batch)
+        emb = None
+      logits = _extract_prediction_logits(model_output)
+      if logits is None:
+        raise ValueError('Cannot export predictions because model output has no logits.')
+      probs = torch.sigmoid(logits).view(-1).detach().cpu().numpy()
+      labels = batch[g_key.y].view(-1).detach().cpu().numpy()
+      preds = (probs > 0.5).astype(np.int64)
+      batch_size = int(labels.shape[0])
+      orig_indices = _to_cpu_list(batch.get(g_key.orig_graph_idx, None), batch_size, default=-1)
+      subgraph_ids = _to_cpu_list(batch.get(g_key.subgraph_id, None), batch_size, default=-1)
+      external_counts = _to_cpu_list(batch.get(g_key.border_external_count, None), batch_size, default=None)
+      border_entropy = _embedding_scalar_list(emb, 'border_anchor_entropy', batch_size)
+      border_residual_ratio = _embedding_scalar_list(emb, 'border_residual_ratio', batch_size)
+      border_gate_mean = _embedding_scalar_list(emb, 'border_gate', batch_size, reducer='mean')
+      z_border_norm = _embedding_scalar_list(emb, 'z_border', batch_size, reducer='norm')
+
+      for i in range(batch_size):
+        rows.append({
+          'fold_idx': fold_idx,
+          'run_idx': run_idx,
+          'split': split_name,
+          'orig_idx': int(orig_indices[i]) if orig_indices[i] is not None else -1,
+          'subgraph_id': int(subgraph_ids[i]) if subgraph_ids[i] is not None else -1,
+          'label': int(labels[i]),
+          'prob': float(probs[i]),
+          'pred': int(preds[i]),
+          'correct': int(preds[i] == labels[i]),
+          'border_external_count': None if external_counts[i] is None else float(external_counts[i]),
+          'border_anchor_entropy': None if border_entropy[i] is None else float(border_entropy[i]),
+          'border_residual_ratio': None if border_residual_ratio[i] is None else float(border_residual_ratio[i]),
+          'border_gate_mean': None if border_gate_mean[i] is None else float(border_gate_mean[i]),
+          'z_border_norm': None if z_border_norm[i] is None else float(z_border_norm[i]),
+        })
+  return rows
+
+
+def _write_prediction_csv(rows, path):
+  if not rows:
+    return
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  fieldnames = [
+    'fold_idx', 'run_idx', 'split', 'orig_idx', 'subgraph_id', 'label', 'prob', 'pred', 'correct',
+    'border_external_count', 'border_anchor_entropy', 'border_residual_ratio', 'border_gate_mean',
+    'z_border_norm',
+  ]
+  with open(path, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def _export_predictions_for_splits(loaders_by_split, model, hparams, final_splits, fold_idx=None, run_idx=None):
+  if not _should_export_predictions(hparams):
+    return []
+  paths = []
+  for split_name in final_splits:
+    rows = _collect_prediction_rows(
+      loaders_by_split[split_name], model, hparams, split_name, fold_idx=fold_idx, run_idx=run_idx
+    )
+    index_name = 'fold_{}'.format(fold_idx) if fold_idx is not None else 'run_{}'.format(run_idx)
+    out_path = os.path.join(
+      hparams.model_save_path,
+      '{}_{}_{}_predictions.csv'.format(hparams.timestamp, index_name, split_name),
+    )
+    _write_prediction_csv(rows, out_path)
+    logging.warning('Saved prediction export to {}'.format(out_path))
+    paths.append(out_path)
+  return paths
+
+
 def _get_lightweight_attention_exporter():
   global _LIGHTWEIGHT_ATTENTION_EXPORTER
   if _LIGHTWEIGHT_ATTENTION_EXPORTER is not None:
@@ -186,18 +304,19 @@ def _clear_cuda_cache(hparams):
 
 def train_eval(hparams, data_name=None):
   """
-  训练与评估主入口（Repeated Holdout）。
+  Repeated holdout training and evaluation entry point.
 
-  - 根据 hparams.holdout_seeds 或 (holdout_runs, cv_seed) 生成多个随机种子
-  - 每个 seed 划分 train/val/test，训练模型（在 val 上早停），并在 test 上评估
-  - 可选：导出 test set 的 embedding 分析结果（Excel）与 branch-B 注意力（Excel）
+  - Use hparams.holdout_seeds when provided, otherwise derive seeds from
+    holdout_runs and cv_seed.
+  - Split train/val/test for each seed, train with validation early stopping,
+    and evaluate the requested final splits.
 
-  返回：
-    dict: {'seeds': [...], 'results': [...], 'summary': {...}}，其中 summary 是多次 holdout 的均值±方差统计
+  Returns:
+    dict with per-run results and aggregate summary metrics.
   """
   data_loader = load_data.GraphDataLoaderWrapper(hparams, data_name=data_name)
 
-  # 读取重复留出配置：优先使用 holdout_seeds，否则使用 holdout_runs/cv_seed 生成
+  # 璇诲彇閲嶅鐣欏嚭閰嶇疆锛氫紭鍏堜娇鐢?holdout_seeds锛屽惁鍒欎娇鐢?holdout_runs/cv_seed 鐢熸垚
   holdout_seeds = getattr(hparams, 'holdout_seeds', None)
   if isinstance(holdout_seeds, list) and len(holdout_seeds) > 0:
     seeds = [int(s) for s in holdout_seeds]
@@ -219,7 +338,7 @@ def train_eval(hparams, data_name=None):
 
     reproducibility.set_seed(seed, cuda_deterministic=(hparams.device == 'cuda'))
 
-    # 仅返回 train/val/test
+    # Return train/val/test loaders only.
     training_loader, validation_loader, test_loader = data_loader.get_holdout_loaders(
       seed=seed, train_frac=0.6, val_frac=0.2, test_frac=0.2
     )
@@ -228,7 +347,7 @@ def train_eval(hparams, data_name=None):
     summary_writer = None
 
     model = encoder.MISGLEncoder(hparams, data_name=data_name).to(torch.device(hparams.device))
-    # 训练+早停都用val
+    # Train with validation early stopping.
     model, _, best_val_result = train_eval_iter(
       model, training_loader, validation_loader, summary_writer, hparams, dataset_raw=data_loader._dataset_raw
     )
@@ -263,6 +382,8 @@ def train_eval(hparams, data_name=None):
         for split_name in final_splits
       ),
     ))
+
+    _export_predictions_for_splits(loaders_by_split, model, hparams, final_splits, run_idx=run_idx)
 
     if _should_export_attention(hparams):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_holdout_{run_idx}_analyze_attention.xlsx')
@@ -350,7 +471,12 @@ def fixed_cv_train_eval(hparams, data_name=None):
   }
   all_results = []
 
-  for fold_idx in range(fold_count):
+  fold_indices = list(range(fold_count))
+  cv_fold_limit = getattr(hparams, 'cv_fold_limit', None)
+  if cv_fold_limit is not None:
+    fold_indices = fold_indices[:max(1, int(cv_fold_limit))]
+
+  for fold_idx in fold_indices:
     seed = int(getattr(hparams, 'cv_seed', 1024)) + fold_idx
     test_fold = int(fold_idx)
     val_fold = (test_fold + 1) % fold_count
@@ -407,6 +533,8 @@ def fixed_cv_train_eval(hparams, data_name=None):
         for split_name in final_splits
       ),
     ))
+
+    _export_predictions_for_splits(loaders_by_split, model, hparams, final_splits, fold_idx=fold_idx)
 
     if _should_export_attention(hparams):
       out_path = os.path.join(hparams.model_save_path, f'{hparams.timestamp}_cv_fold_{fold_idx}_analyze_attention.xlsx')
@@ -511,14 +639,15 @@ def _is_better_val_result(val_result, best_val_result, hparams):
 
 def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset_raw=None):
     """
-    单次 holdout 下的训练循环（按 epoch 训练 + val 早停）。
+    Single training loop with validation early stopping.
 
-    - train_dataset：用于反向传播更新参数
-    - eval_dataset：用于评估与 early stopping（val）
-    - writer：保留旧接口兼容，当前训练流程不写可视化日志
-    
-    返回：
-      (model, val_accs) 其中 model 会在结束前恢复到 val 最优权重。
+    - train_dataset is used for parameter updates.
+    - eval_dataset is used for validation and early stopping.
+    - writer is kept for API compatibility.
+
+    Returns:
+      (model, val_accs, best_val_result). The model is restored to the best
+      validation checkpoint before returning.
     """
     optimizer = torch.optim.Adam(
       filter(lambda p: p.requires_grad, model.parameters()),
@@ -568,7 +697,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
         raise RuntimeError('Training dataset is empty.')
       avg_loss /= num_batches
 
-      # 训练集评估
+      # Evaluate a small training subset for logging.
       should_eval_train = (
         enable_train_eval
         and should_log_epoch
@@ -579,7 +708,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
         train_result = evaluate(train_dataset, model, hparams, max_num_examples=train_eval_max_num_examples)
         last_train_acc = train_result['acc']
 
-      # 验证：用于早停与报告
+      # Validation is used for early stopping and reporting.
       val_result = evaluate(eval_dataset, model, hparams, include_loss=True, loss_epoch=epoch)
       val_accs.append(val_result['acc'])
       if should_log_epoch:
@@ -590,7 +719,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
           )
         )
         
-      # 导出 GAT1 特征，每 50 个 epoch 保存一次，第一次保存在第 50 epoch (即 epoch 49)
+      # Optionally export GAT1 features every 50 epochs.
       enable_gat_export = bool(getattr(hparams, 'enable_gat_export', False))
       if enable_gat_export and (epoch + 1) % 50 == 0:
           logging.warning(f"Triggering GAT1 feature export at epoch {epoch + 1}")
@@ -621,7 +750,7 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
           logging.warning('Early stop at epoch {} (patience={})'.format(epoch, patience))
           break
 
-    # 恢复 val 最优权重
+    # Restore best validation checkpoint.
     if best_model_state is not None:
       model.load_state_dict(best_model_state)
 
@@ -631,5 +760,4 @@ def train_eval_iter(model, train_dataset, eval_dataset, writer, hparams, dataset
       'loss': float(best_val_result['loss']),
       'train_loss': float(best_val_result['train_loss']),
     }
-
 

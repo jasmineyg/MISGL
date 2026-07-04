@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 
 """ HParams handling."""
 
@@ -37,6 +37,7 @@ DEFAULT_HPARAMS = {
   'cv_num_folds': 10,
   'cv_val_policy': 'adjacent',
   'cv_use_all_samples': True,
+  'cv_fold_limit': None,
   'use_coarse_graph': False,
   'coarse_graph_topk': 16,
   'enable_gat_export': False,
@@ -46,11 +47,37 @@ DEFAULT_HPARAMS = {
   'train_eval_max_num_examples': 100,
   'final_eval_splits': ['train', 'val', 'test'],
   'export_attention': False,
+  'export_predictions': False,
   'analyze_attention': False,
   'attention_sample_frac': 0.1,
   'attention_train_sample_frac': 0.1,
   'attention_top_k': 20,
   'attention_export_train': True,
+  'subgnn_border': {
+    'use': False,
+    'num_anchors': 16,
+    'anchor_size': 16,
+    'anchor_seed': 1024,
+    'max_sequence_length': 64,
+    'dtw_temperature': 1.0,
+    'anchor_embed_dim': 32,
+    'anchor_encoder_hidden_dim': 32,
+    'anchor_encoder_layers': 1,
+    'anchor_encoder_dropout': 0.0,
+    'anchor_walk_aggregator': 'sum',
+    'n_triangular_walks': 4,
+    'random_walk_len': 8,
+    'sample_walk_len': 16,
+    'rw_beta': 0.5,
+    'structure_patch_type': 'triangular_random_walk',
+    'gate_hidden_dim': 64,
+    'dropout': 0.1,
+    'residual_init': 0.1,
+    'softmax_temperature': 1.0,
+    'shuffle': False,
+    'shuffle_seed': 8943,
+    'export_diagnostics': False,
+  },
   'branch_b': {
     'use': False,
     'attn_hidden': 128,

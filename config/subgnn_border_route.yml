@@ -1,0 +1,51 @@
+﻿data_name_set: ['ogbn_arxiv', 'reddit']
+timestamp: subgnn_border_route
+model_save_path: 'results/subgnn_border/subgnn_border_route'
+processed_data_dir: '/data/yg/Subgraph-MIL/Data/processed_data'
+cv_split_dir: '/data/yg/Subgraph-MIL/diffpool2/splits'
+channel_list: [6805, 256, 128, 64, 1]
+
+batch_size: 64
+epoch: 200
+learning_rate: 0.001
+dropout: 0.5
+patience: 30
+grad_clip: 2
+loss_type: 'bce'
+final_eval_splits: ['train', 'val', 'test']
+export_predictions: true
+export_attention: false
+
+branch_b:
+  use: true
+  attn_hidden: 128
+  gate_hidden: 64
+  use_structural_features: true
+  structural_fusion: 'gated_residual'
+  attention_shape_loss_weight: 0.05
+
+subgnn_border:
+  use: true
+  num_anchors: 16
+  anchor_size: 16
+  anchor_seed: 1024
+  max_sequence_length: 64
+  dtw_temperature: 1.0
+  anchor_embed_dim: 32
+  anchor_encoder_hidden_dim: 32
+  anchor_encoder_layers: 1
+  anchor_encoder_dropout: 0.0
+  anchor_walk_aggregator: 'sum'
+  n_triangular_walks: 4
+  random_walk_len: 8
+  sample_walk_len: 16
+  rw_beta: 0.5
+  structure_patch_type: 'triangular_random_walk'
+  gate_hidden_dim: 64
+  dropout: 0.1
+  residual_init: 0.1
+  softmax_temperature: 1.0
+  shuffle: false
+  shuffle_seed: 8943
+  export_diagnostics: true
+

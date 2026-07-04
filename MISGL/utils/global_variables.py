@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 
 
 class GKey(object):
@@ -11,6 +11,9 @@ class GKey(object):
     self.orig_graph_idx = 'orig_graph_idx'
     self.subgraph_id = 'subgraph_id'
     self.structural_features = 'structural_features'
+    self.border_anchor_sim = 'border_anchor_sim'
+    self.border_anchor_walk_features = 'border_anchor_walk_features'
+    self.border_external_count = 'border_external_count'
 
 
 g_key = GKey()

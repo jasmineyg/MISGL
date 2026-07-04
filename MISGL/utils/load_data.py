@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 
 import networkx as nx
 import numpy as np
@@ -14,13 +14,14 @@ from torch.utils.data import Dataset, DataLoader
 from MISGL.utils import hparams_lib
 from MISGL.utils.global_variables import *
 from MISGL.utils import reproducibility
+from MISGL.utils import subgnn_border
 
 
 # follow a discussion here: https://github.com/RexYing/diffpool/issues/17
 
 class GraphDataset(Dataset):
 
-  def __init__(self, hparams, graph_list):
+  def __init__(self, hparams, graph_list, subgnn_border_anchor_walk_features=None):
     self._hparams = hparams_lib.copy_hparams(hparams)
     preload_to_gpu = bool(getattr(self._hparams, 'preload_data_to_gpu', True))
     target_device = self._hparams.device if preload_to_gpu else 'cpu'
@@ -31,6 +32,14 @@ class GraphDataset(Dataset):
     )
     self._structure_undirected = bool(bb_cfg.get('structural_undirected', True)) if bb_cfg else True
     self._structural_feature_dim = 7
+    self._use_subgnn_border = subgnn_border.subgnn_border_enabled(self._hparams)
+    border_cfg = getattr(self._hparams, 'subgnn_border', {})
+    self._subgnn_border_num_anchors = int(border_cfg.get('num_anchors', 16)) if isinstance(border_cfg, dict) else 16
+    self._subgnn_border_anchor_walk_features = None
+    if self._use_subgnn_border and subgnn_border_anchor_walk_features is not None:
+      self._subgnn_border_anchor_walk_features = torch.tensor(
+        np.asarray(subgnn_border_anchor_walk_features, dtype=np.float32), dtype=torch.float32
+      ).to(self._device)
     self.graph_list = []
     self.processed_graph_list = self.preprocess_graph(graph_list)
 
@@ -38,7 +47,7 @@ class GraphDataset(Dataset):
     processed_graph_list = []
     for graph in graph_list:
       graph_tmp_dict = {}
-      # 使用固定节点顺序以保证邻接矩阵与特征对齐
+      # 浣跨敤鍥哄畾鑺傜偣椤哄簭浠ヤ繚璇侀偦鎺ョ煩闃典笌鐗瑰緛瀵归綈
       nodelist = list(graph.nodes())
       adj = nx.to_numpy_array(graph, nodelist=nodelist, dtype=np.float32)
       feature_dim = self._hparams.channel_list[0]
@@ -46,7 +55,7 @@ class GraphDataset(Dataset):
       for idx, node_id in enumerate(nodelist):
         node_feat = graph.nodes[node_id].get('features')
         if node_feat is None:
-          raise ValueError('节点缺少 features 属性，无法构建输入特征')
+          raise ValueError('鑺傜偣缂哄皯 features 灞炴€э紝鏃犳硶鏋勫缓杈撳叆鐗瑰緛')
         node_tmp_feature[idx, :feature_dim] = np.asarray(node_feat, dtype=np.float32)
       num_nodes = adj.shape[0]
       graph_tmp_dict[g_key.x] = torch.tensor(node_tmp_feature, dtype=torch.float32).to(self._device)
@@ -59,6 +68,24 @@ class GraphDataset(Dataset):
         if num_nodes > 0:
           structural_features[:num_nodes, :] = self._compute_structural_features_np(adj)
         graph_tmp_dict[g_key.structural_features] = torch.tensor(structural_features, dtype=torch.float32).to(self._device)
+      if self._use_subgnn_border:
+        border_anchor_sim = graph.graph.get('border_anchor_sim', None)
+        if border_anchor_sim is None:
+          raise ValueError('subgnn_border is enabled but graph is missing border_anchor_sim.')
+        border_anchor_sim = np.asarray(border_anchor_sim, dtype=np.float32)
+        if border_anchor_sim.shape != (self._subgnn_border_num_anchors,):
+          raise ValueError(
+            'Expected border_anchor_sim shape ({},), got {}'.format(
+              self._subgnn_border_num_anchors, border_anchor_sim.shape
+            )
+          )
+        graph_tmp_dict[g_key.border_anchor_sim] = torch.tensor(border_anchor_sim, dtype=torch.float32).to(self._device)
+        if self._subgnn_border_anchor_walk_features is None:
+          raise ValueError('subgnn_border is enabled but shared border_anchor_walk_features are missing.')
+        graph_tmp_dict[g_key.border_anchor_walk_features] = self._subgnn_border_anchor_walk_features
+        graph_tmp_dict[g_key.border_external_count] = torch.tensor(
+          float(graph.graph.get('border_external_count', 0.0)), dtype=torch.float32
+        ).to(self._device)
       orig_idx = graph.graph.get('orig_idx', -1)
       try:
         orig_idx = int(orig_idx)
@@ -165,7 +192,7 @@ class GraphDataLoaderWrapper(object):
     if not os.path.exists(dataset_path):
         logging.error(f'[ERROR] Dataset file not found: {dataset_path}')
         logging.error(f'[ERROR] Current working directory: {os.getcwd()}')
-        # 尝试在当前目录或相对目录查找
+        # 灏濊瘯鍦ㄥ綋鍓嶇洰褰曟垨鐩稿鐩綍鏌ユ壘
         alt_path = os.path.join('processed_data', f'{data_name}_processed.pkl')
         if os.path.exists(alt_path):
              logging.warning(f'[DEBUG] Found dataset at alternative path: {alt_path}')
@@ -209,6 +236,10 @@ class GraphDataLoaderWrapper(object):
           pass
       self.all_graphs.append(graph)
     self.all_labels = np.array([int(g.graph.get('label', 0)) for g in self.all_graphs])
+    self._subgnn_border_info = None
+    self._subgnn_border_anchor_walk_features = None
+    if subgnn_border.subgnn_border_enabled(self._hparams):
+      self._attach_subgnn_border_features(dataset, subgraphs)
     self.all_groups = self._resolve_group_ids(dataset, subgraphs, self.all_indices)
 
     self.cv_seed = int(getattr(self._hparams, 'cv_seed', 1024))
@@ -230,6 +261,34 @@ class GraphDataLoaderWrapper(object):
     self.cv_folds = None
     self.cv_build_info = None
 
+  def _attach_subgnn_border_features(self, dataset, subgraphs):
+    border_info = subgnn_border.build_subgnn_border_features(
+      dataset,
+      self._hparams,
+      data_name=self.data_name,
+    )
+    if border_info is None:
+      return
+    features = border_info['features']
+    external_counts = border_info['external_counts']
+    self._subgnn_border_anchor_walk_features = border_info.get('anchor_walk_features')
+    if features.shape[0] != len(subgraphs):
+      raise ValueError(
+        'SubGNN border feature row count mismatch: {} vs {}'.format(features.shape[0], len(subgraphs))
+      )
+    for idx, graph in enumerate(subgraphs):
+      graph.graph['border_anchor_sim'] = features[idx].astype(np.float32, copy=False)
+      graph.graph['border_external_count'] = float(external_counts[idx])
+    diagnostics_path = subgnn_border.maybe_write_subgnn_border_diagnostics(
+      self._hparams,
+      self.data_name,
+      border_info.get('diagnostics'),
+    )
+    self._subgnn_border_info = {
+      'diagnostics': border_info.get('diagnostics'),
+      'diagnostics_path': diagnostics_path,
+      'anchor_walk_features_shape': None if self._subgnn_border_anchor_walk_features is None else list(self._subgnn_border_anchor_walk_features.shape),
+    }
   def _set_or_add_hparam(self, name, value):
     if name in self._hparams:
       self._hparams.set_hparam(name, value)
@@ -237,7 +296,7 @@ class GraphDataLoaderWrapper(object):
       self._hparams.add_hparam(name, value)
 
   def _resolve_group_ids(self, dataset, subgraphs, indices):
-    # 优先从dataset字典尝试取组ID数组（必须与subgraphs一一对齐）
+    # 浼樺厛浠巇ataset瀛楀吀灏濊瘯鍙栫粍ID鏁扮粍锛堝繀椤讳笌subgraphs涓€涓€瀵归綈锛?
     possible_keys = [
         'group_ids', 'groups', 'subject_ids', 'patient_ids',
         'case_ids', 'slice_groups', 'slide_ids', 'group_idx'
@@ -248,7 +307,7 @@ class GraphDataLoaderWrapper(object):
         if isinstance(arr, (list, np.ndarray)) and len(arr) == len(subgraphs):
           return [arr[i] for i in indices]
 
-    # 次选：从每个Graph的graph属性尝试取组ID；若无则退化为每图独立组
+    # 娆￠€夛細浠庢瘡涓狦raph鐨刧raph灞炴€у皾璇曞彇缁処D锛涜嫢鏃犲垯閫€鍖栦负姣忓浘鐙珛缁?
     group_keys_in_graph = [
         'group_id', 'group', 'subject_id', 'patient_id',
         'case_id', 'slice_group', 'slide_id'
@@ -268,15 +327,15 @@ class GraphDataLoaderWrapper(object):
 
   def get_holdout_loaders(self, seed=None, train_frac=0.6, val_frac=0.2, test_frac=0.2):
     """
-    重复随机留出：分组分层的6:2:2划分
-    - 组：若能解析到，则按组划分；否则每图视作独立组
-    - 分层：在“组”层面按多数标签进行分层抽样
-    返回：training_loader, validation_loader, test_loader
+    閲嶅闅忔満鐣欏嚭锛氬垎缁勫垎灞傜殑6:2:2鍒掑垎
+    - 缁勶細鑻ヨ兘瑙ｆ瀽鍒帮紝鍒欐寜缁勫垝鍒嗭紱鍚﹀垯姣忓浘瑙嗕綔鐙珛缁?
+    - 鍒嗗眰锛氬湪鈥滅粍鈥濆眰闈㈡寜澶氭暟鏍囩杩涜鍒嗗眰鎶芥牱
+    杩斿洖锛歵raining_loader, validation_loader, test_loader
     """
-    # 校验比例
+    # 鏍￠獙姣斾緥
     total = train_frac + val_frac + test_frac
     if abs(total - 1.0) > 1e-6:
-      raise ValueError(f'划分比例之和应为1.0，当前={total}')
+      raise ValueError(f'鍒掑垎姣斾緥涔嬪拰搴斾负1.0锛屽綋鍓?{total}')
     if seed is None:
       seed = getattr(self._hparams, 'cv_seed', 1024)
 
@@ -285,7 +344,7 @@ class GraphDataLoaderWrapper(object):
     unique_groups, group_inverse = np.unique(groups, return_inverse=True)
     num_groups = len(unique_groups)
 
-    # 计算每组标签（多数表决；若组内标签一致则直接使用）
+    # 璁＄畻姣忕粍鏍囩锛堝鏁拌〃鍐筹紱鑻ョ粍鍐呮爣绛句竴鑷村垯鐩存帴浣跨敤锛?
     group_labels_list = [[] for _ in range(num_groups)]
     for sample_idx, g_idx in enumerate(group_inverse):
       group_labels_list[g_idx].append(labels[sample_idx])
@@ -294,17 +353,17 @@ class GraphDataLoaderWrapper(object):
       for lst in group_labels_list
     ])
 
-    # Step1: 组层面划分 test vs 其余（分层随机）
+    # Step1: 缁勫眰闈㈠垝鍒?test vs 鍏朵綑锛堝垎灞傞殢鏈猴級
     sss_test = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=seed)
     group_indices = np.arange(num_groups)
     train_val_group_idx, test_group_idx = next(sss_test.split(group_indices, group_labels))
 
-    # Step2: 在train_val内部再划分 train vs val（相对比例）
+    # Step2: 鍦╰rain_val鍐呴儴鍐嶅垝鍒?train vs val锛堢浉瀵规瘮渚嬶級
     relative_val_frac = val_frac / (train_frac + val_frac)  # 0.2/0.8 = 0.25
     sss_val = StratifiedShuffleSplit(n_splits=1, test_size=relative_val_frac, random_state=seed + 1)
     tr_group_idx, val_group_idx = next(sss_val.split(train_val_group_idx, group_labels[train_val_group_idx]))
 
-    # 映射到样本索引
+    # 鏄犲皠鍒版牱鏈储寮?
     train_groups = set(unique_groups[train_val_group_idx[tr_group_idx]])
     val_groups   = set(unique_groups[train_val_group_idx[val_group_idx]])
     test_groups  = set(unique_groups[test_group_idx])
@@ -319,10 +378,10 @@ class GraphDataLoaderWrapper(object):
 
     logging.info(f'Holdout split sizes: train={len(train_graphs)}, val={len(val_graphs)}, test={len(test_graphs)}')
 
-    # 构建 DataLoader
-    training_set   = GraphDataset(self._hparams, train_graphs)
-    validation_set = GraphDataset(self._hparams, val_graphs)
-    test_set       = GraphDataset(self._hparams, test_graphs)
+    # 鏋勫缓 DataLoader
+    training_set   = GraphDataset(self._hparams, train_graphs, self._subgnn_border_anchor_walk_features)
+    validation_set = GraphDataset(self._hparams, val_graphs, self._subgnn_border_anchor_walk_features)
+    test_set       = GraphDataset(self._hparams, test_graphs, self._subgnn_border_anchor_walk_features)
 
     training_loader   = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
     validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)
@@ -488,9 +547,9 @@ class GraphDataLoaderWrapper(object):
     val_graphs = [self.cv_graphs[i] for i in val_idx]
     test_graphs = [self.cv_graphs[i] for i in test_idx]
 
-    training_set = GraphDataset(self._hparams, train_graphs)
-    validation_set = GraphDataset(self._hparams, val_graphs)
-    test_set = GraphDataset(self._hparams, test_graphs)
+    training_set = GraphDataset(self._hparams, train_graphs, self._subgnn_border_anchor_walk_features)
+    validation_set = GraphDataset(self._hparams, val_graphs, self._subgnn_border_anchor_walk_features)
+    test_set = GraphDataset(self._hparams, test_graphs, self._subgnn_border_anchor_walk_features)
 
     training_loader = DataLoader(training_set, batch_size=self._hparams.batch_size, shuffle=True, worker_init_fn=reproducibility.worker_init_fn)
     validation_loader = DataLoader(validation_set, batch_size=self._hparams.batch_size, shuffle=False, worker_init_fn=reproducibility.worker_init_fn)

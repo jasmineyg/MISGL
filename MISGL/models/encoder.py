@@ -1,10 +1,11 @@
-# coding=utf-8
+﻿# coding=utf-8
 
 import torch
 import torch.nn as nn
 
 from MISGL.layers.gat_layer import ResidualGATLayer
 from MISGL.models.mil_head import MILBranchB
+from MISGL.models.subgnn_border import SubGNNBorderRouter
 from MISGL.utils.global_variables import g_key
 from MISGL.utils import hparams_lib
 
@@ -90,7 +91,27 @@ class MISGLEncoder(nn.Module):
             self.branch_b_structural_feature_names = ()
             self.branch_b_head = None
 
-        # 分类器 两层MLP
+        border_cfg = getattr(self._hparams, 'subgnn_border', None)
+        self.use_subgnn_border = bool(border_cfg and border_cfg.get('use', False))
+        if self.use_subgnn_border:
+            self.subgnn_border_router = SubGNNBorderRouter(
+                input_dim=classifier_input_dim,
+                num_anchors=int(border_cfg.get('num_anchors', 16)),
+                node_feature_dim=in_dim,
+                anchor_embed_dim=int(border_cfg.get('anchor_embed_dim', 32)),
+                anchor_encoder_hidden_dim=int(border_cfg.get('anchor_encoder_hidden_dim', border_cfg.get('anchor_embed_dim', 32))),
+                anchor_encoder_layers=int(border_cfg.get('anchor_encoder_layers', 1)),
+                anchor_encoder_dropout=float(border_cfg.get('anchor_encoder_dropout', 0.0)),
+                anchor_walk_aggregator=str(border_cfg.get('anchor_walk_aggregator', 'sum')),
+                gate_hidden_dim=int(border_cfg.get('gate_hidden_dim', classifier_input_dim)),
+                dropout=float(border_cfg.get('dropout', dropout)),
+                residual_init=float(border_cfg.get('residual_init', 0.1)),
+                softmax_temperature=float(border_cfg.get('softmax_temperature', 1.0)),
+            )
+        else:
+            self.subgnn_border_router = None
+
+        # 鍒嗙被鍣?涓ゅ眰MLP
         self.classifier = nn.Sequential(
             nn.Linear(classifier_input_dim, classifier_hidden_dim),
             nn.LeakyReLU(negative_slope=negative_slope),
@@ -102,6 +123,8 @@ class MISGLEncoder(nn.Module):
 
     def reset_parameters(self):
         self.gat_layer.reset_parameters()
+        if self.subgnn_border_router is not None:
+            self.subgnn_border_router.reset_parameters()
         gain = torch.nn.init.calculate_gain('leaky_relu', float(getattr(self._hparams, 'leaky_relu_alpha', 0.2)))
         for module in self.classifier.modules():
             if isinstance(module, nn.Linear):
@@ -153,6 +176,17 @@ class MISGLEncoder(nn.Module):
             if branch_b_out is not None:
                 classifier_input = branch_b_out['z_B']
 
+        border_out = None
+        if self.use_subgnn_border:
+            if g_key.border_anchor_sim not in graph_input:
+                raise ValueError('subgnn_border is enabled but graph_input is missing border_anchor_sim.')
+            if g_key.border_anchor_walk_features not in graph_input:
+                raise ValueError('subgnn_border is enabled but graph_input is missing border_anchor_walk_features.')
+            border_anchor_sim = graph_input[g_key.border_anchor_sim].to(device=h.device, dtype=h.dtype)
+            border_anchor_walk_features = graph_input[g_key.border_anchor_walk_features].to(device=h.device, dtype=h.dtype)
+            border_out = self.subgnn_border_router(classifier_input, border_anchor_sim, border_anchor_walk_features)
+            classifier_input = border_out['z_fused']
+
         ypred = self.classifier(classifier_input)
 
         # Keep compatibility with existing analysis/export scripts.
@@ -160,8 +194,12 @@ class MISGLEncoder(nn.Module):
         self.current_h1 = h1
         self.current_graph_emb_classifier = classifier_input
 
-        if self.use_branch_b:
-            model_out = {'ypred_A': ypred, 'branch_b': branch_b_out}
+        if self.use_branch_b or border_out is not None:
+            model_out = {'ypred_A': ypred}
+            if self.use_branch_b:
+                model_out['branch_b'] = branch_b_out
+            if border_out is not None:
+                model_out['subgnn_border'] = border_out
         else:
             model_out = ypred
 
@@ -184,6 +222,12 @@ class MISGLEncoder(nn.Module):
                 emb['z_g_proj'] = branch_b_out['z_g_proj']
             if 'structural_gate' in branch_b_out:
                 emb['structural_gate'] = branch_b_out['structural_gate']
+        if border_out is not None:
+            emb['z_border'] = border_out['z_border']
+            emb['border_gate'] = border_out['border_gate']
+            emb['border_anchor_weights'] = border_out['border_anchor_weights']
+            emb['border_anchor_entropy'] = border_out['border_anchor_entropy']
+            emb['border_residual_ratio'] = border_out['border_residual_ratio']
         return model_out, emb
 
     def _compute_branch_b_structural_features(self, adj, batch_num_nodes, dtype=None):
