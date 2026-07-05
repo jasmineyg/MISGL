@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import train as train_entry
 from MISGL.bin import train_eval
 from MISGL.utils import get_loss
 from MISGL.utils.evaluate import evaluate
@@ -25,6 +26,16 @@ def _hparams(**overrides):
 
 
 class LossAblationTest(unittest.TestCase):
+    def test_safe_run_name_replaces_path_separators(self):
+        self.assertEqual(
+            train_entry._safe_run_name('cora_120/cora_metis'),
+            'cora_120__cora_metis',
+        )
+        self.assertEqual(
+            train_entry._safe_run_name('reddit\\reddit_random_balanced'),
+            'reddit__reddit_random_balanced',
+        )
+
     def test_focal_gamma_zero_equals_bce(self):
         logits = torch.tensor([-2.0, -0.2, 0.4, 2.5])
         targets = torch.tensor([0.0, 1.0, 0.0, 1.0])
