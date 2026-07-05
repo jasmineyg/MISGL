@@ -126,6 +126,7 @@ class MISGLEncoder(nn.Module):
         h = self.gat_layer(x, adj, mask)
         h1 = self._masked_mean_pool(h, batch_num_nodes)
         classifier_input = h1
+        z_mil = h1
         branch_b_out = None
 
         if self.use_branch_b:
@@ -151,7 +152,8 @@ class MISGLEncoder(nn.Module):
                 if h_flat.size(0) > 0 else None
             )
             if branch_b_out is not None:
-                classifier_input = branch_b_out['z_B']
+                z_mil = branch_b_out['z_B']
+                classifier_input = z_mil
 
         ypred = self.classifier(classifier_input)
 
@@ -174,6 +176,7 @@ class MISGLEncoder(nn.Module):
             'graph_emb_H1': h1,
             'graph_emb_classifier': classifier_input,
             'graph_emb': classifier_input,
+            'z_mil': z_mil,
         }
         if branch_b_out is not None:
             emb['z_B'] = branch_b_out['z_B']
