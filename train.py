@@ -118,6 +118,10 @@ def _resolve_experiment_name(hparams):
   return base_name or 'run'
 
 
+def _safe_run_name(data_name):
+  return str(data_name).replace('/', '__').replace('\\', '__')
+
+
 def _format_metric_entry(metric_summary):
   if not isinstance(metric_summary, dict):
     return ''
@@ -207,7 +211,7 @@ def main(args):
     base_ts = str(base_ts).strip() if base_ts is not None else ''
     if base_ts == '':
       base_ts = 'run'
-    hparams.timestamp = f'{data_name}_{base_ts}'
+    hparams.timestamp = f'{_safe_run_name(data_name)}_{base_ts}'
 
     logging.warning('\n' + '='*30)
     logging.warning('==== {} ===='.format(data_name))

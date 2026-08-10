@@ -4,6 +4,9 @@ import torch
 import torch.nn.functional as F
 
 
+SUPPORTED_LOSS_TYPES = ('bce', 'focal', 'weighted_bce')
+
+
 def _smooth_binary_targets(targets, hparams):
     targets = targets.view(-1).float()
     smoothing = float(getattr(hparams, 'label_smoothing', 0.0))
@@ -12,6 +15,57 @@ def _smooth_binary_targets(targets, hparams):
     if smoothing == 0.0:
         return targets
     return targets * (1.0 - smoothing) + 0.5 * smoothing
+
+
+def _loss_type(hparams):
+    loss_type = str(getattr(hparams, 'loss_type', 'bce')).strip().lower()
+    if loss_type not in SUPPORTED_LOSS_TYPES:
+        raise ValueError(
+            'Unsupported loss_type {!r}; expected one of {}.'.format(
+                loss_type, ', '.join(SUPPORTED_LOSS_TYPES)
+            )
+        )
+    return loss_type
+
+
+def binary_classification_loss(logits, targets, hparams):
+    logits = logits.view(-1)
+    targets = _smooth_binary_targets(targets, hparams).to(
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    if logits.numel() != targets.numel():
+        raise ValueError('logits and targets must contain the same number of values.')
+
+    loss_type = _loss_type(hparams)
+    if loss_type == 'bce':
+        return F.binary_cross_entropy_with_logits(logits, targets)
+
+    if loss_type == 'focal':
+        gamma = float(getattr(hparams, 'focal_gamma', 2.0))
+        if gamma < 0.0:
+            raise ValueError('focal_gamma must be non-negative.')
+        per_example_bce = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction='none',
+        )
+        focal_factor = torch.pow(-torch.expm1(-per_example_bce), gamma)
+        return (focal_factor * per_example_bce).mean()
+
+    pos_weight = getattr(hparams, 'loss_pos_weight', None)
+    if pos_weight is None:
+        raise ValueError(
+            'weighted_bce requires loss_pos_weight computed from the current training fold.'
+        )
+    pos_weight = float(pos_weight)
+    if pos_weight <= 0.0:
+        raise ValueError('loss_pos_weight must be positive.')
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        pos_weight=logits.new_tensor(pos_weight),
+    )
 
 
 def _attention_shape_loss_config(hparams):
@@ -64,12 +118,12 @@ def mil_attention_shape_loss(attention, batch, targets, eps=1e-8):
 
 
 def fused_loss(model_output, targets, epoch, hparams):
+    del epoch
     if isinstance(model_output, dict) and 'ypred_A' in model_output:
         logits_A = model_output['ypred_A']
     else:
         logits_A = model_output
-    smoothed_targets = _smooth_binary_targets(targets, hparams)
-    loss = F.binary_cross_entropy_with_logits(logits_A.view(-1), smoothed_targets)
+    loss = binary_classification_loss(logits_A, targets, hparams)
 
     enabled, weight, eps = _attention_shape_loss_config(hparams)
     if not enabled or weight == 0.0 or not isinstance(model_output, dict):

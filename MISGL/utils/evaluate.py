@@ -9,8 +9,9 @@ from MISGL.utils.global_variables import *
 
 
 def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", include_loss=False, loss_epoch=0):
+    del loss_epoch
     model.eval()
-    preds, labels = [], []
+    preds, labels, probabilities = [], [], []
     loss_sum = 0.0
     loss_count = 0
     device = torch.device(hparams.device)
@@ -21,7 +22,7 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", in
         if value.device.type != device.type:
             return True
         return device.index is not None and value.device.index != device.index
-    
+
     with torch.inference_mode():
         for batch_idx, data in enumerate(dataset):
             batch = {
@@ -29,19 +30,17 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", in
                 if _needs_device_move(value) else value
                 for key, value in data.items()
             }
-            
+
             out = model(batch)
-            # 只使用分支A的分类头输出，不做融合
             if isinstance(out, dict) and 'ypred_A' in out:
-                logits_A = out['ypred_A']  # [B] 或 [B,1]
+                logits_A = out['ypred_A']
                 if isinstance(logits_A, torch.Tensor):
-                    p = torch.sigmoid(logits_A).view(-1)  # [B]
+                    p = torch.sigmoid(logits_A).view(-1)
                 else:
-                    # Fallback if logits_A is not a tensor for some reason
                     p = torch.zeros(len(batch[g_key.y]), device=device)
             else:
-                logits_A = out  # [B] 或 [B,1]
-                p = torch.sigmoid(logits_A).view(-1)  # [B]
+                logits_A = out
+                p = torch.sigmoid(logits_A).view(-1)
 
             if include_loss and isinstance(logits_A, torch.Tensor):
                 batch_targets = batch[g_key.y].view(-1).float()
@@ -52,9 +51,10 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", in
 
             pred = (p > 0.5).long().cpu().numpy()
             y = batch[g_key.y].view(-1).cpu().numpy()
-            
+
             preds.append(pred)
             labels.append(y)
+            probabilities.append(p.cpu().numpy())
 
             if max_num_examples is not None:
                 if (batch_idx + 1) * len(pred) > max_num_examples:
@@ -62,23 +62,29 @@ def evaluate(dataset, model, hparams, max_num_examples=None, dataset_name="", in
 
     preds = np.concatenate(preds, axis=0)
     labels = np.concatenate(labels, axis=0)
-    
+    probabilities = np.concatenate(probabilities, axis=0)
+    tn, fp, fn, tp = metrics.confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    has_both_classes = np.unique(labels).size == 2
+
     result = {
         'prec': metrics.precision_score(labels, preds, average='binary', zero_division=0),
         'rec': metrics.recall_score(labels, preds, average='binary', zero_division=0),
         'acc': metrics.accuracy_score(labels, preds),
-        'F1': metrics.f1_score(labels, preds, average='binary', zero_division=0)
+        'F1': metrics.f1_score(labels, preds, average='binary', zero_division=0),
+        'balanced_acc': metrics.balanced_accuracy_score(labels, preds),
+        'roc_auc': metrics.roc_auc_score(labels, probabilities) if has_both_classes else None,
+        'pr_auc': metrics.average_precision_score(labels, probabilities) if has_both_classes else None,
+        'tn': int(tn),
+        'fp': int(fp),
+        'fn': int(fn),
+        'tp': int(tp),
     }
     if include_loss:
         result['loss'] = loss_sum / max(loss_count, 1)
-    
-    # 添加数据集名称标识
-    prefix = f"[{dataset_name}]" if dataset_name else ""
-    # print(f'{prefix}  acc: {result["acc"]:.4f}, prec: {result["prec"]:.4f}, rec: {result["rec"]:.4f}, F1: {result["F1"]:.4f}')
-    
+
     nested = {
         'A': dict(result),
         'B': dict(result),
-        'AB': dict(result)
+        'AB': dict(result),
     }
     return {**nested, **result}
