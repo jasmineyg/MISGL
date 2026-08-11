@@ -113,3 +113,29 @@ results/*
 /POSITION_HEAD_EXPERIMENT_REPORT.md
 /EDGE_GATE_EXPERIMENT_RESULT_ANALYSIS.md
 /COARSE_GRAPH_SUBGRAPH_DISCUSSION.md
+
+# Local analyses and experiment launchers (kept outside the production package)
+/attention_analyzer.py
+/data_information.md
+/config/b_on_partition_variants.yml
+/launch_loss_ablation.sh
+/smoke_loss_ablation.py
+/summarize_loss_ablation.py
+/tools/
+/figures/
+/MISGL_research_progress_*.md
+/MISGL课题进展与论文框架*.md
+/analyze_mil_neighbor_correction.py
+/create_synthetic_mil_consistent_v2.py
+/paper_figures_mil_consistent*.py
+/plot_synthetic_mil_consistent.py
+/semantic_oracle_striped_partition.py
+/summarize_synthetic*.py
+/run_synthetic*.sh
+/mil_consistent_*.png
+
+# Generated experiment summaries
+/pilot_fold*.json
+/*_metrics.json
+/*_report.json
+/*_summary.json

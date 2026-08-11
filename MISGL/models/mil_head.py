@@ -1,234 +1,138 @@
-# coding=utf-8
+"""Structure-enhanced gated-attention MIL pooling."""
+
+from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
-class _GatedAttentionScorer(nn.Module):
-    """Gated-attention scorer for node-level MIL weights."""
+@dataclass(frozen=True)
+class MILOutput:
+    """Node attention and the resulting bag embeddings."""
 
-    def __init__(self, in_dim, attn_hidden=128, gate_hidden=None):
-        super().__init__()
-        del gate_hidden
-        self.V = nn.Linear(in_dim, attn_hidden)
-        self.U = nn.Linear(in_dim, attn_hidden)
-        self.w = nn.Linear(attn_hidden, 1, bias=False)
-
-    def forward(self, phi):
-        t1 = torch.tanh(self.V(phi))
-        t2 = torch.sigmoid(self.U(phi))
-        gated_features = t1 * t2
-        return self.w(gated_features).squeeze(-1)
+    embedding: torch.Tensor
+    attention: torch.Tensor
+    bag_index: torch.Tensor
 
 
-class MILBranchB(nn.Module):
-    """Gated-attention MIL head that aggregates node embeddings into bag embeddings."""
+class MILHead(nn.Module):
+    """Fuse node structure and pool variable-sized bags with gated attention."""
 
     def __init__(
         self,
-        node_dim,
-        attn_hidden=128,
-        gate_hidden=None,
-        num_classes=2,
-        num_layers=1,
-        num_heads=4,
-        mlp_ratio=2.0,
-        dropout=0.1,
-        attn_dropout=0.0,
-        structural_dim=0,
-        structural_hidden_dim=None,
-        structural_embed_dim=32,
-        structural_fusion='gated_residual',
-        structural_gate_hidden_dim=None,
-        structural_residual_init=0.1,
-    ):
-        del num_classes, num_layers, num_heads, mlp_ratio, attn_dropout
+        node_dim: int,
+        attention_dim: int,
+        structure_dim: int,
+        structure_gate_dim: int,
+        dropout: float,
+        residual_init: float,
+    ) -> None:
         super().__init__()
-        self.node_dim = int(node_dim)
-        self.structural_dim = int(structural_dim)
-        self.structural_embed_dim = int(structural_embed_dim) if self.structural_dim > 0 else 0
-        self.structural_fusion = str(structural_fusion).strip().lower() if self.structural_dim > 0 else 'none'
-        if self.structural_dim > 0:
-            structural_hidden_dim = int(
-                structural_hidden_dim if structural_hidden_dim is not None else self.structural_embed_dim
-            )
-            self.structural_encoder = nn.Sequential(
-                nn.Linear(self.structural_dim, structural_hidden_dim),
-                nn.LayerNorm(structural_hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(p=float(dropout)),
-                nn.Linear(structural_hidden_dim, self.structural_embed_dim),
-                nn.LayerNorm(self.structural_embed_dim),
-                nn.ReLU(),
-            )
-        else:
-            self.structural_encoder = None
+        if min(node_dim, attention_dim, structure_dim, structure_gate_dim) <= 0:
+            raise ValueError("MIL dimensions must be positive")
 
-        if self.structural_fusion == 'concat':
-            self.structural_proj = None
-            self.structural_gate = None
-            self.structural_residual_scale = None
-            self.output_dim = self.node_dim + self.structural_embed_dim
-        elif self.structural_fusion in ('none', ''):
-            self.structural_proj = None
-            self.structural_gate = None
-            self.structural_residual_scale = None
-            self.output_dim = self.node_dim
-        elif self.structural_fusion == 'gated_residual':
-            structural_gate_hidden_dim = int(
-                structural_gate_hidden_dim if structural_gate_hidden_dim is not None else self.node_dim
-            )
-            self.structural_proj = nn.Linear(self.structural_embed_dim, self.node_dim)
-            self.structural_gate = nn.Sequential(
-                nn.Linear(self.node_dim * 2, structural_gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(structural_gate_hidden_dim, self.node_dim),
-                nn.Sigmoid(),
-            )
-            self.structural_residual_scale = nn.Parameter(
-                torch.tensor(float(structural_residual_init), dtype=torch.float32)
-            )
-            self.output_dim = self.node_dim
-        else:
-            raise ValueError(f'Unsupported structural_fusion: {structural_fusion!r}')
-
-        self.scorer = _GatedAttentionScorer(
-            in_dim=self.node_dim + self.structural_embed_dim,
-            attn_hidden=attn_hidden,
-            gate_hidden=gate_hidden,
+        self.structure_encoder = nn.Sequential(
+            nn.Linear(7, structure_dim),
+            nn.LayerNorm(structure_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(structure_dim, structure_dim),
+            nn.LayerNorm(structure_dim),
+            nn.ReLU(),
+        )
+        self.structure_projection = nn.Linear(structure_dim, node_dim)
+        self.structure_gate = nn.Sequential(
+            nn.Linear(node_dim * 2, structure_gate_dim),
+            nn.ReLU(),
+            nn.Linear(structure_gate_dim, node_dim),
+            nn.Sigmoid(),
+        )
+        self.structure_scale = nn.Parameter(
+            torch.tensor(float(residual_init), dtype=torch.float32)
         )
 
-    def graph_softmax(self, scores, batch, tau=1.0, eps=1e-9):
-        if scores.dim() != 1:
-            raise ValueError(f'Expected scores to have shape [N], got {tuple(scores.shape)}')
-        if batch.dim() != 1:
-            raise ValueError(f'Expected batch to have shape [N], got {tuple(batch.shape)}')
-        if scores.size(0) != batch.size(0):
-            raise ValueError('scores and batch must have the same first dimension.')
-
-        batch = batch.long()
-        bag_count = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
-        if bag_count == 0:
-            return torch.zeros_like(scores)
-
-        scaled_scores = scores / tau
-        max_per_bag = scores.new_full((bag_count,), -torch.inf)
-        if not hasattr(max_per_bag, 'scatter_reduce_'):
-            weights = torch.zeros_like(scores)
-            for bag_idx in range(bag_count):
-                node_mask = batch == bag_idx
-                if not torch.any(node_mask):
-                    continue
-                weights[node_mask] = torch.softmax(scaled_scores[node_mask], dim=0)
-            return weights.clamp(1e-6, 1.0 - 1e-6).clamp_min(eps)
-
-        max_per_bag.scatter_reduce_(0, batch, scaled_scores, reduce='amax', include_self=True)
-
-        exp_scores = torch.exp(scaled_scores - max_per_bag[batch])
-        sum_per_bag = scores.new_zeros((bag_count,))
-        sum_per_bag.scatter_add_(0, batch, exp_scores)
-        weights = exp_scores / sum_per_bag[batch].clamp_min(eps)
-        return weights.clamp(1e-6, 1.0 - 1e-6).clamp_min(eps)
-
-    def _pad_attention(self, attention, batch):
-        batch = batch.long()
-        bag_count = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
-        lengths = torch.bincount(batch, minlength=bag_count)
-        max_nodes = int(lengths.max().item()) if lengths.numel() > 0 else 0
-
-        a_pad = attention.new_zeros((bag_count, max_nodes))
-        mask_valid = torch.zeros((bag_count, max_nodes), dtype=torch.bool, device=attention.device)
-
-        for bag_idx in range(bag_count):
-            bag_attention = attention[batch == bag_idx]
-            length = bag_attention.size(0)
-            if length == 0:
-                continue
-            a_pad[bag_idx, :length] = bag_attention
-            mask_valid[bag_idx, :length] = True
-
-        return a_pad, mask_valid
+        score_dim = node_dim + structure_dim
+        self.tanh_projection = nn.Linear(score_dim, attention_dim)
+        self.sigmoid_projection = nn.Linear(score_dim, attention_dim)
+        self.score_projection = nn.Linear(attention_dim, 1, bias=False)
 
     def forward(
         self,
-        h,
-        batch,
-        eps=None,
-        y=None,
-        k=5,
-        return_padded_attention=False,
-        structural_features=None,
-    ):
-        del y, k
-        if h.dim() != 2:
-            raise ValueError(f'Expected h to have shape [N, D], got {tuple(h.shape)}')
-        if batch.dim() != 1:
-            raise ValueError(f'Expected batch to have shape [N], got {tuple(batch.shape)}')
-        if h.size(0) != batch.size(0):
-            raise ValueError('h and batch must have the same first dimension.')
-        if h.size(0) == 0:
-            raise ValueError('MILBranchB received an empty batch of nodes.')
+        node_embeddings: torch.Tensor,
+        structure: torch.Tensor,
+        bag_index: torch.Tensor,
+    ) -> MILOutput:
+        if node_embeddings.ndim != 2:
+            raise ValueError("node_embeddings must have shape [nodes, features]")
+        if structure.ndim != 2 or structure.shape != (node_embeddings.size(0), 7):
+            raise ValueError("structure must have shape [nodes, 7]")
+        if bag_index.ndim != 1 or bag_index.size(0) != node_embeddings.size(0):
+            raise ValueError("bag_index must contain one id per node")
+        if node_embeddings.size(0) == 0:
+            raise ValueError("MILHead requires at least one node")
+        if bag_index.dtype != torch.long:
+            raise TypeError("bag_index must have dtype torch.long")
+        if structure.device != node_embeddings.device:
+            raise ValueError("structure and node_embeddings must share a device")
+        if bag_index.device != node_embeddings.device:
+            raise ValueError("bag_index and node_embeddings must share a device")
+        if torch.any(bag_index < 0):
+            raise ValueError("bag_index must be non-negative")
 
-        if eps is None:
-            eps = 1e-9
+        bag_count = int(bag_index.max().item()) + 1
+        if torch.any(torch.bincount(bag_index, minlength=bag_count) == 0):
+            raise ValueError("bag ids must be contiguous and start at zero")
 
-        batch = batch.long()
-        score_input = h
-        structural_embedding = None
-        if self.structural_dim > 0:
-            if structural_features is None:
-                raise ValueError('structural_features is required when structural_dim > 0.')
-            if structural_features.dim() != 2:
-                raise ValueError(
-                    f'Expected structural_features to have shape [N, G], got {tuple(structural_features.shape)}'
-                )
-            if structural_features.size(0) != h.size(0):
-                raise ValueError('structural_features and h must have the same first dimension.')
-            if structural_features.size(1) != self.structural_dim:
-                raise ValueError(
-                    f'Expected structural_features dim {self.structural_dim}, got {structural_features.size(1)}.'
-                )
-            structural_features = structural_features.to(device=h.device, dtype=h.dtype)
-            structural_embedding = self.structural_encoder(structural_features)
-            score_input = torch.cat([h, structural_embedding], dim=-1)
+        node_structure = self.structure_encoder(structure)
+        score_input = torch.cat((node_embeddings, node_structure), dim=-1)
+        gated_score = torch.tanh(self.tanh_projection(score_input))
+        gated_score = gated_score * torch.sigmoid(
+            self.sigmoid_projection(score_input)
+        )
+        scores = self.score_projection(gated_score).squeeze(-1).clamp(-12.0, 12.0)
 
-        scores = self.scorer(score_input).clamp(min=-12.0, max=12.0)
-        attention = self.graph_softmax(scores, batch, tau=1.0, eps=eps)
+        maximum = scores.new_full((bag_count,), -torch.inf)
+        maximum.scatter_reduce_(
+            0,
+            bag_index,
+            scores,
+            reduce="amax",
+            include_self=True,
+        )
+        exponentials = torch.exp(scores - maximum[bag_index])
+        normalizer = scores.new_zeros(bag_count)
+        normalizer.scatter_add_(0, bag_index, exponentials)
+        attention = exponentials / normalizer[bag_index]
+        attention = attention.clamp(1.0e-6, 1.0 - 1.0e-6)
 
-        weighted_nodes = attention.unsqueeze(-1) * h
-        bag_count = int(batch.max().item()) + 1
-        z_h = h.new_zeros((bag_count, h.size(1)))
-        z_h.index_add_(0, batch, weighted_nodes)
+        node_embedding = self._weighted_sum(
+            node_embeddings, attention, bag_index, bag_count
+        )
+        bag_structure = self._weighted_sum(
+            node_structure, attention, bag_index, bag_count
+        )
+        projected_structure = self.structure_projection(bag_structure)
+        structure_gate = self.structure_gate(
+            torch.cat((node_embedding, projected_structure), dim=-1)
+        )
+        embedding = (
+            node_embedding
+            + self.structure_scale * structure_gate * projected_structure
+        )
+        return MILOutput(
+            embedding=embedding,
+            attention=attention,
+            bag_index=bag_index,
+        )
 
-        z_B = z_h
-        z_g = None
-        z_g_proj = None
-        structural_gate = None
-        if structural_embedding is not None:
-            weighted_structural = attention.unsqueeze(-1) * structural_embedding
-            z_g = h.new_zeros((bag_count, structural_embedding.size(1)))
-            z_g.index_add_(0, batch, weighted_structural)
-            if self.structural_fusion == 'concat':
-                z_B = torch.cat([z_h, z_g], dim=-1)
-            elif self.structural_fusion == 'gated_residual':
-                z_g_proj = self.structural_proj(z_g)
-                structural_gate = self.structural_gate(torch.cat([z_h, z_g_proj], dim=-1))
-                z_B = z_h + self.structural_residual_scale * structural_gate * z_g_proj
-
-        output = {
-            'z_B': z_B,
-            'z_h': z_h,
-            'a': attention,
-            'batch': batch,
-        }
-        if z_g is not None:
-            output['z_g'] = z_g
-        if z_g_proj is not None:
-            output['z_g_proj'] = z_g_proj
-        if structural_gate is not None:
-            output['structural_gate'] = structural_gate
-        if return_padded_attention:
-            a_pad, mask_valid = self._pad_attention(attention, batch)
-            output['a_pad'] = a_pad
-            output['mask_valid'] = mask_valid
-        return output
+    @staticmethod
+    def _weighted_sum(
+        values: torch.Tensor,
+        attention: torch.Tensor,
+        bag_index: torch.Tensor,
+        bag_count: int,
+    ) -> torch.Tensor:
+        weighted = attention.unsqueeze(-1) * values
+        pooled = values.new_zeros((bag_count, values.size(1)))
+        pooled.index_add_(0, bag_index, weighted)
+        return pooled

@@ -1,0 +1,50 @@
+datasets:
+  - ogbn_arxiv
+run_name: misgl
+data_dir: /data/yg/Subgraph-MIL/Data/processed_data
+output_dir: results
+device: cuda
+cuda_device: '0'
+seed: 1024
+folds: 10
+
+model:
+  encoder_dim: 256
+  classifier_dim: 64
+  dropout: 0.5
+  gat_heads: 4
+  gat_attention_dropout: 0.5
+  gat_feature_dropout: 0.5
+  gat_negative_slope: 0.2
+  gat_residual: true
+
+training:
+  batch_size: 64
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.0
+  patience: 30
+  max_grad_norm: 2.0
+  label_smoothing: 0.0
+  loss: bce
+  focal_gamma: 2.0
+
+mil_head:
+  enabled: true
+  attention_dim: 128
+  structure_dim: 32
+  structure_gate_dim: 64
+  structure_dropout: 0.1
+  structure_residual_init: 0.1
+  attention_loss_weight: 0.05
+  attention_loss_eps: 1.0e-8
+
+pos_head:
+  enabled: true
+  top_k: 16
+  hidden_dim: 256
+  dropout: 0.5
+  epochs: 300
+  patience: 50
+  lr: 0.001
+  weight_decay: 0.0005

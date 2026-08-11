@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>MISGL 代码整理总结</title>
+  <style>
+    body { max-width: 880px; margin: 40px auto; padding: 0 20px; color: #1f2937; font: 16px/1.65 system-ui, sans-serif; }
+    h1, h2 { color: #111827; }
+    code { padding: 2px 5px; border-radius: 4px; background: #f3f4f6; }
+    .ok { color: #047857; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>MISGL 代码整理总结</h1>
+  <p>本次整理保留方法主链：稀疏 GAT → 7 维结构增强 MIL → 可选 POS-HEAD。</p>
+
+  <h2>配置与开关</h2>
+  <ul>
+    <li>合并为唯一配置文件 <code>config/train.yml</code>，由严格 dataclass 校验。</li>
+    <li>明确三种合法模式：baseline（MIL off / POS off）、MIL（on / off）、MIL + POS（on / on）。</li>
+    <li>POS-HEAD 依赖 MIL-HEAD；非法组合立即报错。</li>
+  </ul>
+
+  <h2>核心实现</h2>
+  <ul>
+    <li>删除 DiffPool、branch A/B、coarse/stage 等遗留命名，统一为 <code>MILHead</code>、<code>POSHead</code> 与 <code>MISGLModel</code>。</li>
+    <li>保留 7 维结构特征、结构编码、门控残差融合及注意力形状损失；结构特征只在加载数据时计算一次。</li>
+    <li>子图改为稀疏边列表批处理，GAT 只处理实际边和自环，训练主路径复杂度为 <code>O(H(E+N))</code>。</li>
+    <li>POS 图仍按 <code>SᵀAS</code>、去自环、对称化、逐行 top-k、行归一化构建。</li>
+    <li>交叉验证改为内存中的分组分层折叠，不再读写 split JSON，也不包含失败兜底分支。</li>
+  </ul>
+
+  <h2>清理</h2>
+  <ul>
+    <li>移除旧训练入口、旧评估/配置工具、coarse GCN 实验、无用测试与 JSON 输出。</li>
+    <li>本地研究脚本和实验产物已取消 Git 跟踪并加入忽略规则，不会提交到远程。</li>
+  </ul>
+
+  <h2>验证</h2>
+  <p class="ok">通过：7/7 单元与合成端到端测试。</p>
+  <p>验证只使用内存合成数据；未使用 Flickr 数据集。</p>
+</body>
+</html>

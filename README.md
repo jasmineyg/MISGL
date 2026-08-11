@@ -1,30 +1,70 @@
-## Automatic GPU selection
+# MISGL
 
-Training can choose an idle NVIDIA GPU on the Linux server where `train.py` is
-running. Enable it either from the command line:
+MISGL trains a sparse graph encoder with two explicit optional heads:
+
+- **MIL-HEAD** combines seven precomputed structural descriptors with node
+  representations, then aggregates instances using gated attention.
+- **POS-HEAD** refines the MIL representation over the sparse top-`k`
+  subgraph-relation graph. It depends on MIL-HEAD.
+
+Training uses one strict configuration file, `config/train.yml`. Every field is
+required. Unknown fields, missing fields, invalid values, and illegal head
+combinations stop immediately; the loader does not search for another
+configuration or infer missing values.
+
+## Head modes
+
+Only these three modes are legal:
+
+| Mode | MIL-HEAD | POS-HEAD | Command |
+| --- | --- | --- | --- |
+| Mean-pool baseline | off | off | `python train.py --no-mil-head --no-pos-head` |
+| MIL | on | off | `python train.py --mil-head --no-pos-head` |
+| MIL + POS | on | on | `python train.py --mil-head --pos-head` |
+
+`POS-HEAD=on, MIL-HEAD=off` is invalid and raises an error before training.
+The checked-in YAML enables both heads, so the default run is:
 
 ```bash
-python train.py --hparam_path ./config/b_on.yml --auto_select_gpu
+python train.py --config config/train.yml
 ```
 
-or in a YAML config:
+## Common overrides
 
-```yaml
-device: 'cuda'
-cuda_visible_devices: 'auto'
-# Alternatively leave cuda_visible_devices unchanged and set:
-# auto_select_gpu: true
-gpu_candidate_devices: null       # e.g. '0,1,2'; null scans all visible GPUs
-gpu_memory_used_max_mb: 1024      # max used memory for an idle card
-gpu_utilization_max_pct: 10       # max utilization for an idle card
-gpu_select_wait_seconds: 0        # wait time before failing; 0 fails immediately
-gpu_select_poll_interval: 30
-gpu_lock_idle_card: true          # Linux file lock to reduce duplicate selection
-gpu_lock_dir: '/tmp/misgl_gpu_locks'
+```bash
+# Train more than one dataset.
+python train.py --datasets ogbn_arxiv reddit
+
+# Use CPU and write results to another directory.
+python train.py --device cpu --output-dir results/cpu
+
+# Use another strict YAML file.
+python train.py --config config/experiment.yml
 ```
 
-The selector uses `nvidia-smi` and sets `CUDA_VISIBLE_DEVICES` before CUDA is
-initialized. When automatic selection is enabled, use `gpu_candidate_devices`
-to restrict which physical cards may be selected. Manual
-`cuda_visible_devices: '0'` style settings still work when automatic selection
-is disabled.
+CLI values replace only the corresponding YAML values. Dataset names are
+space-separated. Edit `cuda_device` in the YAML when a specific visible CUDA
+device is required.
+Set `data_dir` to the local directory containing `<dataset>_processed.pkl`
+before the first run.
+
+## Computation
+
+Subgraphs are batched as one disconnected sparse graph. GAT attention is
+computed only on existing edges and self-loops, using `O(H(E + N))` memory and
+work per batch instead of materializing `B x H x N x N` attention tensors.
+The seven structural descriptors are calculated once while loading each
+dataset and are reused across all epochs and folds.
+
+## Configuration layout
+
+```text
+datasets, run_name, data_dir, output_dir, device, cuda_device, seed, folds
+|-- model       graph encoder and classifier dimensions
+|-- training    optimizer, loss, clipping, and early stopping
+|-- mil_head    MIL switch, structure fusion, and attention settings
+`-- pos_head    POS switch and relation-propagation settings
+```
+
+The public configuration API is in `MISGL/config.py`. The root entry point
+only parses CLI overrides and calls `MISGL.trainer.run(config)`.
