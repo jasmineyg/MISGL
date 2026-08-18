@@ -1,0 +1,43 @@
+diff --git a/paper_5x10/run_coarse_gcn_paper.py b/paper_5x10/run_coarse_gcn_paper.py
+--- a/paper_5x10/run_coarse_gcn_paper.py
++++ b/paper_5x10/run_coarse_gcn_paper.py
+@@ -356,7 +356,7 @@ def run_one_fold(args, hparams, loader, split_manifest, fold_idx, coarse_adj, co
+     fold_dir = os.path.join(args.out_dir, hparams.data_name, f'fold_{fold_idx}')
+     os.makedirs(fold_dir, exist_ok=True)
+-    train_loader, val_loader, _test_loader, split_meta = loader.get_cv_loaders_from_manifest(split_manifest, fold_idx)
++    train_loader, val_loader, test_loader, split_meta = loader.get_cv_loaders_from_manifest(split_manifest, fold_idx)
+     logging.info(
+         'Fold %d sizes: train=%d val=%d test=%d',
+         fold_idx,
+@@ -370,6 +370,24 @@ def run_one_fold(args, hparams, loader, split_manifest, fold_idx, coarse_adj, co
+         os.path.join(fold_dir, 'stage1_branch_b.pt'),
+     )
+ 
++    attention_path = None
++    branch_b_cfg = getattr(hparams, 'branch_b', {}) or {}
++    if bool(branch_b_cfg.get('use', False)):
++        from paper_attention_metrics import export_fold_attention_metrics
++
++        attention_path = os.path.join(fold_dir, 'attention_metrics.json')
++        export_fold_attention_metrics(
++            model=model,
++            test_loader=test_loader,
++            hparams=hparams,
++            dataset_raw=loader._dataset_raw,
++            output_path=attention_path,
++            data_name=hparams.data_name,
++            cv_seed=int(getattr(hparams, 'cv_seed', args.seed)),
++            fold_idx=int(fold_idx),
++        )
++
+     payload = export_z_mil(model, hparams, loader)
+     z_mil_path = os.path.join(fold_dir, 'z_mil.pt')
+     torch.save(payload, z_mil_path)
+@@ -405,6 +423,7 @@ def run_one_fold(args, hparams, loader, split_manifest, fold_idx, coarse_adj, co
+         'paths': {
+             'z_mil': z_mil_path,
+             'coarse_adj': coarse_path,
++            'attention_metrics': attention_path,
+         },
+         'coarse_graph': {
+             'num_nodes': int(coarse_adj.shape[0]),
