@@ -85,7 +85,7 @@ def graph_batch():
         X: features,
         EDGE_INDEX: edge_index,
         BAG_INDEX: torch.tensor([0, 0, 1, 1, 1]),
-        STRUCTURE: torch.zeros(5, 7),
+        STRUCTURE: torch.zeros(5, 9),
         LABEL: torch.tensor([0, 1]),
         SAMPLE_INDEX: torch.tensor([0, 1]),
     }
@@ -229,7 +229,7 @@ class DataAndTrainingTest(unittest.TestCase):
             self.assertEqual(bundle.subgraph_ids[-1], 14)
 
             first_batch = next(iter(bundle.loaders(0, batch_size=4)["train"]))
-            self.assertEqual(first_batch[STRUCTURE].shape, (first_batch[X].shape[0], 7))
+            self.assertEqual(first_batch[STRUCTURE].shape, (first_batch[X].shape[0], 9))
             self.assertEqual(first_batch[EDGE_INDEX].shape[0], 2)
 
             adjacency = build_position_adjacency(

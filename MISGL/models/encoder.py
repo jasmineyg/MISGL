@@ -48,6 +48,7 @@ class MISGLModel(nn.Module):
                 structure_gate_dim=config.mil_head.structure_gate_dim,
                 dropout=config.mil_head.structure_dropout,
                 residual_init=config.mil_head.structure_residual_init,
+                structure_layers=config.mil_head.structure_layers,
             )
             if config.mil_head.enabled
             else None

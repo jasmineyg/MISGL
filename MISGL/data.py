@@ -14,6 +14,7 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from MISGL.keys import BAG_INDEX, EDGE_INDEX, LABEL, SAMPLE_INDEX, STRUCTURE, X
+from MISGL.structural_features import compute_cm_features
 
 
 def _binary_labels(values: Any, expected_size: int) -> np.ndarray:
@@ -165,83 +166,7 @@ class GraphTensorDataset(Dataset):
 
     @staticmethod
     def _compute_structural_features_np(adjacency: np.ndarray) -> np.ndarray:
-        adjacency_bool = adjacency != 0
-        adjacency_bool = np.logical_or(adjacency_bool, adjacency_bool.T)
-        np.fill_diagonal(adjacency_bool, False)
-        adjacency_float = adjacency_bool.astype(np.float32, copy=False)
-
-        node_count = adjacency_float.shape[0]
-        max_degree = max(float(node_count - 1), 1.0)
-        degree = adjacency_float.sum(axis=-1)
-        degree_normalized = degree / max_degree
-        log_degree_normalized = np.log1p(degree) / np.log1p(max_degree)
-
-        neighbor_degree_sum = adjacency_float @ degree
-        average_neighbor_degree = neighbor_degree_sum / np.maximum(degree, 1.0)
-        average_neighbor_degree_normalized = average_neighbor_degree / max_degree
-
-        two_hop_walk_count = neighbor_degree_sum
-        two_hop_denominator = max(max_degree ** 2, 1.0)
-        two_hop_walk_log_normalized = np.log1p(two_hop_walk_count) / np.log1p(
-            two_hop_denominator
-        )
-
-        two_path_count = adjacency_float @ adjacency_float
-        closed_wedge_count = (two_path_count * adjacency_float).sum(axis=-1)
-        triangle_count = closed_wedge_count / 2.0
-        max_triangle_count = max(
-            max_degree * (max_degree - 1.0) / 2.0, 1.0
-        )
-        triangle_count_log_normalized = np.log1p(triangle_count) / np.log1p(
-            max_triangle_count
-        )
-
-        possible_wedge_count = degree * (degree - 1.0)
-        clustering_coefficient = np.divide(
-            closed_wedge_count,
-            np.maximum(possible_wedge_count, 1.0),
-            out=np.zeros_like(degree),
-            where=possible_wedge_count > 0,
-        )
-
-        core_number_normalized = GraphTensorDataset._compute_core_number_norm_np(
-            adjacency_float, max_degree
-        )
-        return np.stack(
-            [
-                degree_normalized,
-                log_degree_normalized,
-                average_neighbor_degree_normalized,
-                two_hop_walk_log_normalized,
-                triangle_count_log_normalized,
-                clustering_coefficient,
-                core_number_normalized,
-            ],
-            axis=-1,
-        ).astype(np.float32, copy=False)
-
-    @staticmethod
-    def _compute_core_number_norm_np(
-        adjacency: np.ndarray,
-        max_degree: float,
-    ) -> np.ndarray:
-        node_count = adjacency.shape[0]
-        remaining = np.ones(node_count, dtype=bool)
-        working_degree = adjacency.sum(axis=-1).astype(np.float32, copy=True)
-        local_core = np.zeros(node_count, dtype=np.float32)
-        running_core = 0.0
-
-        for _ in range(node_count):
-            masked_degree = np.where(remaining, working_degree, np.inf)
-            node_index = int(np.argmin(masked_degree))
-            running_core = max(running_core, float(masked_degree[node_index]))
-            local_core[node_index] = running_core
-            remaining[node_index] = False
-            working_degree = np.maximum(
-                working_degree - adjacency[:, node_index], 0.0
-            )
-
-        return local_core / max_degree
+        return compute_cm_features(adjacency)
 
     def __len__(self) -> int:
         return len(self._samples)

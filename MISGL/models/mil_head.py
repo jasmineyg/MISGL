@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from MISGL.structural_features import CM_MASK, INPUT_DIM
+
 
 @dataclass(frozen=True)
 class MILOutput:
@@ -26,20 +28,25 @@ class MILHead(nn.Module):
         structure_gate_dim: int,
         dropout: float,
         residual_init: float,
+        structure_layers: int = 1,
     ) -> None:
         super().__init__()
         if min(node_dim, attention_dim, structure_dim, structure_gate_dim) <= 0:
             raise ValueError("MIL dimensions must be positive")
 
-        self.structure_encoder = nn.Sequential(
-            nn.Linear(7, structure_dim),
-            nn.LayerNorm(structure_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(structure_dim, structure_dim),
-            nn.LayerNorm(structure_dim),
-            nn.ReLU(),
+        if type(structure_layers) is not int or structure_layers not in (1, 2):
+            raise ValueError("structure_layers must be 1 or 2")
+        self.register_buffer(
+            "structure_mask", torch.tensor(CM_MASK, dtype=torch.float32),
+            persistent=False,
         )
+        layers = [nn.Linear(INPUT_DIM, structure_dim), nn.LayerNorm(structure_dim), nn.ReLU()]
+        if structure_layers == 2:
+            layers.extend([
+                nn.Dropout(dropout), nn.Linear(structure_dim, structure_dim),
+                nn.LayerNorm(structure_dim), nn.ReLU(),
+            ])
+        self.structure_encoder = nn.Sequential(*layers)
         self.structure_projection = nn.Linear(structure_dim, node_dim)
         self.structure_gate = nn.Sequential(
             nn.Linear(node_dim * 2, structure_gate_dim),
@@ -64,8 +71,8 @@ class MILHead(nn.Module):
     ) -> MILOutput:
         if node_embeddings.ndim != 2:
             raise ValueError("node_embeddings must have shape [nodes, features]")
-        if structure.ndim != 2 or structure.shape != (node_embeddings.size(0), 7):
-            raise ValueError("structure must have shape [nodes, 7]")
+        if structure.ndim != 2 or structure.shape != (node_embeddings.size(0), INPUT_DIM):
+            raise ValueError("structure must have shape [nodes, 9]")
         if bag_index.ndim != 1 or bag_index.size(0) != node_embeddings.size(0):
             raise ValueError("bag_index must contain one id per node")
         if node_embeddings.size(0) == 0:
@@ -83,7 +90,7 @@ class MILHead(nn.Module):
         if torch.any(torch.bincount(bag_index, minlength=bag_count) == 0):
             raise ValueError("bag ids must be contiguous and start at zero")
 
-        node_structure = self.structure_encoder(structure)
+        node_structure = self.structure_encoder(structure * self.structure_mask)
         score_input = torch.cat((node_embeddings, node_structure), dim=-1)
         gated_score = torch.tanh(self.tanh_projection(score_input))
         gated_score = gated_score * torch.sigmoid(
