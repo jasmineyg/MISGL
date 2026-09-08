@@ -139,3 +139,18 @@ results/*
 /*_metrics.json
 /*_report.json
 /*_summary.json
+
+# Historical research code and records remain local; publish only the core model.
+/baseline_experiments/
+/paper_10fold/
+/paper_5x10/
+/structural_cm_*/
+/remote_structural_*/
+/final_dataset_ablation/
+/gdf_experiments/
+/s2n_fair_adapter/
+/docs/paper/
+/methodology_*.md
+/outputs/
+/tmp/
+/.codex_spreadsheet_work/

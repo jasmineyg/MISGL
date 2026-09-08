@@ -32,12 +32,9 @@ training:
 mil_head:
   enabled: true
   attention_dim: 128
-  # Final paper setting selected on 2026-09-07: C+M, Linear(9,8)+LayerNorm+ReLU.
-  structure_features: c_m
-  structure_layers: 1
-  structure_dim: 8
+  # Full nine descriptors; single Linear(9,32) + LayerNorm + ReLU.
+  structure_dim: 32
   structure_gate_dim: 64
-  structure_dropout: 0.1  # Used only if structure_layers=2; absent in the selected one-layer encoder.
   structure_residual_init: 0.1
   attention_loss_weight: 0.05
   attention_loss_eps: 1.0e-8

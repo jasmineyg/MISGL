@@ -1,70 +1,63 @@
 # MISGL
 
-MISGL trains a sparse graph encoder with two explicit optional heads:
+The core model uses all nine structural statistics and a single structural
+encoder: `Linear(9,32) -> LayerNorm(32) -> ReLU`.
 
-- **MIL-HEAD** combines seven precomputed structural descriptors with node
-  representations, then aggregates instances using gated attention.
-- **POS-HEAD** refines the MIL representation over the sparse top-`k`
-  subgraph-relation graph. It depends on MIL-HEAD.
+## Structural representation
 
-Training uses one strict configuration file, `config/train.yml`. Every field is
-required. Unknown fields, missing fields, invalid values, and illegal head
-combinations stop immediately; the loader does not search for another
-configuration or infer missing values.
+Features are computed once per dataset on unweighted, undirected subgraphs
+with self-loops removed, in this fixed order:
 
-## Head modes
+1. Normalized degree
+2. Normalized average neighbor degree
+3. Exactly-two-hop reachability ratio
+4. Personalized PageRank self-return probability (restart probability 0.15)
+5. Log-normalized triangle count
+6. Clustering coefficient
+7. Normalized core number
+8. PageRank normalized by its maximum
+9. Absolute Fiedler-vector coordinate normalized by its maximum (LapPE)
 
-Only these three modes are legal:
+All nine inputs are used. There is no feature mask, alternative structural
+profile, two-layer encoder, or structural dropout option. The structural output
+width is fixed at 32. The node GAT output is 256 by default, giving a 288-wide
+attention input. Attention uses parallel tanh/sigmoid projections with hidden
+width 128. The same attention weights pool semantic and structural embeddings;
+a 32-to-256 projection and a 64-hidden-unit gate fuse structure into the semantic
+representation. The final MIL representation remains 256-dimensional.
 
-| Mode | MIL-HEAD | POS-HEAD | Command |
-| --- | --- | --- | --- |
-| Mean-pool baseline | off | off | `python train.py --no-mil-head --no-pos-head` |
-| MIL | on | off | `python train.py --mil-head --no-pos-head` |
-| MIL + POS | on | on | `python train.py --mil-head --pos-head` |
+The GAT, MIL/POS head switches, losses and two-stage training are retained.
+POS uses the frozen MIL embeddings and the subgraph relation graph.
 
-`POS-HEAD=on, MIL-HEAD=off` is invalid and raises an error before training.
-The checked-in YAML enables both heads, so the default run is:
+## Run
+
+Use Python with PyTorch, NumPy, SciPy, NetworkX, scikit-learn, ruamel.yaml and tqdm.
+Every field in `config/train.yml` is required; unknown fields are rejected.
+Set `data_dir` to a directory containing `<dataset>_processed.pkl` before running.
 
 ```bash
+# Default: MIL + POS
 python train.py --config config/train.yml
+# MIL only
+python train.py --mil-head --no-pos-head
+# Mean pooling baseline
+python train.py --no-mil-head --no-pos-head
+# Override datasets and output directory
+python train.py --datasets ogbn_arxiv reddit --output-dir results/full9
 ```
 
-## Common overrides
+POS requires MIL. Structural statistics are label-free and precomputed while
+loading data. GAT processes disconnected sparse graph batches. Descriptor
+calculation includes dense subgraph matrix operations and eigendecomposition.
+Use a new output directory for new training; previous masked or differently sized
+models must not be treated as results from this configuration. Old YAML files
+containing removed structural options must be updated to the checked-in schema.
+
+## Verify
 
 ```bash
-# Train more than one dataset.
-python train.py --datasets ogbn_arxiv reddit
-
-# Use CPU and write results to another directory.
-python train.py --device cpu --output-dir results/cpu
-
-# Use another strict YAML file.
-python train.py --config config/experiment.yml
+python -m unittest discover -s tests
 ```
 
-CLI values replace only the corresponding YAML values. Dataset names are
-space-separated. Edit `cuda_device` in the YAML when a specific visible CUDA
-device is required.
-Set `data_dir` to the local directory containing `<dataset>_processed.pkl`
-before the first run.
-
-## Computation
-
-Subgraphs are batched as one disconnected sparse graph. GAT attention is
-computed only on existing edges and self-loops, using `O(H(E + N))` memory and
-work per batch instead of materializing `B x H x N x N` attention tensors.
-The seven structural descriptors are calculated once while loading each
-dataset and are reused across all epochs and folds.
-
-## Configuration layout
-
-```text
-datasets, run_name, data_dir, output_dir, device, cuda_device, seed, folds
-|-- model       graph encoder and classifier dimensions
-|-- training    optimizer, loss, clipping, and early stopping
-|-- mil_head    MIL switch, structure fusion, and attention settings
-`-- pos_head    POS switch and relation-propagation settings
-```
-
-The public configuration API is in `MISGL/config.py`. The root entry point
-only parses CLI overrides and calls `MISGL.trainer.run(config)`.
+Only the core package, configuration, entry point and tests are maintained here.
+Historical experiment scripts and result records remain outside Git tracking.

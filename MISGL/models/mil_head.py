@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from MISGL.structural_features import CM_MASK, INPUT_DIM
+from MISGL.structural_features import INPUT_DIM
 
 
 @dataclass(frozen=True)
@@ -26,27 +26,17 @@ class MILHead(nn.Module):
         attention_dim: int,
         structure_dim: int,
         structure_gate_dim: int,
-        dropout: float,
         residual_init: float,
-        structure_layers: int = 1,
     ) -> None:
         super().__init__()
         if min(node_dim, attention_dim, structure_dim, structure_gate_dim) <= 0:
             raise ValueError("MIL dimensions must be positive")
 
-        if type(structure_layers) is not int or structure_layers not in (1, 2):
-            raise ValueError("structure_layers must be 1 or 2")
-        self.register_buffer(
-            "structure_mask", torch.tensor(CM_MASK, dtype=torch.float32),
-            persistent=False,
+        if structure_dim != 32:
+            raise ValueError("structure_dim must be 32 for the final encoder")
+        self.structure_encoder = nn.Sequential(
+            nn.Linear(INPUT_DIM, structure_dim), nn.LayerNorm(structure_dim), nn.ReLU()
         )
-        layers = [nn.Linear(INPUT_DIM, structure_dim), nn.LayerNorm(structure_dim), nn.ReLU()]
-        if structure_layers == 2:
-            layers.extend([
-                nn.Dropout(dropout), nn.Linear(structure_dim, structure_dim),
-                nn.LayerNorm(structure_dim), nn.ReLU(),
-            ])
-        self.structure_encoder = nn.Sequential(*layers)
         self.structure_projection = nn.Linear(structure_dim, node_dim)
         self.structure_gate = nn.Sequential(
             nn.Linear(node_dim * 2, structure_gate_dim),
@@ -90,7 +80,7 @@ class MILHead(nn.Module):
         if torch.any(torch.bincount(bag_index, minlength=bag_count) == 0):
             raise ValueError("bag ids must be contiguous and start at zero")
 
-        node_structure = self.structure_encoder(structure * self.structure_mask)
+        node_structure = self.structure_encoder(structure)
         score_input = torch.cat((node_embeddings, node_structure), dim=-1)
         gated_score = torch.tanh(self.tanh_projection(score_input))
         gated_score = gated_score * torch.sigmoid(

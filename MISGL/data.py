@@ -14,7 +14,7 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from MISGL.keys import BAG_INDEX, EDGE_INDEX, LABEL, SAMPLE_INDEX, STRUCTURE, X
-from MISGL.structural_features import compute_cm_features
+from MISGL.structural_features import compute_structural_features
 
 
 def _binary_labels(values: Any, expected_size: int) -> np.ndarray:
@@ -166,7 +166,7 @@ class GraphTensorDataset(Dataset):
 
     @staticmethod
     def _compute_structural_features_np(adjacency: np.ndarray) -> np.ndarray:
-        return compute_cm_features(adjacency)
+        return compute_structural_features(adjacency)
 
     def __len__(self) -> int:
         return len(self._samples)

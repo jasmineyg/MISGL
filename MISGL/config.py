@@ -105,11 +105,8 @@ class TrainingConfig:
 class MILHeadConfig:
     enabled: bool
     attention_dim: int
-    structure_features: str
-    structure_layers: int
     structure_dim: int
     structure_gate_dim: int
-    structure_dropout: float
     structure_residual_init: float
     attention_loss_weight: float
     attention_loss_eps: float
@@ -117,16 +114,10 @@ class MILHeadConfig:
     def __post_init__(self) -> None:
         _require_bool("mil_head.enabled", self.enabled)
         _require_int("mil_head.attention_dim", self.attention_dim)
-        if self.structure_features != "c_m":
-            raise ValueError("mil_head.structure_features must be c_m (selected paper profile)")
-        _require_int("mil_head.structure_layers", self.structure_layers)
-        if self.structure_layers not in (1, 2):
-            raise ValueError("mil_head.structure_layers must be 1 or 2")
         _require_int("mil_head.structure_dim", self.structure_dim)
+        if self.structure_dim != 32:
+            raise ValueError("mil_head.structure_dim must be 32 for the final encoder")
         _require_int("mil_head.structure_gate_dim", self.structure_gate_dim)
-        _require_probability(
-            "mil_head.structure_dropout", self.structure_dropout
-        )
         _require_number(
             "mil_head.structure_residual_init", self.structure_residual_init
         )
