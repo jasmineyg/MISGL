@@ -18,6 +18,19 @@ Use `--device cuda --cuda-device 0` for GPU training. Training settings are in
 `MISGL/config.py`. Real partitioned data belong in
 `data/<dataset>/{bfs,metis,metis_perturb}/`.
 
+## Partitioned datasets
+
+The experiment data are available in [Releases](https://github.com/jasmineyg/MISGL/releases/tag/paper-data-v1).
+With GitHub CLI installed, run from the repository root to download, verify and
+restore the original `data/` directory:
+
+```bash
+gh release download paper-data-v1 -R jasmineyg/MISGL -p 'misgl-data.tar.gz.part-*' -p '*SHA256SUMS' -D /tmp/misgl-data
+(cd /tmp/misgl-data && shasum -a 256 -c SHA256SUMS)
+cat /tmp/misgl-data/misgl-data.tar.gz.part-* | tar -xzf -
+shasum -a 256 -c /tmp/misgl-data/DATA_SHA256SUMS
+```
+
 ## Real-data construction
 
 Use a separate Python 3.9.23 environment with native METIS 5.2.1. The same
