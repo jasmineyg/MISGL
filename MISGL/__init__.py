@@ -1,5 +1,5 @@
 """MISGL training package."""
 
-from MISGL.config import Config, load_config
+from MISGL.config import Config, default_config
 
-__all__ = ["Config", "load_config"]
+__all__ = ["Config", "default_config"]

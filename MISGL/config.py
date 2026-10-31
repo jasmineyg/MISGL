@@ -1,14 +1,8 @@
-"""Strict configuration objects and YAML loading for MISGL training."""
+"""Training settings and the paper defaults."""
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass
 import math
-from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple, Type, TypeVar
-
-from ruamel.yaml import YAML
-
-
-_ConfigType = TypeVar("_ConfigType")
+from typing import Any, Optional, Tuple
 
 
 def _require_bool(name: str, value: Any) -> None:
@@ -47,7 +41,9 @@ def _require_text(name: str, value: Any) -> None:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    encoder_dim: int
+    """Residual GAT backbone and the first-stage classifier."""
+
+    node_dim: int
     classifier_dim: int
     dropout: float
     gat_heads: int
@@ -57,12 +53,12 @@ class ModelConfig:
     gat_residual: bool
 
     def __post_init__(self) -> None:
-        _require_int("model.encoder_dim", self.encoder_dim)
+        _require_int("model.node_dim", self.node_dim)
         _require_int("model.classifier_dim", self.classifier_dim)
         _require_probability("model.dropout", self.dropout)
         _require_int("model.gat_heads", self.gat_heads)
-        if self.encoder_dim % self.gat_heads != 0:
-            raise ValueError("model.encoder_dim must be divisible by model.gat_heads")
+        if self.node_dim % self.gat_heads != 0:
+            raise ValueError("model.node_dim must be divisible by model.gat_heads")
         _require_probability("model.gat_attention_dropout", self.gat_attention_dropout)
         _require_probability("model.gat_feature_dropout", self.gat_feature_dropout)
         _require_number("model.gat_negative_slope", self.gat_negative_slope)
@@ -71,15 +67,15 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    """First-stage optimization; the Context-Head has its own settings below."""
+
     batch_size: int
     epochs: int
     lr: float
     weight_decay: float
     patience: int
     max_grad_norm: float
-    label_smoothing: float
     loss: str
-    focal_gamma: float
 
     def __post_init__(self) -> None:
         _require_int("training.batch_size", self.batch_size)
@@ -92,43 +88,37 @@ class TrainingConfig:
         _require_number("training.max_grad_norm", self.max_grad_norm)
         if self.max_grad_norm == 0:
             raise ValueError("training.max_grad_norm must be greater than 0")
-        _require_probability("training.label_smoothing", self.label_smoothing)
         _require_text("training.loss", self.loss)
-        if self.loss not in {"bce", "focal", "weighted_bce"}:
-            raise ValueError(
-                "training.loss must be one of: bce, focal, weighted_bce"
-            )
-        _require_number("training.focal_gamma", self.focal_gamma)
+        if self.loss != "bce":
+            raise ValueError("The paper implementation uses BCE only")
 
 
 @dataclass(frozen=True)
-class MILHeadConfig:
+class InternalHeadConfig:
+    """Structural encoding, gated attention and residual fusion (Section 4.2)."""
+
     enabled: bool
     attention_dim: int
     structure_dim: int
     structure_gate_dim: int
-    structure_residual_init: float
-    attention_loss_weight: float
-    attention_loss_eps: float
+    residual_scale_init: float
 
     def __post_init__(self) -> None:
-        _require_bool("mil_head.enabled", self.enabled)
-        _require_int("mil_head.attention_dim", self.attention_dim)
-        _require_int("mil_head.structure_dim", self.structure_dim)
+        _require_bool("internal_head.enabled", self.enabled)
+        _require_int("internal_head.attention_dim", self.attention_dim)
+        _require_int("internal_head.structure_dim", self.structure_dim)
         if self.structure_dim != 32:
-            raise ValueError("mil_head.structure_dim must be 32 for the final encoder")
-        _require_int("mil_head.structure_gate_dim", self.structure_gate_dim)
-        _require_number(
-            "mil_head.structure_residual_init", self.structure_residual_init
-        )
-        _require_number("mil_head.attention_loss_weight", self.attention_loss_weight)
-        _require_probability("mil_head.attention_loss_eps", self.attention_loss_eps)
-        if self.attention_loss_eps == 0:
-            raise ValueError("mil_head.attention_loss_eps must be greater than 0")
+            raise ValueError(
+                "internal_head.structure_dim must be 32 for the final encoder"
+            )
+        _require_int("internal_head.structure_gate_dim", self.structure_gate_dim)
+        _require_number("internal_head.residual_scale_init", self.residual_scale_init)
 
 
 @dataclass(frozen=True)
-class POSHeadConfig:
+class ContextHeadConfig:
+    """Coarse-graph Top-K and second-stage optimization (Sections 4.3-4.4)."""
+
     enabled: bool
     top_k: int
     hidden_dim: int
@@ -139,16 +129,16 @@ class POSHeadConfig:
     weight_decay: float
 
     def __post_init__(self) -> None:
-        _require_bool("pos_head.enabled", self.enabled)
-        _require_int("pos_head.top_k", self.top_k)
-        _require_int("pos_head.hidden_dim", self.hidden_dim)
-        _require_probability("pos_head.dropout", self.dropout)
-        _require_int("pos_head.epochs", self.epochs)
-        _require_int("pos_head.patience", self.patience)
-        _require_number("pos_head.lr", self.lr)
+        _require_bool("context_head.enabled", self.enabled)
+        _require_int("context_head.top_k", self.top_k)
+        _require_int("context_head.hidden_dim", self.hidden_dim)
+        _require_probability("context_head.dropout", self.dropout)
+        _require_int("context_head.epochs", self.epochs)
+        _require_int("context_head.patience", self.patience)
+        _require_number("context_head.lr", self.lr)
         if self.lr == 0:
-            raise ValueError("pos_head.lr must be greater than 0")
-        _require_number("pos_head.weight_decay", self.weight_decay)
+            raise ValueError("context_head.lr must be greater than 0")
+        _require_number("context_head.weight_decay", self.weight_decay)
 
 
 @dataclass(frozen=True)
@@ -163,8 +153,8 @@ class Config:
     folds: int
     model: ModelConfig
     training: TrainingConfig
-    mil_head: MILHeadConfig
-    pos_head: POSHeadConfig
+    internal_head: InternalHeadConfig
+    context_head: ContextHeadConfig
 
     def __post_init__(self) -> None:
         if not isinstance(self.datasets, tuple):
@@ -189,101 +179,53 @@ class Config:
             raise ValueError("cuda_device is required when device is cuda")
         _require_int("seed", self.seed, minimum=0)
         _require_int("folds", self.folds, minimum=3)
-        if self.pos_head.enabled and not self.mil_head.enabled:
-            raise ValueError("pos_head requires mil_head to be enabled")
 
 
-def _build_config_section(
-    config_type: Type[_ConfigType], data: Any, section_name: str
-) -> _ConfigType:
-    if not isinstance(data, Mapping):
-        raise TypeError("{} must be a mapping".format(section_name))
-
-    expected = {item.name for item in fields(config_type)}
-    actual = set(data)
-    unknown = actual - expected
-    missing = expected - actual
-    if unknown:
-        raise ValueError(
-            "unknown {} keys: {}".format(section_name, ", ".join(sorted(unknown)))
-        )
-    if missing:
-        raise ValueError(
-            "missing {} keys: {}".format(section_name, ", ".join(sorted(missing)))
-        )
-    return config_type(**dict(data))
-
-
-def load_config(path: str) -> Config:
-    """Load exactly one YAML file into a validated immutable configuration."""
-
-    config_path = Path(path)
-    yaml = YAML(typ="safe")
-    with config_path.open("r", encoding="utf-8") as config_file:
-        raw = yaml.load(config_file)
-
-    if not isinstance(raw, Mapping):
-        raise TypeError("configuration root must be a mapping")
-
-    expected = {item.name for item in fields(Config)}
-    actual = set(raw)
-    unknown = actual - expected
-    missing = expected - actual
-    if unknown:
-        raise ValueError("unknown config keys: {}".format(", ".join(sorted(unknown))))
-    if missing:
-        raise ValueError("missing config keys: {}".format(", ".join(sorted(missing))))
-
-    datasets = raw["datasets"]
-    if not isinstance(datasets, (list, tuple)) or isinstance(datasets, str):
-        raise TypeError("datasets must be a sequence of strings")
-
+def default_config() -> Config:
+    """Return the paper hyperparameters; no external configuration file is needed."""
     return Config(
-        datasets=tuple(datasets),
-        run_name=raw["run_name"],
-        data_dir=raw["data_dir"],
-        output_dir=raw["output_dir"],
-        device=raw["device"],
-        cuda_device=raw["cuda_device"],
-        seed=raw["seed"],
-        folds=raw["folds"],
-        model=_build_config_section(ModelConfig, raw["model"], "model"),
-        training=_build_config_section(
-            TrainingConfig, raw["training"], "training"
+        datasets=("synthetic_milinst_both_useful_v2",),
+        run_name="nasgl",
+        data_dir="data/syn3",
+        output_dir="outputs",
+        device="cuda",
+        cuda_device="0",
+        seed=1024,
+        folds=10,
+        model=ModelConfig(
+            node_dim=256,
+            classifier_dim=64,
+            dropout=0.5,
+            gat_heads=4,
+            gat_attention_dropout=0.5,
+            gat_feature_dropout=0.5,
+            gat_negative_slope=0.2,
+            gat_residual=True,
         ),
-        mil_head=_build_config_section(MILHeadConfig, raw["mil_head"], "mil_head"),
-        pos_head=_build_config_section(POSHeadConfig, raw["pos_head"], "pos_head"),
-    )
-
-
-def apply_overrides(
-    config: Config,
-    datasets: Optional[Sequence[str]] = None,
-    data_dir: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    device: Optional[str] = None,
-    mil_head: Optional[bool] = None,
-    pos_head: Optional[bool] = None,
-) -> Config:
-    """Apply explicit CLI overrides and revalidate the resulting head state."""
-
-    mil_config = (
-        config.mil_head
-        if mil_head is None
-        else replace(config.mil_head, enabled=mil_head)
-    )
-    pos_config = (
-        config.pos_head
-        if pos_head is None
-        else replace(config.pos_head, enabled=pos_head)
-    )
-
-    return replace(
-        config,
-        datasets=config.datasets if datasets is None else tuple(datasets),
-        data_dir=config.data_dir if data_dir is None else data_dir,
-        output_dir=config.output_dir if output_dir is None else output_dir,
-        device=config.device if device is None else device,
-        mil_head=mil_config,
-        pos_head=pos_config,
+        training=TrainingConfig(
+            batch_size=64,
+            epochs=200,
+            lr=0.001,
+            weight_decay=0.0,
+            patience=30,
+            max_grad_norm=2.0,
+            loss="bce",
+        ),
+        internal_head=InternalHeadConfig(
+            enabled=True,
+            attention_dim=128,
+            structure_dim=32,
+            structure_gate_dim=64,
+            residual_scale_init=0.1,
+        ),
+        context_head=ContextHeadConfig(
+            enabled=True,
+            top_k=16,
+            hidden_dim=256,
+            dropout=0.5,
+            epochs=300,
+            patience=50,
+            lr=0.001,
+            weight_decay=0.0005,
+        ),
     )

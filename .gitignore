@@ -1,156 +1,16 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# celery beat schedule file
-celerybeat-schedule
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-
-# tmp results
-results/*
-.idea*
-/result.xlsx
-/result/
+.DS_Store
+._*
 /data/
-/log.md
-/POSITION_HEAD_EXPERIMENT_REPORT.md
-/EDGE_GATE_EXPERIMENT_RESULT_ANALYSIS.md
-/COARSE_GRAPH_SUBGRAPH_DISCUSSION.md
-
-# Local analyses and experiment launchers (kept outside the production package)
-/attention_analyzer.py
-/data_information.md
-/config/b_on_partition_variants.yml
-/launch_loss_ablation.sh
-/smoke_loss_ablation.py
-/summarize_loss_ablation.py
-/tools/
-/figures/
-/MISGL_research_progress_*.md
-/MISGL课题进展与论文框架*.md
-/analyze_mil_neighbor_correction.py
-/create_synthetic_mil_consistent_v2.py
-/paper_figures_mil_consistent*.py
-/plot_synthetic_mil_consistent.py
-/semantic_oracle_striped_partition.py
-/summarize_synthetic*.py
-/run_synthetic*.sh
-/mil_consistent_*.png
-
-# Generated experiment summaries
-/pilot_fold*.json
-/*_metrics.json
-/*_report.json
-/*_summary.json
-
-# Historical research code and records remain local; publish only the core model.
-/baseline_experiments/
-/paper_10fold/
-/paper_5x10/
-/structural_cm_*/
-/remote_structural_*/
-/final_dataset_ablation/
-/gdf_experiments/
-/s2n_fair_adapter/
-/docs/paper/
-/methodology_*.md
 /outputs/
-/tmp/
-/.codex_spreadsheet_work/
+/results/
+/cache/
+*.pt
+*.pth
+*.pkl
+*.npz
+*.log
+.env

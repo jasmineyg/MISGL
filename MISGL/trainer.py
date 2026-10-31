@@ -1,34 +1,101 @@
-"""Unified fixed-CV training for the MIL and POS heads."""
+"""Two-stage NASGL training, BCE loss and classification metrics."""
 
 import copy
-import logging
 import os
 import random
-from dataclasses import asdict
-from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from sklearn import metrics
 
 from MISGL.config import Config
-from MISGL.data import DatasetBundle
-from MISGL.keys import LABEL, SAMPLE_INDEX
-from MISGL.losses import binary_loss, model_loss
-from MISGL.metrics import binary_metrics, summarize
-from MISGL.models.encoder import MISGLModel
-from MISGL.models.pos_head import POSHead
-from MISGL.position_graph import (
-    build_position_adjacency,
-    row_normalize,
-    to_torch_sparse,
+from MISGL.context_head import ContextHead
+from MISGL.model import SubgraphEncoder
+
+
+def binary_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    logits = logits.reshape(-1)
+    targets = targets.to(device=logits.device, dtype=logits.dtype).reshape(-1)
+    if logits.shape != targets.shape:
+        raise ValueError(
+            f"logits and targets must have equal shape, got {logits.shape} and {targets.shape}"
+        )
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+METRIC_NAMES = (
+    "acc",
+    "precision",
+    "recall",
+    "f1",
+    "balanced_acc",
+    "roc_auc",
+    "pr_auc",
+    "tn",
+    "fp",
+    "fn",
+    "tp",
 )
 
 
-SPLITS = ("train", "val", "test")
+def binary_metrics(
+    logits: torch.Tensor, labels: torch.Tensor
+) -> Dict[str, Union[float, int]]:
+    """Return the full metric set; both classes must be present."""
+    logits = logits.detach().cpu().reshape(-1)
+    labels = labels.detach().cpu().to(torch.long).reshape(-1)
+    if logits.shape != labels.shape:
+        raise ValueError("logits and labels must have equal shape")
+    if logits.numel() == 0:
+        raise ValueError("cannot evaluate an empty split")
+
+    y_true = labels.numpy()
+    if not np.array_equal(np.unique(y_true), np.asarray([0, 1])):
+        raise ValueError("every evaluated split must contain both binary classes")
+
+    probabilities = torch.sigmoid(logits).numpy()
+    predictions = (probabilities > 0.5).astype(np.int64)
+    tn, fp, fn, tp = metrics.confusion_matrix(
+        y_true, predictions, labels=[0, 1]
+    ).ravel()
+    return {
+        "acc": float(metrics.accuracy_score(y_true, predictions)),
+        "precision": float(
+            metrics.precision_score(y_true, predictions, zero_division=0)
+        ),
+        "recall": float(metrics.recall_score(y_true, predictions, zero_division=0)),
+        "f1": float(metrics.f1_score(y_true, predictions, zero_division=0)),
+        "balanced_acc": float(metrics.balanced_accuracy_score(y_true, predictions)),
+        "roc_auc": float(metrics.roc_auc_score(y_true, probabilities)),
+        "pr_auc": float(metrics.average_precision_score(y_true, probabilities)),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
 
 
-def _runtime_device(config: Config) -> torch.device:
+def summarize(
+    fold_metrics: List[Dict[str, Union[float, int]]],
+) -> Dict[str, Dict[str, float]]:
+    """Aggregate numeric fold metrics with sample standard deviation."""
+    if not fold_metrics:
+        raise ValueError("cannot summarize zero folds")
+    summary = {}
+    for name in METRIC_NAMES:
+        values = np.asarray(
+            [float(item[name]) for item in fold_metrics], dtype=np.float64
+        )
+        summary[name] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=1)),
+        }
+    return summary
+
+
+def runtime_device(config: Config) -> torch.device:
     if config.device == "cuda":
         if config.cuda_device is None:
             raise ValueError("cuda_device must be set when device is 'cuda'")
@@ -38,17 +105,10 @@ def _runtime_device(config: Config) -> torch.device:
     return torch.device(config.device)
 
 
-def _move_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+def _move_batch(
+    batch: Dict[str, torch.Tensor], device: torch.device
+) -> Dict[str, torch.Tensor]:
     return {name: value.to(device, non_blocking=True) for name, value in batch.items()}
-
-
-def _positive_class_weight(labels: np.ndarray) -> float:
-    labels = np.asarray(labels, dtype=np.int64)
-    negative_count = int(np.sum(labels == 0))
-    positive_count = int(np.sum(labels == 1))
-    if negative_count == 0 or positive_count == 0:
-        raise ValueError("every training fold must contain both binary classes")
-    return float(negative_count) / float(positive_count)
 
 
 def _is_better(
@@ -67,7 +127,7 @@ def _is_better(
     )
 
 
-def _set_seed(seed: int, device: torch.device) -> None:
+def set_seed(seed: int, device: torch.device) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -77,13 +137,13 @@ def _set_seed(seed: int, device: torch.device) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def _predict_all(
-    model: MISGLModel,
+def encode_subgraphs(
+    model: SubgraphEncoder,
     loader,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     logits = []
-    embeddings = []
+    z_int = []
     labels = []
     sample_indices = []
     model.eval()
@@ -92,20 +152,20 @@ def _predict_all(
             batch = _move_batch(cpu_batch, device)
             output = model(batch)
             logits.append(output.logits.detach().cpu().reshape(-1))
-            embeddings.append(output.embedding.detach().cpu())
-            labels.append(batch[LABEL].detach().cpu().reshape(-1))
-            sample_indices.append(batch[SAMPLE_INDEX].detach().cpu().reshape(-1))
+            z_int.append(output.z_int.detach().cpu())
+            labels.append(batch["label"].detach().cpu().reshape(-1))
+            sample_indices.append(batch["sample_index"].detach().cpu().reshape(-1))
     if not logits:
         raise ValueError("cannot predict an empty dataset")
     return (
         torch.cat(logits),
-        torch.cat(embeddings),
+        torch.cat(z_int),
         torch.cat(labels),
         torch.cat(sample_indices),
     )
 
 
-def _split_metrics(
+def evaluate_splits(
     logits: torch.Tensor,
     labels: torch.Tensor,
     split_positions: Dict[str, np.ndarray],
@@ -116,25 +176,19 @@ def _split_metrics(
     }
 
 
-def train_encoder(
+def train_internal_stage(
     config: Config,
     input_dim: int,
     train_loader,
     val_loader,
-    train_labels: np.ndarray,
     device: torch.device,
-) -> Tuple[MISGLModel, Dict[str, float]]:
-    """Train the node encoder and optional MIL head for one fold."""
-    model = MISGLModel(config, input_dim=input_dim).to(device)
+) -> Tuple[SubgraphEncoder, Dict[str, float]]:
+    """Stage 1: train the residual GAT and Internal-Head using subgraph labels."""
+    model = SubgraphEncoder(config, input_dim=input_dim).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.training.lr,
         weight_decay=config.training.weight_decay,
-    )
-    pos_weight = (
-        _positive_class_weight(train_labels)
-        if config.training.loss == "weighted_bce"
-        else None
     )
 
     best_state = None
@@ -149,13 +203,15 @@ def train_encoder(
             batch = _move_batch(cpu_batch, device)
             optimizer.zero_grad()
             output = model(batch)
-            loss = model_loss(output, batch[LABEL], config, pos_weight=pos_weight)
+            loss = binary_loss(output.logits, batch["label"])
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.training.max_grad_norm
+            )
             optimizer.step()
 
-        val_logits, _, val_labels, _ = _predict_all(model, val_loader, device)
-        val_loss = float(binary_loss(val_logits, val_labels, config, pos_weight=pos_weight).item())
+        val_logits, _, val_labels, _ = encode_subgraphs(model, val_loader, device)
+        val_loss = float(binary_loss(val_logits, val_labels).item())
         val_accuracy = float(binary_metrics(val_logits, val_labels)["acc"])
         if _is_better(
             val_accuracy,
@@ -185,16 +241,16 @@ def train_encoder(
     }
 
 
-def train_pos_head(
+def train_context_stage(
     config: Config,
-    embeddings: torch.Tensor,
+    z_int: torch.Tensor,
     labels: torch.Tensor,
     split_positions: Dict[str, np.ndarray],
-    normalized_adjacency: torch.Tensor,
+    a_context: torch.Tensor,
     device: torch.device,
-) -> Tuple[POSHead, torch.Tensor, Dict[str, float]]:
-    """Train the POS head on frozen MIL embeddings for one fold."""
-    embeddings = embeddings.to(device=device, dtype=torch.float32)
+) -> Tuple[ContextHead, torch.Tensor, Dict[str, float]]:
+    """Stage 2: train Context-Head using the frozen internal representations."""
+    z_int = z_int.to(device=device, dtype=torch.float32)
     labels = labels.to(device=device, dtype=torch.float32)
     masks = {}
     for name, positions in split_positions.items():
@@ -202,21 +258,15 @@ def train_pos_head(
         mask[torch.as_tensor(positions, dtype=torch.long, device=device)] = True
         masks[name] = mask
 
-    train_labels = labels[masks["train"]].detach().cpu().numpy()
-    pos_weight = (
-        _positive_class_weight(train_labels)
-        if config.training.loss == "weighted_bce"
-        else None
-    )
-    model = POSHead(
-        embedding_dim=embeddings.size(1),
-        hidden_dim=config.pos_head.hidden_dim,
-        dropout=config.pos_head.dropout,
+    model = ContextHead(
+        internal_dim=z_int.size(1),
+        hidden_dim=config.context_head.hidden_dim,
+        dropout=config.context_head.dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=config.pos_head.lr,
-        weight_decay=config.pos_head.weight_decay,
+        lr=config.context_head.lr,
+        weight_decay=config.context_head.weight_decay,
     )
 
     best_state = None
@@ -224,24 +274,22 @@ def train_pos_head(
     best_loss = float("inf")
     best_epoch = -1
     stale_epochs = 0
-    for epoch in range(config.pos_head.epochs):
+    for epoch in range(config.context_head.epochs):
         model.train()
         optimizer.zero_grad()
-        logits = model(embeddings, normalized_adjacency)
+        logits = model(z_int, a_context)
         loss = binary_loss(
             logits[masks["train"]],
             labels[masks["train"]],
-            config,
-            pos_weight=pos_weight,
         )
         loss.backward()
         optimizer.step()
 
         model.eval()
         with torch.inference_mode():
-            val_logits = model(embeddings, normalized_adjacency)[masks["val"]]
+            val_logits = model(z_int, a_context)[masks["val"]]
         val_labels = labels[masks["val"]]
-        val_loss = float(binary_loss(val_logits, val_labels, config, pos_weight=pos_weight).item())
+        val_loss = float(binary_loss(val_logits, val_labels).item())
         val_accuracy = float(binary_metrics(val_logits, val_labels)["acc"])
         if _is_better(
             val_accuracy,
@@ -258,148 +306,21 @@ def train_pos_head(
             stale_epochs = 0
         else:
             stale_epochs += 1
-            if stale_epochs >= config.pos_head.patience:
+            if stale_epochs >= config.context_head.patience:
                 break
 
     if best_state is None:
-        raise RuntimeError("POS-head training produced no checkpoint")
+        raise RuntimeError("Context-Head training produced no checkpoint")
     model.load_state_dict(best_state)
     model.eval()
     with torch.inference_mode():
-        logits = model(embeddings, normalized_adjacency).detach().cpu()
-    return model, logits, {
-        "epoch": int(best_epoch),
-        "val_acc": best_accuracy,
-        "val_loss": best_loss,
-    }
-
-
-def _run_directory(config: Config, dataset_name: str) -> Path:
-    mode = "mil" if not config.pos_head.enabled else "mil_pos"
-    if not config.mil_head.enabled:
-        mode = "baseline"
-    return Path(config.output_dir) / dataset_name / f"{config.run_name}_{mode}"
-
-
-def run_dataset(config: Config, dataset_name: str, device: torch.device) -> Dict:
-    bundle = DatasetBundle.load(
-        config,
-        dataset_name,
-        require_position_graph=config.pos_head.enabled,
-    )
-    output_dir = _run_directory(config, dataset_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    normalized_adjacency = None
-    if config.pos_head.enabled:
-        position_adjacency = build_position_adjacency(
-            bundle.original_graph,
-            bundle.assignment_matrix,
-            bundle.subgraph_ids,
-            top_k=config.pos_head.top_k,
-        )
-        normalized_adjacency = to_torch_sparse(
-            row_normalize(position_adjacency),
-            device,
-        )
-
-    fold_results = []
-    for fold in range(config.folds):
-        _set_seed(config.seed + fold, device)
-        split_positions = bundle.split(fold)
-        loaders = bundle.loaders(fold, config.training.batch_size)
-        train_labels = bundle.labels[split_positions["train"]]
-        model, encoder_selection = train_encoder(
-            config,
-            bundle.feature_dim,
-            loaders["train"],
-            loaders["val"],
-            train_labels,
-            device,
-        )
-
-        encoder_logits, embeddings, labels, sample_indices = _predict_all(
-            model,
-            bundle.all_loader(config.training.batch_size),
-            device,
-        )
-        expected_indices = torch.as_tensor(bundle.sample_indices, dtype=torch.long)
-        if not torch.equal(sample_indices, expected_indices):
-            raise RuntimeError("all_loader changed the canonical sample order")
-        encoder_metrics = _split_metrics(encoder_logits, labels, split_positions)
-
-        final_logits = encoder_logits
-        pos_model = None
-        pos_selection = None
-        if config.pos_head.enabled:
-            pos_model, final_logits, pos_selection = train_pos_head(
-                config,
-                embeddings,
-                labels,
-                split_positions,
-                normalized_adjacency,
-                device,
-            )
-        final_metrics = _split_metrics(final_logits, labels, split_positions)
-
-        fold_dir = output_dir / f"fold_{fold}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": model.state_dict(),
-                "input_dim": bundle.feature_dim,
-                "selection": encoder_selection,
-            },
-            fold_dir / "encoder.pt",
-        )
-        if pos_model is not None:
-            torch.save(
-                {"state_dict": pos_model.state_dict(), "selection": pos_selection},
-                fold_dir / "pos_head.pt",
-            )
-
-        fold_result = {
-            "fold": fold,
-            "encoder_selection": encoder_selection,
-            "pos_selection": pos_selection,
-            "encoder": encoder_metrics,
-            "final": final_metrics,
-        }
-        fold_results.append(fold_result)
-        logging.info(
-            "%s fold=%d test_acc=%.4f test_f1=%.4f",
-            dataset_name,
-            fold,
-            final_metrics["test"]["acc"],
-            final_metrics["test"]["f1"],
-        )
-
-    result = {
-        "dataset": dataset_name,
-        "folds": fold_results,
-        "summary": {
-            split: summarize([item["final"][split] for item in fold_results])
-            for split in SPLITS
+        logits = model(z_int, a_context).detach().cpu()
+    return (
+        model,
+        logits,
+        {
+            "epoch": int(best_epoch),
+            "val_acc": best_accuracy,
+            "val_loss": best_loss,
         },
-    }
-    torch.save(
-        {"config": asdict(config), "result": result},
-        output_dir / "metrics.pt",
     )
-    return result
-
-
-def run(config: Config) -> Dict[str, Dict]:
-    """Run all configured datasets; any error stops the run."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    device = _runtime_device(config)
-    results = {
-        dataset_name: run_dataset(config, dataset_name, device)
-        for dataset_name in config.datasets
-    }
-    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"config": asdict(config), "results": results},
-        Path(config.output_dir) / f"{config.run_name}_summary.pt",
-    )
-    return results

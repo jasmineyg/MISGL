@@ -13,43 +13,42 @@ import torch
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from MISGL.keys import BAG_INDEX, EDGE_INDEX, LABEL, SAMPLE_INDEX, STRUCTURE, X
-from MISGL.structural_features import compute_structural_features
+from MISGL.internal_head import compute_structural_statistics
 
 
 def _binary_labels(values: Any, expected_size: int) -> np.ndarray:
     labels = np.asarray(values)
     if labels.ndim != 1 or labels.shape[0] != expected_size:
         raise ValueError(
-            'subgraph_labels must be a one-dimensional array with one label '
-            'per subgraph_structure.'
+            "subgraph_labels must be a one-dimensional array with one label "
+            "per subgraph_structure."
         )
-    if labels.dtype.kind not in 'biuf':
-        raise TypeError('subgraph_labels must contain numeric binary values.')
+    if labels.dtype.kind not in "biuf":
+        raise TypeError("subgraph_labels must contain numeric binary values.")
     if not np.isfinite(labels).all() or not np.isin(labels, (0, 1)).all():
-        raise ValueError('subgraph_labels must contain only 0 and 1.')
+        raise ValueError("subgraph_labels must contain only 0 and 1.")
     return labels.astype(np.int64, copy=False)
 
 
 def _index_array(values: Any, name: str) -> np.ndarray:
     if not isinstance(values, (list, tuple, np.ndarray)):
-        raise TypeError('{} must be a one-dimensional integer sequence.'.format(name))
+        raise TypeError("{} must be a one-dimensional integer sequence.".format(name))
     array = np.asarray(values)
     if array.ndim != 1:
-        raise ValueError('{} must be one-dimensional.'.format(name))
+        raise ValueError("{} must be one-dimensional.".format(name))
     if array.size == 0:
         return np.empty(0, dtype=np.int64)
-    if array.dtype.kind not in 'iu':
-        raise TypeError('{} must contain integers.'.format(name))
+    if array.dtype.kind not in "iu":
+        raise TypeError("{} must contain integers.".format(name))
     return array.astype(np.int64, copy=False)
 
 
 def _integer(value: Any, name: str, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError('{} must be an integer.'.format(name))
+        raise TypeError("{} must be an integer.".format(name))
     result = int(value)
     if result < minimum:
-        raise ValueError('{} must be at least {}.'.format(name, minimum))
+        raise ValueError("{} must be at least {}.".format(name, minimum))
     return result
 
 
@@ -64,14 +63,14 @@ class GraphTensorDataset(Dataset):
         include_structure: bool,
     ) -> None:
         if not isinstance(subgraphs, (list, tuple)) or not subgraphs:
-            raise ValueError('subgraphs must be a non-empty list or tuple.')
+            raise ValueError("subgraphs must be a non-empty list or tuple.")
         if type(include_structure) is not bool:
-            raise TypeError('include_structure must be a bool.')
+            raise TypeError("include_structure must be a bool.")
 
         label_array = _binary_labels(labels, len(subgraphs))
-        index_array = _index_array(sample_indices, 'sample_indices')
+        index_array = _index_array(sample_indices, "sample_indices")
         if index_array.shape[0] != len(subgraphs):
-            raise ValueError('sample_indices must contain one index per subgraph.')
+            raise ValueError("sample_indices must contain one index per subgraph.")
 
         self._samples: List[Dict[str, torch.Tensor]] = []
         feature_dim = None
@@ -80,7 +79,7 @@ class GraphTensorDataset(Dataset):
             sample_index = int(index_array[graph_position])
             if not isinstance(graph, nx.Graph):
                 raise TypeError(
-                    'subgraph_structures[{}] must be a NetworkX graph.'.format(
+                    "subgraph_structures[{}] must be a NetworkX graph.".format(
                         sample_index
                     )
                 )
@@ -88,22 +87,26 @@ class GraphTensorDataset(Dataset):
             node_ids = list(graph.nodes())
             if not node_ids:
                 raise ValueError(
-                    'subgraph_structures[{}] has no nodes.'.format(sample_index)
+                    "subgraph_structures[{}] has no nodes.".format(sample_index)
                 )
 
             node_features = []
             for node_id in node_ids:
-                if 'features' not in graph.nodes[node_id]:
+                if "features" not in graph.nodes[node_id]:
                     raise ValueError(
                         "Node {!r} in subgraph_structures[{}] is missing 'features'.".format(
                             node_id, sample_index
                         )
                     )
-                features = np.asarray(graph.nodes[node_id]['features'], dtype=np.float32)
+                features = np.asarray(
+                    graph.nodes[node_id]["features"], dtype=np.float32
+                )
                 if features.ndim != 1 or features.size == 0:
                     raise ValueError(
                         "Node {!r} in subgraph_structures[{}] must have a non-empty "
-                        "one-dimensional 'features' array.".format(node_id, sample_index)
+                        "one-dimensional 'features' array.".format(
+                            node_id, sample_index
+                        )
                     )
                 if not np.isfinite(features).all():
                     raise ValueError(
@@ -115,8 +118,8 @@ class GraphTensorDataset(Dataset):
                     feature_dim = int(features.size)
                 elif features.size != feature_dim:
                     raise ValueError(
-                        'All node feature vectors must have the same dimension; '
-                        'expected {}, got {} in subgraph_structures[{}].'.format(
+                        "All node feature vectors must have the same dimension; "
+                        "expected {}, got {} in subgraph_structures[{}].".format(
                             feature_dim, features.size, sample_index
                         )
                     )
@@ -128,13 +131,13 @@ class GraphTensorDataset(Dataset):
                     graph,
                     nodelist=node_ids,
                     dtype=np.float32,
-                    weight='weight',
-                    format='csr',
+                    weight="weight",
+                    format="csr",
                 )
             )
             if not np.isfinite(adjacency.data).all():
                 raise ValueError(
-                    'subgraph_structures[{}] has non-finite edge weights.'.format(
+                    "subgraph_structures[{}] has non-finite edge weights.".format(
                         sample_index
                     )
                 )
@@ -143,30 +146,28 @@ class GraphTensorDataset(Dataset):
             topology = adjacency.copy()
             topology.data = np.ones(topology.nnz, dtype=np.float32)
             topology = topology.maximum(
-                sp.eye(len(node_ids), dtype=np.float32, format='csr')
+                sp.eye(len(node_ids), dtype=np.float32, format="csr")
             ).tocoo()
             edge_index = np.vstack((topology.row, topology.col)).astype(
                 np.int64, copy=False
             )
 
             sample = {
-                X: torch.from_numpy(x),
-                EDGE_INDEX: torch.from_numpy(edge_index),
-                LABEL: torch.tensor(label_array[graph_position], dtype=torch.long),
-                SAMPLE_INDEX: torch.tensor(sample_index, dtype=torch.long),
+                "x": torch.from_numpy(x),
+                "edge_index": torch.from_numpy(edge_index),
+                "label": torch.tensor(label_array[graph_position], dtype=torch.long),
+                "sample_index": torch.tensor(sample_index, dtype=torch.long),
             }
             if include_structure:
-                structure = self._compute_structural_features_np(
-                    adjacency.toarray()
-                )
-                sample[STRUCTURE] = torch.from_numpy(structure)
+                structure = self._compute_structural_statistics_np(adjacency.toarray())
+                sample["structure"] = torch.from_numpy(structure)
             self._samples.append(sample)
 
         self.feature_dim = int(feature_dim)
 
     @staticmethod
-    def _compute_structural_features_np(adjacency: np.ndarray) -> np.ndarray:
-        return compute_structural_features(adjacency)
+    def _compute_structural_statistics_np(adjacency: np.ndarray) -> np.ndarray:
+        return compute_structural_statistics(adjacency)
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -180,33 +181,35 @@ def collate_graph_batch(
 ) -> Dict[str, torch.Tensor]:
     """Concatenate graphs into one disconnected sparse graph batch."""
     if not samples:
-        raise ValueError('Cannot collate an empty graph batch.')
+        raise ValueError("Cannot collate an empty graph batch.")
 
-    include_structure = STRUCTURE in samples[0]
-    if any((STRUCTURE in sample) != include_structure for sample in samples):
-        raise ValueError('All samples in a batch must use the same structure schema.')
+    include_structure = "structure" in samples[0]
+    if any(("structure" in sample) != include_structure for sample in samples):
+        raise ValueError("All samples in a batch must use the same structure schema.")
 
     node_features = []
     edge_indices = []
-    bag_indices = []
+    subgraph_indices = []
     node_offset = 0
-    for bag_index, sample in enumerate(samples):
-        node_count = sample[X].shape[0]
-        node_features.append(sample[X])
-        edge_indices.append(sample[EDGE_INDEX] + node_offset)
-        bag_indices.append(torch.full((node_count,), bag_index, dtype=torch.long))
+    for subgraph_index, sample in enumerate(samples):
+        node_count = sample["x"].shape[0]
+        node_features.append(sample["x"])
+        edge_indices.append(sample["edge_index"] + node_offset)
+        subgraph_indices.append(
+            torch.full((node_count,), subgraph_index, dtype=torch.long)
+        )
         node_offset += node_count
 
     batch = {
-        X: torch.cat(node_features, dim=0),
-        EDGE_INDEX: torch.cat(edge_indices, dim=1),
-        BAG_INDEX: torch.cat(bag_indices, dim=0),
-        LABEL: torch.stack([sample[LABEL] for sample in samples]),
-        SAMPLE_INDEX: torch.stack([sample[SAMPLE_INDEX] for sample in samples]),
+        "x": torch.cat(node_features, dim=0),
+        "edge_index": torch.cat(edge_indices, dim=1),
+        "subgraph_index": torch.cat(subgraph_indices, dim=0),
+        "label": torch.stack([sample["label"] for sample in samples]),
+        "sample_index": torch.stack([sample["sample_index"] for sample in samples]),
     }
     if include_structure:
-        batch[STRUCTURE] = torch.cat(
-            [sample[STRUCTURE] for sample in samples], dim=0
+        batch["structure"] = torch.cat(
+            [sample["structure"] for sample in samples], dim=0
         )
     return batch
 
@@ -230,76 +233,83 @@ class DatasetBundle:
         cls,
         config: Any,
         dataset_name: str,
-        require_position_graph: bool,
-    ) -> 'DatasetBundle':
+        require_context_graph: bool,
+    ) -> "DatasetBundle":
         if not isinstance(dataset_name, str) or not dataset_name:
-            raise ValueError('dataset_name must be a non-empty string.')
-        if not isinstance(require_position_graph, bool):
-            raise TypeError('require_position_graph must be a bool.')
-        if type(config.mil_head.enabled) is not bool:
-            raise TypeError('config.mil_head.enabled must be a bool.')
+            raise ValueError("dataset_name must be a non-empty string.")
+        if not isinstance(require_context_graph, bool):
+            raise TypeError("require_context_graph must be a bool.")
+        if type(config.internal_head.enabled) is not bool:
+            raise TypeError("config.internal_head.enabled must be a bool.")
 
-        dataset_path = Path(config.data_dir) / '{}_processed.pkl'.format(dataset_name)
-        with dataset_path.open('rb') as handle:
+        dataset_path = Path(config.data_dir) / "{}_processed.pkl".format(dataset_name)
+        with dataset_path.open("rb") as handle:
             raw = pickle.load(handle)
 
         if not isinstance(raw, Mapping):
-            raise TypeError('The processed dataset root must be a mapping.')
-        required_keys = ('subgraph_structures', 'train_test_split', 'subgraph_labels')
+            raise TypeError("The processed dataset root must be a mapping.")
+        required_keys = ("subgraph_structures", "train_test_split", "subgraph_labels")
         missing_keys = [key for key in required_keys if key not in raw]
         if missing_keys:
-            raise KeyError('Processed dataset is missing keys: {}.'.format(', '.join(missing_keys)))
+            raise KeyError(
+                "Processed dataset is missing keys: {}.".format(", ".join(missing_keys))
+            )
 
-        subgraphs = raw['subgraph_structures']
+        subgraphs = raw["subgraph_structures"]
         if not isinstance(subgraphs, (list, tuple)) or not subgraphs:
-            raise ValueError('subgraph_structures must be a non-empty list or tuple.')
+            raise ValueError("subgraph_structures must be a non-empty list or tuple.")
 
-        split_schema = raw['train_test_split']
+        split_schema = raw["train_test_split"]
         if not isinstance(split_schema, Mapping):
-            raise TypeError('train_test_split must be a mapping.')
-        split_keys = ('train_indices', 'test_indices')
+            raise TypeError("train_test_split must be a mapping.")
+        split_keys = ("train_indices", "test_indices")
         missing_split_keys = [key for key in split_keys if key not in split_schema]
         if missing_split_keys:
             raise KeyError(
-                'train_test_split is missing keys: {}.'.format(', '.join(missing_split_keys))
+                "train_test_split is missing keys: {}.".format(
+                    ", ".join(missing_split_keys)
+                )
             )
 
-        train_ids = _index_array(split_schema['train_indices'], 'train_indices')
-        test_ids = _index_array(split_schema['test_indices'], 'test_indices')
+        train_ids = _index_array(split_schema["train_indices"], "train_indices")
+        test_ids = _index_array(split_schema["test_indices"], "test_indices")
         sample_indices = np.concatenate((train_ids, test_ids))
         if sample_indices.size == 0:
-            raise ValueError('train_indices and test_indices cannot both be empty.')
+            raise ValueError("train_indices and test_indices cannot both be empty.")
         if np.unique(sample_indices).size != sample_indices.size:
-            raise ValueError('train_indices and test_indices must not contain duplicate indices.')
+            raise ValueError(
+                "train_indices and test_indices must not contain duplicate indices."
+            )
         if sample_indices.min() < 0 or sample_indices.max() >= len(subgraphs):
             raise IndexError(
-                'train_indices/test_indices contain values outside subgraph_structures.'
+                "train_indices/test_indices contain values outside subgraph_structures."
             )
 
-        all_labels = _binary_labels(raw['subgraph_labels'], len(subgraphs))
+        all_labels = _binary_labels(raw["subgraph_labels"], len(subgraphs))
         labels = all_labels[sample_indices]
         active_subgraphs = [subgraphs[int(index)] for index in sample_indices]
         subgraph_ids = cls._read_subgraph_ids(active_subgraphs, sample_indices)
         group_ids = cls._read_group_ids(raw, len(subgraphs), sample_indices)
 
-        folds = _integer(config.folds, 'config.folds', 3)
-        seed = _integer(config.seed, 'config.seed', 0)
+        folds = _integer(config.folds, "config.folds", 3)
+        seed = _integer(config.seed, "config.seed", 0)
         fold_indices = cls._build_grouped_folds(labels, group_ids, folds, seed)
 
-        original_graph = raw.get('original_graph')
-        assignment_matrix = raw.get('assignment_matrix')
-        if require_position_graph:
-            missing_position_keys = [
-                key for key in ('original_graph', 'assignment_matrix')
+        original_graph = raw.get("original_graph")
+        assignment_matrix = raw.get("assignment_matrix")
+        if require_context_graph:
+            missing_context_keys = [
+                key
+                for key in ("original_graph", "assignment_matrix")
                 if key not in raw or raw[key] is None
             ]
-            if missing_position_keys:
+            if missing_context_keys:
                 raise KeyError(
-                    'Position graph requires dataset keys: {}.'.format(
-                        ', '.join(missing_position_keys)
+                    "Context graph requires dataset keys: {}.".format(
+                        ", ".join(missing_context_keys)
                     )
                 )
-            cls._validate_position_schema(
+            cls._validate_context_schema(
                 original_graph,
                 assignment_matrix,
                 subgraph_ids,
@@ -309,7 +319,7 @@ class DatasetBundle:
             active_subgraphs,
             labels,
             sample_indices,
-            include_structure=config.mil_head.enabled,
+            include_structure=config.internal_head.enabled,
         )
         return cls(
             feature_dim=tensor_dataset.feature_dim,
@@ -332,17 +342,17 @@ class DatasetBundle:
         for graph, sample_index in zip(subgraphs, sample_indices):
             if not isinstance(graph, nx.Graph):
                 raise TypeError(
-                    'subgraph_structures[{}] must be a NetworkX graph.'.format(
+                    "subgraph_structures[{}] must be a NetworkX graph.".format(
                         int(sample_index)
                     )
                 )
-            if 'subgraph_id' not in graph.graph:
+            if "subgraph_id" not in graph.graph:
                 raise KeyError(
                     "subgraph_structures[{}] is missing graph.graph['subgraph_id'].".format(
                         int(sample_index)
                     )
                 )
-            subgraph_id = graph.graph['subgraph_id']
+            subgraph_id = graph.graph["subgraph_id"]
             if isinstance(subgraph_id, bool) or not isinstance(subgraph_id, Integral):
                 raise TypeError(
                     "subgraph_structures[{}] graph.graph['subgraph_id'] must be an integer.".format(
@@ -364,17 +374,15 @@ class DatasetBundle:
         subgraph_count: int,
         sample_indices: np.ndarray,
     ) -> np.ndarray:
-        if 'group_ids' not in raw:
+        if "group_ids" not in raw:
             return sample_indices.copy()
 
-        values = raw['group_ids']
+        values = raw["group_ids"]
         if not isinstance(values, (list, tuple, np.ndarray)):
-            raise TypeError('group_ids must be a one-dimensional sequence.')
+            raise TypeError("group_ids must be a one-dimensional sequence.")
         array = np.asarray(values)
         if array.ndim != 1 or array.shape[0] != subgraph_count:
-            raise ValueError(
-                'group_ids must contain one value per subgraph_structure.'
-            )
+            raise ValueError("group_ids must contain one value per subgraph_structure.")
 
         normalized = []
         id_kind = None
@@ -382,18 +390,22 @@ class DatasetBundle:
             if isinstance(value, np.generic):
                 value = value.item()
             if isinstance(value, bool):
-                raise TypeError('group_ids values must be integers or non-empty strings.')
+                raise TypeError(
+                    "group_ids values must be integers or non-empty strings."
+                )
             if isinstance(value, Integral):
                 current_kind = int
                 value = int(value)
             elif isinstance(value, str) and value:
                 current_kind = str
             else:
-                raise TypeError('group_ids values must be integers or non-empty strings.')
+                raise TypeError(
+                    "group_ids values must be integers or non-empty strings."
+                )
             if id_kind is None:
                 id_kind = current_kind
             elif current_kind is not id_kind:
-                raise TypeError('group_ids must not mix integer and string values.')
+                raise TypeError("group_ids must not mix integer and string values.")
             normalized.append(value)
 
         dtype = np.int64 if id_kind is int else object
@@ -413,11 +425,11 @@ class DatasetBundle:
 
         class_counts = np.bincount(group_labels, minlength=2)
         if np.count_nonzero(class_counts) != 2:
-            raise ValueError('Active groups must contain both binary label classes.')
+            raise ValueError("Active groups must contain both binary label classes.")
         if class_counts.min() < fold_count:
             raise ValueError(
-                'Each group-label class needs at least config.folds={} groups; '
-                'class counts are {}.'.format(fold_count, class_counts.tolist())
+                "Each group-label class needs at least config.folds={} groups; "
+                "class counts are {}.".format(fold_count, class_counts.tolist())
             )
 
         splitter = StratifiedKFold(
@@ -434,45 +446,53 @@ class DatasetBundle:
         return tuple(fold_indices)
 
     @staticmethod
-    def _validate_position_schema(
+    def _validate_context_schema(
         original_graph: Any,
         assignment_matrix: Any,
         subgraph_ids: np.ndarray,
     ) -> None:
-        if not sp.issparse(assignment_matrix) and not isinstance(assignment_matrix, np.ndarray):
-            raise TypeError('assignment_matrix must be a SciPy sparse matrix or NumPy array.')
+        if not sp.issparse(assignment_matrix) and not isinstance(
+            assignment_matrix, np.ndarray
+        ):
+            raise TypeError(
+                "assignment_matrix must be a SciPy sparse matrix or NumPy array."
+            )
         if len(assignment_matrix.shape) != 2:
-            raise ValueError('assignment_matrix must be two-dimensional.')
+            raise ValueError("assignment_matrix must be two-dimensional.")
         original_node_count, assignment_columns = assignment_matrix.shape
         if original_node_count <= 0:
-            raise ValueError('assignment_matrix must have at least one row.')
+            raise ValueError("assignment_matrix must have at least one row.")
         if assignment_columns <= int(subgraph_ids.max()):
-            raise ValueError("graph.graph['subgraph_id'] exceeds assignment_matrix columns.")
+            raise ValueError(
+                "graph.graph['subgraph_id'] exceeds assignment_matrix columns."
+            )
 
         if sp.issparse(original_graph):
             if original_graph.shape != (original_node_count, original_node_count):
                 raise ValueError(
-                    'original_graph adjacency shape must match assignment_matrix rows.'
+                    "original_graph adjacency shape must match assignment_matrix rows."
                 )
             return
         if not isinstance(original_graph, nx.Graph):
-            raise TypeError('original_graph must be a NetworkX graph or SciPy sparse matrix.')
+            raise TypeError(
+                "original_graph must be a NetworkX graph or SciPy sparse matrix."
+            )
         if original_graph.number_of_nodes() != original_node_count:
             raise ValueError(
-                'original_graph node count must match assignment_matrix rows.'
+                "original_graph node count must match assignment_matrix rows."
             )
         if set(original_graph.nodes()) != set(range(original_node_count)):
             raise ValueError(
-                'original_graph node ids must be exactly 0..N-1 so they align with '
-                'assignment_matrix rows.'
+                "original_graph node ids must be exactly 0..N-1 so they align with "
+                "assignment_matrix rows."
             )
 
     def split(self, fold: int) -> Dict[str, np.ndarray]:
         """Return local dataset positions for one train/validation/test split."""
-        fold_index = _integer(fold, 'fold', 0)
+        fold_index = _integer(fold, "fold", 0)
         if fold_index >= len(self._fold_indices):
             raise IndexError(
-                'fold must be in [0, {}), got {}.'.format(
+                "fold must be in [0, {}), got {}.".format(
                     len(self._fold_indices), fold_index
                 )
             )
@@ -487,34 +507,34 @@ class DatasetBundle:
         train_positions = np.flatnonzero(train_mask).astype(np.int64, copy=False)
 
         return {
-            'train': train_positions.copy(),
-            'val': validation_positions.copy(),
-            'test': test_positions.copy(),
+            "train": train_positions.copy(),
+            "val": validation_positions.copy(),
+            "test": test_positions.copy(),
         }
 
     def loaders(self, fold: int, batch_size: int) -> Dict[str, DataLoader]:
         """Build loaders over the already-preprocessed sparse graph tensors."""
-        size = _integer(batch_size, 'batch_size', 1)
+        size = _integer(batch_size, "batch_size", 1)
         positions = self.split(fold)
         generator = torch.Generator()
         generator.manual_seed(self._seed + int(fold))
 
         return {
-            'train': DataLoader(
-                Subset(self.dataset, positions['train'].tolist()),
+            "train": DataLoader(
+                Subset(self.dataset, positions["train"].tolist()),
                 batch_size=size,
                 shuffle=True,
                 generator=generator,
                 collate_fn=collate_graph_batch,
             ),
-            'val': DataLoader(
-                Subset(self.dataset, positions['val'].tolist()),
+            "val": DataLoader(
+                Subset(self.dataset, positions["val"].tolist()),
                 batch_size=size,
                 shuffle=False,
                 collate_fn=collate_graph_batch,
             ),
-            'test': DataLoader(
-                Subset(self.dataset, positions['test'].tolist()),
+            "test": DataLoader(
+                Subset(self.dataset, positions["test"].tolist()),
                 batch_size=size,
                 shuffle=False,
                 collate_fn=collate_graph_batch,
@@ -523,7 +543,7 @@ class DatasetBundle:
 
     def all_loader(self, batch_size: int) -> DataLoader:
         """Return all active subgraphs in their source-index order."""
-        size = _integer(batch_size, 'batch_size', 1)
+        size = _integer(batch_size, "batch_size", 1)
         return DataLoader(
             self.dataset,
             batch_size=size,

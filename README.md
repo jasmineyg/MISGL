@@ -1,63 +1,34 @@
-# MISGL
+# Multiple-Instance Subgraph Learning
 
-The core model uses all nine structural statistics and a single structural
-encoder: `Linear(9,32) -> LayerNorm(32) -> ReLU`.
+Code for the paper *Multiple-Instance Subgraph Learning*, implementing
+Node-Attentive Subgraph Learning (NASGL).
 
-## Structural representation
+## Installation and training
 
-Features are computed once per dataset on unweighted, undirected subgraphs
-with self-loops removed, in this fixed order:
-
-1. Normalized degree
-2. Normalized average neighbor degree
-3. Exactly-two-hop reachability ratio
-4. Personalized PageRank self-return probability (restart probability 0.15)
-5. Log-normalized triangle count
-6. Clustering coefficient
-7. Normalized core number
-8. PageRank normalized by its maximum
-9. Absolute Fiedler-vector coordinate normalized by its maximum (LapPE)
-
-All nine inputs are used. There is no feature mask, alternative structural
-profile, two-layer encoder, or structural dropout option. The structural output
-width is fixed at 32. The node GAT output is 256 by default, giving a 288-wide
-attention input. Attention uses parallel tanh/sigmoid projections with hidden
-width 128. The same attention weights pool semantic and structural embeddings;
-a 32-to-256 projection and a 64-hidden-unit gate fuse structure into the semantic
-representation. The final MIL representation remains 256-dimensional.
-
-The GAT, MIL/POS head switches, losses and two-stage training are retained.
-POS uses the frozen MIL embeddings and the subgraph relation graph.
-
-## Run
-
-Use Python with PyTorch, NumPy, SciPy, NetworkX, scikit-learn, ruamel.yaml and tqdm.
-Every field in `config/train.yml` is required; unknown fields are rejected.
-Set `data_dir` to a directory containing `<dataset>_processed.pkl` before running.
+Use Python 3.10.18. Run from the repository root:
 
 ```bash
-# Default: MIL + POS
-python train.py --config config/train.yml
-# MIL only
-python train.py --mil-head --no-pos-head
-# Mean pooling baseline
-python train.py --no-mil-head --no-pos-head
-# Override datasets and output directory
-python train.py --datasets ogbn_arxiv reddit --output-dir results/full9
+python -m pip install -r requirements.txt
+python -m data_construction.synthetic_data --data-root data
+python train.py --benchmark syn3 --data-root data --device cpu
+python evaluate.py --run-dir outputs/paper/syn3/nasgl --device cpu
 ```
 
-POS requires MIL. Structural statistics are label-free and precomputed while
-loading data. GAT processes disconnected sparse graph batches. Descriptor
-calculation includes dense subgraph matrix operations and eigendecomposition.
-Use a new output directory for new training; previous masked or differently sized
-models must not be treated as results from this configuration. Old YAML files
-containing removed structural options must be updated to the checked-in schema.
+Use `--device cuda --cuda-device 0` for GPU training. Training settings are in
+`MISGL/config.py`. Real partitioned data belong in
+`data/<dataset>/{bfs,metis,metis_perturb}/`.
 
-## Verify
+## Real-data construction
+
+Use a separate Python 3.9.23 environment with native METIS 5.2.1. The same
+requirements file selects the dependencies for each Python version.
 
 ```bash
-python -m unittest discover -s tests
+conda create -n misgl-data -c conda-forge python=3.9.23 metis=5.2.1
+conda activate misgl-data
+python -m pip install -r requirements.txt
+python -m data_construction.real_data --benchmark igb_tiny__metis --raw-dir /path/to/IGB-tiny --data-root data
 ```
 
-Only the core package, configuration, entry point and tests are maintained here.
-Historical experiment scripts and result records remain outside Git tracking.
+Dataset settings are in `data_construction/dataset_settings.py`.
+Data and generated outputs are excluded from version control.
